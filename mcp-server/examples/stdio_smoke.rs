@@ -26,7 +26,19 @@ use tokio::process::Command;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let bin = root.join("target/debug/proofloops-mcp");
+    // `CARGO_MANIFEST_DIR` here is `.../proofloops/mcp-server`.
+    // The binary is built into the *workspace* `target/` by default.
+    let workspace_root = root
+        .parent()
+        .expect("mcp-server should be nested under proofloops/")
+        .to_path_buf();
+    let bin = workspace_root.join("target/debug/proofloops-mcp");
+    if !bin.exists() {
+        anyhow::bail!(
+            "missing server binary at {}\n\nBuild it with:\n  cargo build -p proofloops-mcp --bin proofloops-mcp --features stdio",
+            bin.display()
+        );
+    }
     eprintln!("spawning: {} mcp-stdio", bin.display());
 
     // Make the smoke test independent of any particular repo layout.

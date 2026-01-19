@@ -168,10 +168,10 @@ fn repo_root_from_args(args: &Value) -> Result<PathBuf, String> {
     Ok(repo_root)
 }
 
-struct ProofyloopsPromptTool;
+struct ProofloopsPromptTool;
 
 #[async_trait]
-impl Tool for ProofyloopsPromptTool {
+impl Tool for ProofloopsPromptTool {
     fn description(&self) -> &str {
         "Extract the (system,user) prompt + excerpt for a lemma (`proofloops prompt`)."
     }
@@ -201,10 +201,10 @@ impl Tool for ProofyloopsPromptTool {
     }
 }
 
-struct ProofyloopsVerifyTool;
+struct ProofloopsVerifyTool;
 
 #[async_trait]
-impl Tool for ProofyloopsVerifyTool {
+impl Tool for ProofloopsVerifyTool {
     fn description(&self) -> &str {
         "Elaboration-check a file (`proofloops verify`)."
     }
@@ -232,10 +232,10 @@ impl Tool for ProofyloopsVerifyTool {
     }
 }
 
-struct ProofyloopsVerifySummaryTool;
+struct ProofloopsVerifySummaryTool;
 
 #[async_trait]
-impl Tool for ProofyloopsVerifySummaryTool {
+impl Tool for ProofloopsVerifySummaryTool {
     fn description(&self) -> &str {
         "Elaboration-check a file, returning a small summary plus raw output (`proofloops verify`)."
     }
@@ -265,10 +265,10 @@ impl Tool for ProofyloopsVerifySummaryTool {
     }
 }
 
-struct ProofyloopsSuggestTool;
+struct ProofloopsSuggestTool;
 
 #[async_trait]
-impl Tool for ProofyloopsSuggestTool {
+impl Tool for ProofloopsSuggestTool {
     fn description(&self) -> &str {
         "Suggest a proof by running the configured LLM router (`proofloops suggest`)."
     }
@@ -314,10 +314,10 @@ impl Tool for ProofyloopsSuggestTool {
     }
 }
 
-struct ProofyloopsPatchTool;
+struct ProofloopsPatchTool;
 
 #[async_trait]
-impl Tool for ProofyloopsPatchTool {
+impl Tool for ProofloopsPatchTool {
     fn description(&self) -> &str {
         "Patch a lemma’s first `sorry` with provided Lean code, then verify (`proofloops patch`)."
     }
@@ -375,10 +375,10 @@ impl Tool for ProofyloopsPatchTool {
     }
 }
 
-struct ProofyloopsPatchRegionTool;
+struct ProofloopsPatchRegionTool;
 
 #[async_trait]
-impl Tool for ProofyloopsPatchRegionTool {
+impl Tool for ProofloopsPatchRegionTool {
     fn description(&self) -> &str {
         "Patch the first `sorry` within a (line-based) region and verify (works for instance fields / local blocks)."
     }
@@ -453,10 +453,10 @@ impl Tool for ProofyloopsPatchRegionTool {
     }
 }
 
-struct ProofyloopsLocateSorriesTool;
+struct ProofloopsLocateSorriesTool;
 
 #[async_trait]
-impl Tool for ProofyloopsLocateSorriesTool {
+impl Tool for ProofloopsLocateSorriesTool {
     fn description(&self) -> &str {
         "Locate `sorry` tokens in a file with line/col and suggested patch regions."
     }
@@ -492,10 +492,10 @@ impl Tool for ProofyloopsLocateSorriesTool {
     }
 }
 
-struct ProofyloopsContextPackTool;
+struct ProofloopsContextPackTool;
 
 #[async_trait]
-impl Tool for ProofyloopsContextPackTool {
+impl Tool for ProofloopsContextPackTool {
     fn description(&self) -> &str {
         "Build a JSON-first context pack for a file + decl/line (imports + excerpt + nearby decls)."
     }
@@ -542,10 +542,10 @@ impl Tool for ProofyloopsContextPackTool {
     }
 }
 
-struct ProofyloopsTriageFileTool;
+struct ProofloopsTriageFileTool;
 
 #[async_trait]
-impl Tool for ProofyloopsTriageFileTool {
+impl Tool for ProofloopsTriageFileTool {
     fn description(&self) -> &str {
         "Triage a file: verify_summary + locate_sorries, plus nearest sorry to first error (if any)."
     }
@@ -839,10 +839,10 @@ fn apply_mechanical_fixes_for_first_error(
     (out, edits)
 }
 
-struct ProofyloopsAgentStepTool;
+struct ProofloopsAgentStepTool;
 
 #[async_trait]
-impl Tool for ProofyloopsAgentStepTool {
+impl Tool for ProofloopsAgentStepTool {
     fn description(&self) -> &str {
         "Execute one safe agent step (no LLM): verify → apply mechanical fix → verify."
     }
@@ -968,10 +968,10 @@ fn escape_html(s: &str) -> String {
     out
 }
 
-struct ProofyloopsReportHtmlTool;
+struct ProofloopsReportHtmlTool;
 
 #[async_trait]
-impl Tool for ProofyloopsReportHtmlTool {
+impl Tool for ProofloopsReportHtmlTool {
     fn description(&self) -> &str {
         "Triage many files and write a small HTML report."
     }
@@ -1148,10 +1148,10 @@ impl Tool for ProofyloopsReportHtmlTool {
     }
 }
 
-struct ProofyloopsRubberduckPromptTool;
+struct ProofloopsRubberduckPromptTool;
 
 #[async_trait]
-impl Tool for ProofyloopsRubberduckPromptTool {
+impl Tool for ProofloopsRubberduckPromptTool {
     fn description(&self) -> &str {
         "Build a rubberduck/ideation prompt for a lemma (no proof code; plan + next moves)."
     }
@@ -1182,10 +1182,10 @@ impl Tool for ProofyloopsRubberduckPromptTool {
     }
 }
 
-struct ProofyloopsLoopTool;
+struct ProofloopsLoopTool;
 
 #[async_trait]
-impl Tool for ProofyloopsLoopTool {
+impl Tool for ProofloopsLoopTool {
     fn description(&self) -> &str {
         "Bounded loop: suggest → patch first `sorry` in lemma → verify (`proofloops loop`)."
     }
@@ -1741,7 +1741,7 @@ impl ProofloopsStdioMcp {
         params: Parameters<serde_json::Value>,
     ) -> Result<CallToolResult, McpError> {
         // Delegate to the existing Tool implementation to avoid duplicating report logic.
-        let tool = ProofyloopsReportHtmlTool;
+        let tool = ProofloopsReportHtmlTool;
         let out = tool
             .call(&params.0)
             .await
@@ -1814,22 +1814,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig::new().with_tool_timeout(StdDuration::from_secs(tool_timeout_s));
 
     let server = McpServer::with_config(config)
-        .tool("proofloops_prompt", ProofyloopsPromptTool)?
-        .tool("proofloops_verify", ProofyloopsVerifyTool)?
-        .tool("proofloops_verify_summary", ProofyloopsVerifySummaryTool)?
-        .tool("proofloops_suggest", ProofyloopsSuggestTool)?
-        .tool("proofloops_patch", ProofyloopsPatchTool)?
-        .tool("proofloops_patch_region", ProofyloopsPatchRegionTool)?
-        .tool("proofloops_locate_sorries", ProofyloopsLocateSorriesTool)?
-        .tool("proofloops_context_pack", ProofyloopsContextPackTool)?
-        .tool("proofloops_triage_file", ProofyloopsTriageFileTool)?
-        .tool("proofloops_agent_step", ProofyloopsAgentStepTool)?
-        .tool("proofloops_report_html", ProofyloopsReportHtmlTool)?
+        .tool("proofloops_prompt", ProofloopsPromptTool)?
+        .tool("proofloops_verify", ProofloopsVerifyTool)?
+        .tool("proofloops_verify_summary", ProofloopsVerifySummaryTool)?
+        .tool("proofloops_suggest", ProofloopsSuggestTool)?
+        .tool("proofloops_patch", ProofloopsPatchTool)?
+        .tool("proofloops_patch_region", ProofloopsPatchRegionTool)?
+        .tool("proofloops_locate_sorries", ProofloopsLocateSorriesTool)?
+        .tool("proofloops_context_pack", ProofloopsContextPackTool)?
+        .tool("proofloops_triage_file", ProofloopsTriageFileTool)?
+        .tool("proofloops_agent_step", ProofloopsAgentStepTool)?
+        .tool("proofloops_report_html", ProofloopsReportHtmlTool)?
         .tool(
             "proofloops_rubberduck_prompt",
-            ProofyloopsRubberduckPromptTool,
+            ProofloopsRubberduckPromptTool,
         )?
-        .tool("proofloops_loop", ProofyloopsLoopTool)?;
+        .tool("proofloops_loop", ProofloopsLoopTool)?;
 
     eprintln!("proofloops MCP server listening on http://{addr}");
     server.serve(&addr).await?;
