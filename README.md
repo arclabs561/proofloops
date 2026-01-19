@@ -206,6 +206,16 @@ uvx --from /Users/arc/Documents/dev/proofyloops proofyloops review-diff \
   --scope unstaged
 ```
 
+Prompt-only (no network call; useful for piping into another reviewer):
+
+```bash
+uvx --from /Users/arc/Documents/dev/proofyloops proofyloops review-diff \
+  --repo /Users/arc/Documents/dev/geometry-of-numbers \
+  --scope unstaged \
+  --prompt-only \
+  --output-json /tmp/proofyloops-review-diff-prompt.json
+```
+
 Build a bounded review context pack for a git diff (no LLM call; safe-path filtering + optional transcript tail):
 
 ```bash

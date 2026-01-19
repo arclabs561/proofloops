@@ -595,7 +595,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     l.add_argument("--max-iters", type=int, default=3, help="Max iterations (bounded).")
 
     r = sub.add_parser("review-diff", help="LLM review of repo git diff (project-agnostic).")
-    r.add_argument("--repo", required=True, help="Repo root (directory containing lean-toolchain).")
+    r.add_argument("--repo", required=True, help="Repo root (git repository).")
     r.add_argument(
         "--scope",
         default="staged",
@@ -611,9 +611,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         help="Do not call an LLM; emit the bounded prompt JSON and exit 0.",
     )
     r.add_argument(
+        "--output-json",
+        help="If set, write JSON output to this path and print a small summary to stdout.",
+    )
+    r.add_argument(
         "--require-key",
         action="store_true",
         help="Fail if no provider is configured (otherwise prints a skip message and exits 0).",
+    )
+
+    ls = sub.add_parser("lint-style", help="Run `lake exe lint-style` with explicit module roots.")
+    ls.add_argument("--repo", required=True, help="Repo root (directory containing lean-toolchain).")
+    ls.add_argument("--github", action="store_true", help="Emit GitHub problem-matcher-friendly output.")
+    ls.add_argument(
+        "--module",
+        action="append",
+        default=[],
+        help="Module root to lint (repeatable). Example: --module Covolume",
     )
 
     args = p.parse_args(list(argv) if argv is not None else None)
@@ -768,33 +782,30 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "Return a concise review with concrete, actionable fixes.\n"
         )
 
-        user = json.dumps(
-            {
-                "repo_root": str(repo_root),
-                "scope": args.scope,
-                "changed_paths": changed,
-                "diff": diff,
-                "excerpts": excerpts,
-            },
-            ensure_ascii=False,
-        )
+        payload_obj = {
+            "repo_root": str(repo_root),
+            "scope": args.scope,
+            "changed_paths": changed,
+            "diff": diff,
+            "excerpts": excerpts,
+        }
+        user = json.dumps(payload_obj, ensure_ascii=False)
 
         if args.prompt_only:
-            print(
-                json.dumps(
-                    {
-                        "repo_root": str(repo_root),
-                        "scope": args.scope,
-                        "changed_paths": changed,
-                        "diff": diff,
-                        "excerpts": excerpts,
-                        "system": system,
-                        "user": user,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
+            out_obj = {
+                "repo_root": str(repo_root),
+                "scope": args.scope,
+                "system": system,
+                "payload": payload_obj,
+                "user": user,
+            }
+            out_json = json.dumps(out_obj, ensure_ascii=False, indent=2)
+            if args.output_json:
+                p = Path(args.output_json).expanduser().resolve()
+                p.write_text(out_json + "\n", encoding="utf-8")
+                print(json.dumps({"written": str(p), "bytes": len(out_json.encode("utf-8"))}, indent=2))
+                return
+            print(out_json)
             return
 
         try:
@@ -812,8 +823,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "model": resp.get("model"),
             "review": resp.get("content", ""),
         }
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        out_json = json.dumps(out, ensure_ascii=False, indent=2)
+        if args.output_json:
+            p = Path(args.output_json).expanduser().resolve()
+            p.write_text(out_json + "\n", encoding="utf-8")
+            print(json.dumps({"written": str(p), "bytes": len(out_json.encode("utf-8"))}, indent=2))
+            return
+        print(out_json)
         return
+
+    if args.cmd == "lint-style":
+        repo_root = Path(args.repo).expanduser().resolve()
+        lake = _resolve_lake()
+        cmd: List[str] = [str(lake), "exe", "lint-style"]
+        if bool(args.github):
+            cmd.append("--github")
+        modules = [m for m in (args.module or []) if str(m).strip()]
+        if not modules:
+            raise RuntimeError("lint-style: provide at least one --module (repeatable)")
+        cmd.extend(modules)
+        proc = subprocess.run(cmd, cwd=str(repo_root))
+        raise SystemExit(proc.returncode)
 
     raise RuntimeError(f"Unknown command: {args.cmd}")
 
