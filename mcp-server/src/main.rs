@@ -35,7 +35,7 @@ use std::time::Duration as StdDuration;
 use rmcp::{
     handler::server::router::tool::ToolRouter as RmcpToolRouter,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
     transport::stdio,
     ErrorData as McpError, ServiceExt,
@@ -1757,6 +1757,15 @@ impl ProofloopsStdioMcp {
 impl rmcp::ServerHandler for ProofloopsStdioMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
+            server_info: Implementation {
+                // What clients should display as the server name.
+                // (Default is the rmcp framework name, which is misleading for debugging.)
+                name: "proofloops-mcp".to_string(),
+                title: Some("proofloops-mcp".to_string()),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                icons: None,
+                website_url: None,
+            },
             instructions: Some(
                 "Tools for Lean proof triage/patching loops (proofloops). JSON-only, stdout reserved for MCP frames."
                     .to_string(),
