@@ -1091,18 +1091,62 @@ fn main() -> Result<(), String> {
 
                 // Flatten into agent-ready next actions.
                 for e in &error_samples {
+                    let lean_query = format!("Lean 4 {}", e);
                     next_actions.push(json!({
                         "kind": "fix_error",
                         "file": file,
                         "message": e,
                         "research": {
-                            "mcp_calls": [
+                            "plan": {
+                                "goal": "Find the underlying cause and a minimal fix.",
+                                "calls": [
                                 {
                                     "server": "user-arxiv-semantic-search-mcp",
-                                    "tool": "search_papers",
-                                    "arguments": { "query": format!("Lean 4 {}", e) }
+                                    "toolName": "search_papers",
+                                    "arguments": { "query": lean_query }
+                                },
+                                {
+                                    "server": "user-tavily-remote-mcp",
+                                    "toolName": "tavily_search",
+                                    "arguments": {
+                                        "query": lean_query,
+                                        "search_depth": "advanced",
+                                        "max_results": 5
+                                    }
+                                },
+                                {
+                                    "server": "user-perplexity",
+                                    "toolName": "search",
+                                    "arguments": {
+                                        "query": lean_query
+                                    }
                                 }
-                            ]
+                                ],
+                                "extract": {
+                                    "schema": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "root_cause": { "type": "string" },
+                                            "minimal_fix": { "type": "string" },
+                                            "keywords": { "type": "array", "items": { "type": "string" } },
+                                            "sources": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "additionalProperties": false,
+                                                    "properties": {
+                                                        "title": { "type": "string" },
+                                                        "url": { "type": "string" }
+                                                    },
+                                                    "required": ["url"]
+                                                }
+                                            }
+                                        },
+                                        "required": ["root_cause", "minimal_fix"]
+                                    }
+                                }
+                            }
                         }
                     }));
                 }
@@ -1124,6 +1168,7 @@ fn main() -> Result<(), String> {
                     } else {
                         format!("Lean proof {}", decl)
                     };
+                    let web_q = format!("{q} mathlib Lean");
                     next_actions.push(json!({
                         "kind": "fix_sorry",
                         "file": file,
@@ -1134,30 +1179,90 @@ fn main() -> Result<(), String> {
                         "decl_line": loc.decl_line,
                         "excerpt": loc.excerpt,
                         "research": {
-                            "mcp_calls": [
+                            "plan": {
+                                "goal": "Find a correct mathematical step and map it onto Lean/mathlib lemmas.",
+                                "calls": [
                                 {
                                     "server": "user-arxiv-semantic-search-mcp",
-                                    "tool": "search_papers",
+                                    "toolName": "search_papers",
                                     "arguments": { "query": q }
+                                },
+                                {
+                                    "server": "user-tavily-remote-mcp",
+                                    "toolName": "tavily_search",
+                                    "arguments": {
+                                        "query": web_q,
+                                        "search_depth": "advanced",
+                                        "max_results": 5
+                                    }
+                                },
+                                {
+                                    "server": "user-perplexity",
+                                    "toolName": "search",
+                                    "arguments": {
+                                        "query": format!("Summarize the key lemma/step for: {q}. Extract variable definitions and constraints, and mention any standard references.")
+                                    }
                                 }
-                            ]
+                                ],
+                                "extract": {
+                                    "schema": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "math_statement": { "type": "string" },
+                                            "variables": {
+                                                "type": "object",
+                                                "additionalProperties": { "type": "string" }
+                                            },
+                                            "constraints": { "type": "array", "items": { "type": "string" } },
+                                            "candidate_mathlib_lemmas": { "type": "array", "items": { "type": "string" } },
+                                            "sources": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "additionalProperties": false,
+                                                    "properties": {
+                                                        "title": { "type": "string" },
+                                                        "url": { "type": "string" }
+                                                    },
+                                                    "required": ["url"]
+                                                }
+                                            }
+                                        },
+                                        "required": ["math_statement"]
+                                    }
+                                }
+                            }
                         }
                     }));
                 }
                 // Warnings last: they are useful, but proof-blocking work is usually sorries/errors.
                 for w in &warning_samples {
+                    let lean_query = format!("Lean 4 {}", w);
                     next_actions.push(json!({
                         "kind": "fix_warning",
                         "file": file,
                         "message": w,
                         "research": {
-                            "mcp_calls": [
+                            "plan": {
+                                "goal": "Decide whether this warning matters and how to silence it correctly.",
+                                "calls": [
                                 {
                                     "server": "user-arxiv-semantic-search-mcp",
-                                    "tool": "search_papers",
-                                    "arguments": { "query": format!("Lean 4 {}", w) }
+                                    "toolName": "search_papers",
+                                    "arguments": { "query": lean_query }
+                                },
+                                {
+                                    "server": "user-tavily-remote-mcp",
+                                    "toolName": "tavily_search",
+                                    "arguments": {
+                                        "query": lean_query,
+                                        "search_depth": "basic",
+                                        "max_results": 5
+                                    }
                                 }
-                            ]
+                                ]
+                            }
                         }
                     }));
                 }

@@ -1077,7 +1077,7 @@ pub fn build_rubberduck_prompt(
     // Research hooks for agents (Cursor can execute these via MCP).
     //
     // Note: we keep these as *suggestions*; proofloops itself does not talk to MCP servers.
-    let arxiv_query = if decl.contains("nathanson") || decl.contains("polygonal") {
+    let q = if decl.contains("nathanson") || decl.contains("polygonal") {
         "Fermat polygonal number theorem Nathanson proof b^2 < 4a 3a < b^2 + 2b + 4 Cauchy lemma"
     } else if decl.contains("cauchy_lemma") {
         "Cauchy lemma b^2 < 4a 0 < b^2 + 2b - 3a + 4 a = sum of four squares b = sum of variables"
@@ -1086,12 +1086,56 @@ pub fn build_rubberduck_prompt(
     } else {
         "Lean 4 proof strategy for arithmetic lemmas"
     };
+    let web_q = format!("{q} mathlib Lean");
     user.push_str("\n\nResearch (optional):\n");
-    user.push_str("- MCP arXiv search stub:\n");
-    user.push_str(&format!(
-        "{{\"server\":\"user-arxiv-semantic-search-mcp\",\"tool\":\"search_papers\",\"arguments\":{{\"query\":\"{}\"}}}}",
-        arxiv_query
-    ));
+    user.push_str("- MCP research plan (multi-source):\n");
+    // Use JSON so strings are correctly escaped (quotes, backslashes, etc.).
+    // Match the CallMcpTool schema: server + toolName + arguments.
+    let plan = serde_json::json!({
+        "goal": "Collect a reliable statement and a Lean mapping plan.",
+        "calls": [
+            {
+                "server": "user-arxiv-semantic-search-mcp",
+                "toolName": "search_papers",
+                "arguments": { "query": q },
+            },
+            {
+                "server": "user-tavily-remote-mcp",
+                "toolName": "tavily_search",
+                "arguments": { "query": web_q, "search_depth": "advanced", "max_results": 5 },
+            },
+            {
+                "server": "user-perplexity",
+                "toolName": "search",
+                "arguments": {
+                    "query": format!("Summarize the key lemma/step for: {q}. Extract variable definitions and constraints, and mention standard references."),
+                },
+            }
+        ],
+        "extract": {
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "math_statement": { "type": "string" },
+                    "variables": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "constraints": { "type": "array", "items": { "type": "string" } },
+                    "candidate_mathlib_lemmas": { "type": "array", "items": { "type": "string" } },
+                    "sources": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": { "title": { "type": "string" }, "url": { "type": "string" } },
+                            "required": ["url"]
+                        }
+                    }
+                },
+                "required": ["math_statement"]
+            }
+        }
+    });
+    user.push_str(&plan.to_string());
     user.push('\n');
 
     Ok(PromptPayload {
@@ -1142,6 +1186,58 @@ pub fn build_rubberduck_prompt_from_excerpt(
     }
     user.push_str("\nFocused excerpt:\n\n");
     user.push_str(excerpt);
+
+    // Research hooks for agents (Cursor can execute these via MCP).
+    let q = focus_label;
+    let web_q = format!("{q} mathlib Lean");
+    user.push_str("\n\nResearch (optional):\n");
+    user.push_str("- MCP research plan (multi-source):\n");
+    let plan = serde_json::json!({
+        "goal": "Collect a reliable statement and a Lean mapping plan.",
+        "calls": [
+            {
+                "server": "user-arxiv-semantic-search-mcp",
+                "toolName": "search_papers",
+                "arguments": { "query": q },
+            },
+            {
+                "server": "user-tavily-remote-mcp",
+                "toolName": "tavily_search",
+                "arguments": { "query": web_q, "search_depth": "advanced", "max_results": 5 },
+            },
+            {
+                "server": "user-perplexity",
+                "toolName": "search",
+                "arguments": {
+                    "query": format!("Summarize the key lemma/step for: {q}. Extract variable definitions and constraints, and mention standard references."),
+                },
+            }
+        ],
+        "extract": {
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "math_statement": { "type": "string" },
+                    "variables": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "constraints": { "type": "array", "items": { "type": "string" } },
+                    "candidate_mathlib_lemmas": { "type": "array", "items": { "type": "string" } },
+                    "sources": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": { "title": { "type": "string" }, "url": { "type": "string" } },
+                            "required": ["url"]
+                        }
+                    }
+                },
+                "required": ["math_statement"]
+            }
+        }
+    });
+    user.push_str(&plan.to_string());
+    user.push('\n');
 
     Ok(PromptPayload {
         repo_root: repo_root.display().to_string(),
