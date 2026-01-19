@@ -35,6 +35,8 @@ pub mod review;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchSource {
     pub url: String,
+    /// Best-effort canonicalized URL used for deduping (e.g. arXiv pdf -> abs).
+    pub canonical_url: Option<String>,
     pub title: Option<String>,
     pub snippet: Option<String>,
     pub origin: Option<String>,
@@ -45,6 +47,32 @@ pub struct ResearchNotes {
     pub raw_urls: usize,
     pub deduped_urls: usize,
     pub sources: Vec<ResearchSource>,
+}
+
+fn canonicalize_url(url: &str) -> Option<String> {
+    let u = url.trim().trim_end_matches('/');
+    // arXiv: treat pdf and abs as the same paper.
+    // - https://arxiv.org/pdf/1234.5678.pdf  -> https://arxiv.org/abs/1234.5678
+    // - https://arxiv.org/pdf/1234.5678v2.pdf -> https://arxiv.org/abs/1234.5678v2
+    for host in ["https://arxiv.org/abs/", "http://arxiv.org/abs/"] {
+        if let Some(rest) = u.strip_prefix(host) {
+            let id = rest.trim_matches('/');
+            if !id.is_empty() {
+                return Some(format!("https://arxiv.org/abs/{id}"));
+            }
+        }
+    }
+    for host in ["https://arxiv.org/pdf/", "http://arxiv.org/pdf/"] {
+        if let Some(rest) = u.strip_prefix(host) {
+            if let Some(id) = rest.strip_suffix(".pdf") {
+                let id = id.trim_matches('/');
+                if !id.is_empty() {
+                    return Some(format!("https://arxiv.org/abs/{id}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_urlish_key(k: &str) -> bool {
@@ -86,14 +114,29 @@ fn collect_research_sources(
     out: &mut Vec<ResearchSource>,
     seen: &mut HashSet<String>,
     raw_urls: &mut usize,
+    current_origin: Option<&str>,
 ) {
     match v {
         serde_json::Value::Array(xs) => {
             for x in xs {
-                collect_research_sources(x, out, seen, raw_urls);
+                collect_research_sources(x, out, seen, raw_urls, current_origin);
             }
         }
         serde_json::Value::Object(obj) => {
+            // Track origin as we descend (tool/server context often wraps result arrays).
+            let mut origin_here: Option<String> = current_origin.map(|s| s.to_string());
+            let server = obj.get("server").and_then(|v| v.as_str());
+            let tool_name = obj
+                .get("toolName")
+                .and_then(|v| v.as_str())
+                .or_else(|| obj.get("tool").and_then(|v| v.as_str()))
+                .or_else(|| obj.get("source").and_then(|v| v.as_str()));
+            if let (Some(srv), Some(tn)) = (server, tool_name) {
+                origin_here = Some(format!("{srv}:{tn}"));
+            } else if let Some(tn) = tool_name {
+                origin_here = Some(tn.to_string());
+            }
+
             // If this object directly contains a URL field, emit a source.
             for (k, vv) in obj.iter() {
                 if !is_urlish_key(k) {
@@ -107,14 +150,18 @@ fn collect_research_sources(
                     continue;
                 }
                 *raw_urls += 1;
-                if seen.insert(url.to_string()) {
+                let canonical = canonicalize_url(url);
+                let key = canonical.as_deref().unwrap_or(url).to_string();
+                if seen.insert(key) {
                     let title = pick_string_field(obj, &["title", "name"]).map(|s| s.to_string());
                     let snippet = pick_string_field(obj, &["snippet", "summary", "content", "text", "abstract"])
                         .map(|s| s.to_string());
                     let origin = pick_string_field(obj, &["origin", "source", "server", "tool", "toolName"])
-                        .map(|s| s.to_string());
+                        .map(|s| s.to_string())
+                        .or_else(|| origin_here.clone());
                     out.push(ResearchSource {
                         url: url.to_string(),
+                        canonical_url: canonical,
                         title,
                         snippet,
                         origin,
@@ -124,7 +171,13 @@ fn collect_research_sources(
 
             // Recurse into all children.
             for vv in obj.values() {
-                collect_research_sources(vv, out, seen, raw_urls);
+                collect_research_sources(
+                    vv,
+                    out,
+                    seen,
+                    raw_urls,
+                    origin_here.as_deref().or(current_origin),
+                );
             }
         }
         _ => {}
@@ -135,7 +188,7 @@ pub fn ingest_research_json(v: &serde_json::Value) -> ResearchNotes {
     let mut sources = Vec::new();
     let mut seen = HashSet::new();
     let mut raw_urls = 0usize;
-    collect_research_sources(v, &mut sources, &mut seen, &mut raw_urls);
+    collect_research_sources(v, &mut sources, &mut seen, &mut raw_urls, None);
     ResearchNotes {
         raw_urls,
         deduped_urls: sources.len(),

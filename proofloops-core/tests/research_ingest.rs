@@ -28,3 +28,45 @@ fn ingest_dedupes_urls_and_keeps_titles() {
     assert_eq!(a.title.as_deref(), Some("A"));
 }
 
+#[test]
+fn ingest_propagates_origin_and_canonicalizes_arxiv_pdf() {
+    let v = serde_json::json!({
+        "tool_outputs": [
+            {
+                "tool": "tavily_search",
+                "results": [
+                    {"title":"Some PDF","url":"https://example.com/paper.pdf","snippet":"mentions Cauchy lemma"},
+                    {"title":"Duplicate","url":"https://example.com/paper.pdf"}
+                ]
+            },
+            {
+                "tool": "arxiv",
+                "papers": [
+                    {"title":"On polygonal numbers","link":"https://arxiv.org/abs/1234.5678","abstract":"..."},
+                    {"title":"On polygonal numbers (pdf)","pdf_url":"https://arxiv.org/pdf/1234.5678.pdf"}
+                ]
+            }
+        ]
+    });
+
+    let notes = ingest_research_json(&v);
+
+    // pdf + abs should dedupe to one canonical paper URL.
+    assert_eq!(notes.deduped_urls, 2);
+
+    let tav = notes
+        .sources
+        .iter()
+        .find(|s| s.url == "https://example.com/paper.pdf")
+        .expect("missing tavily source");
+    assert_eq!(tav.origin.as_deref(), Some("tavily_search"));
+
+    let arxiv_abs = notes
+        .sources
+        .iter()
+        .find(|s| s.url.starts_with("https://arxiv.org/"))
+        .expect("missing arxiv source");
+    assert_eq!(arxiv_abs.canonical_url.as_deref(), Some("https://arxiv.org/abs/1234.5678"));
+    assert_eq!(arxiv_abs.origin.as_deref(), Some("arxiv"));
+}
+
