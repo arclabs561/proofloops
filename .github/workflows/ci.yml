@@ -8,12 +8,12 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - name: install rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: install rustfmt
+        run: |
+          rustup update stable
+          rustup component add rustfmt
 
       - name: rustfmt
         run: cargo fmt --all --check
@@ -24,10 +24,10 @@ jobs:
   e2e-lean:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: install rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup update stable
 
       - name: install elan (Lean toolchain manager)
         run: |
