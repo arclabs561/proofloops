@@ -95,3 +95,15 @@ Defaults:
 - `PROOFPATCH_MCP_ADDR=127.0.0.1:8087`
 - `PROOFPATCH_MCP_TOOL_TIMEOUT_S=180`
 
+### CI / E2E testing
+
+This repo includes a tiny Lean project fixture under `fixtures/lean-fixture/` used by CI to exercise:
+
+- `proofpatch triage-file` against a real Lake project
+- the stdio MCP surface via `mcp-server/examples/stdio_smoke.rs`
+
+### Agentic tool-calling mode (context)
+
+The “agent loop + tool-calling contracts” engine lives in [`axi`](https://github.com/arclabs561/axi).
+`proofpatch` is designed to stay useful without it; any deeper agentic integration should remain **optional**.
+
