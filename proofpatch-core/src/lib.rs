@@ -30,13 +30,14 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::process::Command;
 
+pub mod json_extract;
 pub mod llm;
+#[cfg(feature = "lsp")]
+mod lsp_client;
 #[cfg(feature = "planner")]
 pub mod planner;
 pub mod review;
 pub mod tree_search;
-#[cfg(feature = "lsp")]
-mod lsp_client;
 
 #[derive(Debug, Clone)]
 struct LeanEnv {
@@ -188,7 +189,10 @@ fn is_urlish_key(k: &str) -> bool {
     )
 }
 
-fn pick_string_field<'a>(obj: &'a serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<&'a str> {
+fn pick_string_field<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<&'a str> {
     for k in keys {
         if let Some(v) = obj.get(*k).and_then(|v| v.as_str()) {
             if !v.trim().is_empty() {
@@ -252,11 +256,15 @@ fn collect_research_sources(
                 let key = canonical.as_deref().unwrap_or(url).to_string();
                 if seen.insert(key) {
                     let title = pick_string_field(obj, &["title", "name"]).map(|s| s.to_string());
-                    let snippet = pick_string_field(obj, &["snippet", "summary", "content", "text", "abstract"])
-                        .map(|s| s.to_string());
-                    let origin = pick_string_field(obj, &["origin", "source", "server", "tool", "toolName"])
-                        .map(|s| s.to_string())
-                        .or_else(|| origin_here.clone());
+                    let snippet = pick_string_field(
+                        obj,
+                        &["snippet", "summary", "content", "text", "abstract"],
+                    )
+                    .map(|s| s.to_string());
+                    let origin =
+                        pick_string_field(obj, &["origin", "source", "server", "tool", "toolName"])
+                            .map(|s| s.to_string())
+                            .or_else(|| origin_here.clone());
                     out.push(ResearchSource {
                         url: url.to_string(),
                         canonical_url: canonical,
@@ -448,7 +456,10 @@ pub fn attach_research_matches_to_next_actions(
             .collect();
 
         if let Some(obj) = a.as_object_mut() {
-            obj.insert("research_matches".to_string(), serde_json::Value::Array(matches));
+            obj.insert(
+                "research_matches".to_string(),
+                serde_json::Value::Array(matches),
+            );
         }
     }
 }
@@ -1012,8 +1023,8 @@ pub fn patch_first_sorry_in_decl(
         .ok_or_else(|| format!("Could not find theorem/lemma/def named {}", decl_name))?;
 
     let stop = usize::min(lines.len(), start + 350);
-    let sorry_pat =
-        Regex::new(r"\b(sorry|admit)\b").map_err(|e| format!("invalid sorry/admit regex: {}", e))?;
+    let sorry_pat = Regex::new(r"\b(sorry|admit)\b")
+        .map_err(|e| format!("invalid sorry/admit regex: {}", e))?;
 
     let mut sorry_line = None;
     for j in start..stop {
@@ -1157,8 +1168,8 @@ pub fn patch_first_sorry_in_region(
         return Err("Empty replacement.".to_string());
     }
 
-    let sorry_pat =
-        Regex::new(r"\b(sorry|admit)\b").map_err(|e| format!("invalid sorry/admit regex: {}", e))?;
+    let sorry_pat = Regex::new(r"\b(sorry|admit)\b")
+        .map_err(|e| format!("invalid sorry/admit regex: {}", e))?;
     let mut sorry_line = None;
     for j in start0..=end0 {
         let ln = &lines[j];
@@ -1262,8 +1273,8 @@ pub fn locate_sorries_in_text(
 ) -> Result<Vec<SorryLocation>, String> {
     let max_results = max_results.max(1).min(500);
     let context_lines = context_lines.min(50);
-    let sorry_pat =
-        Regex::new(r"\b(sorry|admit)\b").map_err(|e| format!("invalid sorry/admit regex: {}", e))?;
+    let sorry_pat = Regex::new(r"\b(sorry|admit)\b")
+        .map_err(|e| format!("invalid sorry/admit regex: {}", e))?;
 
     fn is_ident_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || c == '_' || c == '\''
@@ -1273,7 +1284,13 @@ pub fn locate_sorries_in_text(
         let t = line.trim_start();
         // Best-effort: keep this conservative; it’s a hint, not a parser.
         for kw in [
-            "theorem", "lemma", "def", "abbrev", "instance", "structure", "class",
+            "theorem",
+            "lemma",
+            "def",
+            "abbrev",
+            "instance",
+            "structure",
+            "class",
         ] {
             let prefix = format!("{kw} ");
             if let Some(rest) = t.strip_prefix(&prefix) {
@@ -2137,8 +2154,7 @@ pub async fn verify_lean_text(
     //
     // Env:
     // - `PROOFPATCH_AUTO_BUILD`
-    let auto_build =
-        env_truthy("PROOFPATCH_AUTO_BUILD", true);
+    let auto_build = env_truthy("PROOFPATCH_AUTO_BUILD", true);
     if auto_build && !repo_root.join(".lake/build/lib/lean").exists() {
         let mut build_cmd = Command::new(&lake);
         build_cmd.arg("build").current_dir(&repo_root);
@@ -2215,7 +2231,9 @@ pub async fn verify_lean_text(
     ];
     let lean_cmd_vec = vec!["lean".to_string(), tmp_path_buf.display().to_string()];
 
-    let (mut ok, mut timeout, mut returncode, mut stdout, mut stderr, cmd_vec) = match backend.as_str() {
+    let (mut ok, mut timeout, mut returncode, mut stdout, mut stderr, cmd_vec) = match backend
+        .as_str()
+    {
         #[cfg(feature = "lsp")]
         "lsp" => {
             // For LSP, prefer a stable path inside repo_root so rootUri contains the file.
@@ -2246,7 +2264,10 @@ pub async fn verify_lean_text(
                             Err(_) => {
                                 // Fall back to `lake env lean` so we still capture stdout/stderr.
                                 let mut cmd = Command::new(&lake);
-                                cmd.arg("env").arg("lean").arg(&tmp_path_buf).current_dir(&repo_root);
+                                cmd.arg("env")
+                                    .arg("lean")
+                                    .arg(&tmp_path_buf)
+                                    .current_dir(&repo_root);
                                 maybe_extend_lean_path_for_lake_env(&mut cmd);
                                 let out = tokio::time::timeout(timeout_s, cmd.output())
                                     .await
@@ -2263,8 +2284,10 @@ pub async fn verify_lean_text(
                                     Ok(Ok(output)) => {
                                         let ok = output.status.success();
                                         let returncode = output.status.code();
-                                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                                        let stdout =
+                                            String::from_utf8_lossy(&output.stdout).to_string();
+                                        let stderr =
+                                            String::from_utf8_lossy(&output.stderr).to_string();
                                         (ok, false, returncode, stdout, stderr)
                                     }
                                 };
@@ -2297,12 +2320,22 @@ pub async fn verify_lean_text(
                         )
                     }
                 }
-                Err(e) => (false, true, None, String::new(), format!("lsp backend failed: {e}"), vec!["lean".to_string(), "--server".to_string()]),
+                Err(e) => (
+                    false,
+                    true,
+                    None,
+                    String::new(),
+                    format!("lsp backend failed: {e}"),
+                    vec!["lean".to_string(), "--server".to_string()],
+                ),
             }
         }
         "lake" => {
             let mut cmd = Command::new(&lake);
-            cmd.arg("env").arg("lean").arg(&tmp_path_buf).current_dir(&repo_root);
+            cmd.arg("env")
+                .arg("lean")
+                .arg(&tmp_path_buf)
+                .current_dir(&repo_root);
             maybe_extend_lean_path_for_lake_env(&mut cmd);
             let out = tokio::time::timeout(timeout_s, cmd.output())
                 .await
@@ -2328,7 +2361,14 @@ pub async fn verify_lean_text(
         }
         "lean" => match run_lean_with_env(&repo_root, &lean_args, timeout_s).await {
             Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
-            Err(e) => (false, false, None, String::new(), format!("lean-env backend failed: {e}"), lean_cmd_vec),
+            Err(e) => (
+                false,
+                false,
+                None,
+                String::new(),
+                format!("lean-env backend failed: {e}"),
+                lean_cmd_vec,
+            ),
         },
         _ => {
             // auto: try lean-env first, then fallback to lake env on failure
@@ -2339,20 +2379,32 @@ pub async fn verify_lean_text(
                 let _ = std::fs::create_dir_all(&cache_root);
                 let p = cache_root.join("proofpatch_buffer.lean");
                 let txt = lean_text.to_string();
-                if let Ok(diag) = crate::lsp_client::check_text_via_lsp(&repo_root, &p, txt, timeout_s).await {
+                if let Ok(diag) =
+                    crate::lsp_client::check_text_via_lsp(&repo_root, &p, txt, timeout_s).await
+                {
                     let mut synth = String::new();
                     if !diag.lean_lines.is_empty() {
                         synth = diag.lean_lines.join("\n");
                         synth.push('\n');
                     }
                     // Keep the buffer file around; it lives under `.generated/`.
-                    (diag.ok, false, None, synth, diag.stderr, vec!["lean".to_string(), "--server".to_string()])
+                    (
+                        diag.ok,
+                        false,
+                        None,
+                        synth,
+                        diag.stderr,
+                        vec!["lean".to_string(), "--server".to_string()],
+                    )
                 } else {
                     match run_lean_with_env(&repo_root, &lean_args, timeout_s).await {
                         Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
                         Err(_) => {
                             let mut cmd = Command::new(&lake);
-                            cmd.arg("env").arg("lean").arg(&tmp_path_buf).current_dir(&repo_root);
+                            cmd.arg("env")
+                                .arg("lean")
+                                .arg(&tmp_path_buf)
+                                .current_dir(&repo_root);
                             maybe_extend_lean_path_for_lake_env(&mut cmd);
                             let out = tokio::time::timeout(timeout_s, cmd.output())
                                 .await
@@ -2369,8 +2421,10 @@ pub async fn verify_lean_text(
                                 Ok(Ok(output)) => {
                                     let ok = output.status.success();
                                     let returncode = output.status.code();
-                                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                                    let stdout =
+                                        String::from_utf8_lossy(&output.stdout).to_string();
+                                    let stderr =
+                                        String::from_utf8_lossy(&output.stderr).to_string();
                                     (ok, false, returncode, stdout, stderr)
                                 }
                             };
@@ -2385,7 +2439,10 @@ pub async fn verify_lean_text(
                     Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
                     Err(_) => {
                         let mut cmd = Command::new(&lake);
-                        cmd.arg("env").arg("lean").arg(&tmp_path_buf).current_dir(&repo_root);
+                        cmd.arg("env")
+                            .arg("lean")
+                            .arg(&tmp_path_buf)
+                            .current_dir(&repo_root);
                         maybe_extend_lean_path_for_lake_env(&mut cmd);
                         let out = tokio::time::timeout(timeout_s, cmd.output())
                             .await
@@ -2465,7 +2522,10 @@ pub async fn verify_lean_text(
             let r = match backend.as_str() {
                 "lake" => {
                     let mut cmd = Command::new(&lake);
-                    cmd.arg("env").arg("lean").arg(&tmp_path_buf).current_dir(&repo_root);
+                    cmd.arg("env")
+                        .arg("lean")
+                        .arg(&tmp_path_buf)
+                        .current_dir(&repo_root);
                     maybe_extend_lean_path_for_lake_env(&mut cmd);
                     let out2 = tokio::time::timeout(timeout_s, cmd.output())
                         .await
@@ -2492,7 +2552,10 @@ pub async fn verify_lean_text(
                     Ok(r) => (r.0, r.1, r.2, r.3, r.4),
                     Err(_) => {
                         let mut cmd = Command::new(&lake);
-                        cmd.arg("env").arg("lean").arg(&tmp_path_buf).current_dir(&repo_root);
+                        cmd.arg("env")
+                            .arg("lean")
+                            .arg(&tmp_path_buf)
+                            .current_dir(&repo_root);
                         maybe_extend_lean_path_for_lake_env(&mut cmd);
                         let out2 = tokio::time::timeout(timeout_s, cmd.output())
                             .await
@@ -2556,8 +2619,7 @@ pub async fn verify_lean_file(
     // Prefer verifying the real file path. This avoids module-resolution problems for repos
     // that use their own module roots (e.g. `MIL.*`) and haven’t been built yet.
     let lake = resolve_lake();
-    let auto_build =
-        env_truthy("PROOFPATCH_AUTO_BUILD", true);
+    let auto_build = env_truthy("PROOFPATCH_AUTO_BUILD", true);
     // Only build if output dir is missing (avoid redundant builds).
     if auto_build && !repo_root.join(".lake/build/lib/lean").exists() {
         let mut build_cmd = Command::new(&lake);
@@ -2623,35 +2685,69 @@ pub async fn verify_lean_file(
                         synth = diag.lean_lines.join("\n");
                         synth.push('\n');
                     }
-                    (diag.ok, false, None, synth, diag.stderr, vec!["lean".to_string(), "--server".to_string()])
+                    (
+                        diag.ok,
+                        false,
+                        None,
+                        synth,
+                        diag.stderr,
+                        vec!["lean".to_string(), "--server".to_string()],
+                    )
                 }
                 Err(_) => {
                     // fall back to lean-env (captured `lake env env`) for file verification
-                    match run_lean_with_env(&repo_root, &[p.display().to_string()], timeout_s).await {
+                    match run_lean_with_env(&repo_root, &[p.display().to_string()], timeout_s).await
+                    {
                         Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
-                        Err(e) => (false, false, None, String::new(), format!("lean-env backend failed: {e}"), lean_cmd_vec),
+                        Err(e) => (
+                            false,
+                            false,
+                            None,
+                            String::new(),
+                            format!("lean-env backend failed: {e}"),
+                            lean_cmd_vec,
+                        ),
                     }
                 }
             }
         }
-        "lean" => match run_lean_with_env(&repo_root, &[p.display().to_string()], timeout_s).await {
-            Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
-            Err(e) => (false, false, None, String::new(), format!("lean-env backend failed: {e}"), lean_cmd_vec),
-        },
+        "lean" => {
+            match run_lean_with_env(&repo_root, &[p.display().to_string()], timeout_s).await {
+                Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
+                Err(e) => (
+                    false,
+                    false,
+                    None,
+                    String::new(),
+                    format!("lean-env backend failed: {e}"),
+                    lean_cmd_vec,
+                ),
+            }
+        }
         _ => {
             // auto: try lean-env first, then fallback to lake env on failure
             #[cfg(feature = "lsp")]
             {
                 let txt = std::fs::read_to_string(&p).unwrap_or_default();
-                if let Ok(diag) = crate::lsp_client::check_text_via_lsp(&repo_root, &p, txt, timeout_s).await {
+                if let Ok(diag) =
+                    crate::lsp_client::check_text_via_lsp(&repo_root, &p, txt, timeout_s).await
+                {
                     let mut synth = String::new();
                     if !diag.lean_lines.is_empty() {
                         synth = diag.lean_lines.join("\n");
                         synth.push('\n');
                     }
-                    (diag.ok, false, None, synth, diag.stderr, vec!["lean".to_string(), "--server".to_string()])
+                    (
+                        diag.ok,
+                        false,
+                        None,
+                        synth,
+                        diag.stderr,
+                        vec!["lean".to_string(), "--server".to_string()],
+                    )
                 } else {
-                    match run_lean_with_env(&repo_root, &[p.display().to_string()], timeout_s).await {
+                    match run_lean_with_env(&repo_root, &[p.display().to_string()], timeout_s).await
+                    {
                         Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
                         Err(_) => {
                             let r = run_lake().await;
@@ -2920,7 +3016,8 @@ pub async fn goal_dump_nearest(
 
     // First, get a baseline error location (if any) to choose the closest sorry.
     let baseline = verify_lean_file(&repo_root, file_rel, timeout_s).await?;
-    let first_error_line_1 = parse_first_error_loc(&baseline.stdout, &baseline.stderr).map(|l| l.line);
+    let first_error_line_1 =
+        parse_first_error_loc(&baseline.stdout, &baseline.stderr).map(|l| l.line);
 
     let locs = locate_sorries_in_text(&original, 50, 1)?;
     let selected = select_primary_sorry(first_error_line_1, &locs)
@@ -2993,7 +3090,8 @@ end ProofpatchInline
         // Reuse existing summarizer in mcp-server; here we do minimal, similar fields.
         let stdout = v.get("stdout").and_then(|x| x.as_str()).unwrap_or("");
         let stderr = v.get("stderr").and_then(|x| x.as_str()).unwrap_or("");
-        let first_error_loc = parse_first_error_loc(stdout, stderr).and_then(|loc| serde_json::to_value(loc).ok());
+        let first_error_loc =
+            parse_first_error_loc(stdout, stderr).and_then(|loc| serde_json::to_value(loc).ok());
         let errors = stdout.matches(": error:").count()
             + stdout.matches(": error(").count()
             + stderr.matches(": error:").count()
@@ -3018,10 +3116,7 @@ end ProofpatchInline
     let mut pp_dump: Option<serde_json::Value> = None;
     let merged = format!("{}\n{}", verify.stdout, verify.stderr);
     for obj in extract_json_object_by_brace_balance(&merged) {
-        let is_pp = obj
-            .get("tool")
-            .and_then(|v| v.as_str())
-            == Some("proofpatch")
+        let is_pp = obj.get("tool").and_then(|v| v.as_str()) == Some("proofpatch")
             && obj.get("kind").and_then(|v| v.as_str()) == Some("pp_dump");
         if is_pp {
             pp_dump = Some(obj);
@@ -3088,7 +3183,11 @@ fn extract_try_this_suggestions(text: &str) -> Vec<String> {
     out
 }
 
-fn is_tactic_context_for_sorry(text: &str, selected_line_1: usize, selected_line_text: &str) -> bool {
+fn is_tactic_context_for_sorry(
+    text: &str,
+    selected_line_1: usize,
+    selected_line_text: &str,
+) -> bool {
     // This is a heuristic; it should be stable and conservative.
     //
     // We treat a `sorry` as a tactic hole if it is indented under a `by` line.
@@ -3165,7 +3264,8 @@ pub async fn lean_suggest_nearest(
         .map_err(|e| format!("failed to read {}: {}", p.display(), e))?;
 
     let baseline = verify_lean_file(&repo_root, file_rel, timeout_s).await?;
-    let first_error_line_1 = parse_first_error_loc(&baseline.stdout, &baseline.stderr).map(|l| l.line);
+    let first_error_line_1 =
+        parse_first_error_loc(&baseline.stdout, &baseline.stderr).map(|l| l.line);
 
     lean_suggest_in_text_at(
         &repo_root,
@@ -3239,13 +3339,15 @@ pub async fn lean_suggest_in_text_at(
         .filter(|s| !s.is_empty())
         .collect();
     if order.is_empty() {
-        order = vec!["simp?".into(), "aesop?".into(), "exact?".into(), "apply?".into()];
+        order = vec![
+            "simp?".into(),
+            "aesop?".into(),
+            "exact?".into(),
+            "apply?".into(),
+        ];
     }
     // Filter banned and clamp by pass budget.
-    let mut try_tactics: Vec<String> = order
-        .into_iter()
-        .filter(|t| !ban.contains(t))
-        .collect();
+    let mut try_tactics: Vec<String> = order.into_iter().filter(|t| !ban.contains(t)).collect();
     if try_tactics.is_empty() {
         try_tactics = vec!["simp?".into()];
     }
@@ -3350,16 +3452,17 @@ end ProofpatchInline
                     // Best-effort parse pp_dump from the current run.
                     let mut target_line: Option<String> = None;
                     for obj in extract_json_object_by_brace_balance(&merged) {
-                        let is_pp = obj
-                            .get("tool")
-                            .and_then(|v| v.as_str())
-                            == Some("proofpatch")
+                        let is_pp = obj.get("tool").and_then(|v| v.as_str()) == Some("proofpatch")
                             && obj.get("kind").and_then(|v| v.as_str()) == Some("pp_dump");
                         if !is_pp {
                             continue;
                         }
                         if let Some(goals) = obj.get("goals").and_then(|v| v.as_array()) {
-                            if let Some(g0) = goals.first().and_then(|v| v.get("pretty")).and_then(|v| v.as_str()) {
+                            if let Some(g0) = goals
+                                .first()
+                                .and_then(|v| v.get("pretty"))
+                                .and_then(|v| v.as_str())
+                            {
                                 for ln in g0.lines() {
                                     if let Some(rest) = ln.trim_start().strip_prefix("⊢") {
                                         target_line = Some(rest.trim().to_string());
@@ -3372,7 +3475,10 @@ end ProofpatchInline
                     }
 
                     if let Some(tgt) = target_line {
-                        let is_ineq = tgt.contains('≤') || tgt.contains('≥') || tgt.contains('<') || tgt.contains('>');
+                        let is_ineq = tgt.contains('≤')
+                            || tgt.contains('≥')
+                            || tgt.contains('<')
+                            || tgt.contains('>');
                         if is_ineq {
                             break;
                         }
@@ -3395,10 +3501,7 @@ end ProofpatchInline
     // Reuse existing goal dump extraction.
     let mut pp_dump: Option<serde_json::Value> = None;
     for obj in extract_json_object_by_brace_balance(&merged) {
-        let is_pp = obj
-            .get("tool")
-            .and_then(|v| v.as_str())
-            == Some("proofpatch")
+        let is_pp = obj.get("tool").and_then(|v| v.as_str()) == Some("proofpatch")
             && obj.get("kind").and_then(|v| v.as_str()) == Some("pp_dump");
         if is_pp {
             pp_dump = Some(obj);
@@ -3510,10 +3613,7 @@ end ProofpatchInline
     let merged = format!("{}\n{}", verify.stdout, verify.stderr);
     let mut pp_dump: Option<serde_json::Value> = None;
     for obj in extract_json_object_by_brace_balance(&merged) {
-        let is_pp = obj
-            .get("tool")
-            .and_then(|v| v.as_str())
-            == Some("proofpatch")
+        let is_pp = obj.get("tool").and_then(|v| v.as_str()) == Some("proofpatch")
             && obj.get("kind").and_then(|v| v.as_str()) == Some("pp_dump");
         if is_pp {
             pp_dump = Some(obj);
