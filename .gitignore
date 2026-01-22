@@ -12,3 +12,9 @@ tmp/
 .tmp/
 .generated/
 
+# Lean build artifacts (from embedded Lean projects)
+**/.lake/
+
+# Research PDFs (keep repo light; store links + extracted notes instead)
+*.pdf
+
