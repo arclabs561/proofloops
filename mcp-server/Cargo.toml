@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-axum-mcp = { path = "../../axum-mcp" }
+axum-mcp = { git = "https://github.com/arclabs561/axum-mcp.git", rev = "b9a648182cf0377e7fb5e4189e19b7298c47a98f", package = "axum-mcp" }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

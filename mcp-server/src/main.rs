@@ -192,7 +192,11 @@ fn resolve_lean_repo_root(repo_root: PathBuf, file: Option<&str>) -> Result<Path
     // Lean project, use the file location as the anchor for upward discovery.
     if let Some(f) = file {
         let p = PathBuf::from(f);
-        let abs = if p.is_absolute() { p } else { repo_root.join(p) };
+        let abs = if p.is_absolute() {
+            p
+        } else {
+            repo_root.join(p)
+        };
         if let Some(parent) = abs.parent() {
             if let Ok(r) = plc::find_lean_repo_root(parent) {
                 return Ok(r);
@@ -650,8 +654,8 @@ impl Tool for ProofpatchPatchNearestTool {
         let verify_raw_v = serde_json::to_value(verify)
             .map_err(|e| format!("failed to serialize verify result: {}", e))?;
         let verify_summary = summarize_verify_like_output(&verify_raw_v);
-        let selected_v =
-            serde_json::to_value(&selected).map_err(|e| format!("failed to serialize sorry: {}", e))?;
+        let selected_v = serde_json::to_value(&selected)
+            .map_err(|e| format!("failed to serialize sorry: {}", e))?;
 
         Ok(json!({
             "repo_root": repo_root.display().to_string(),
@@ -753,11 +757,8 @@ impl Tool for ProofpatchTreeSearchNearestTool {
         }
 
         use plc::tree_search::{
-            adapt_candidates_for_error,
-            default_det_candidates as default_candidates,
-            parse_json_string_array,
-            progress_score_key,
-            sanitize_candidates,
+            adapt_candidates_for_error, default_det_candidates as default_candidates,
+            parse_json_string_array, progress_score_key, sanitize_candidates,
             verify_score_key as score_key,
         };
 
@@ -804,8 +805,7 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                     .filter(|s| !s.is_empty())
                     .collect::<Vec<_>>()
             })
-            .filter(|xs: &Vec<String>| !xs.is_empty())
-            ;
+            .filter(|xs: &Vec<String>| !xs.is_empty());
 
         if beam == 0 {
             return Err("beam must be >= 1".to_string());
@@ -828,7 +828,11 @@ impl Tool for ProofpatchTreeSearchNearestTool {
             .map_err(|e| format!("failed to read {}: {}", p.display(), e))?;
 
         let mut goal_dump_v: Option<serde_json::Value> = None;
-        if include_goal_dump || candidates_mode == "auto" || candidates_mode == "llm" || candidates_mode == "lean" {
+        if include_goal_dump
+            || candidates_mode == "auto"
+            || candidates_mode == "llm"
+            || candidates_mode == "lean"
+        {
             if let Ok(gd) =
                 plc::goal_dump_nearest(&repo_root, &file, StdDuration::from_secs(timeout_s)).await
             {
@@ -839,7 +843,10 @@ impl Tool for ProofpatchTreeSearchNearestTool {
         let mut candidates = if let Some(ref xs) = candidates_override {
             xs.clone()
         } else if candidates_mode == "lean" {
-            let ls = plc::lean_suggest_nearest(&repo_root, &file, StdDuration::from_secs(timeout_s)).await.ok();
+            let ls =
+                plc::lean_suggest_nearest(&repo_root, &file, StdDuration::from_secs(timeout_s))
+                    .await
+                    .ok();
             let mut xs = ls
                 .as_ref()
                 .and_then(|v| v.get("suggestions"))
@@ -873,7 +880,11 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let derived = plc::derive_candidates_from_goal_pretty(pretty);
-                if derived.is_empty() { default_candidates() } else { derived }
+                if derived.is_empty() {
+                    default_candidates()
+                } else {
+                    derived
+                }
             } else {
                 xs
             }
@@ -888,7 +899,11 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let derived = plc::derive_candidates_from_goal_pretty(pretty);
-            if derived.is_empty() { default_candidates() } else { derived }
+            if derived.is_empty() {
+                default_candidates()
+            } else {
+                derived
+            }
         } else {
             default_candidates()
         };
@@ -932,7 +947,8 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                 &system,
                 &payload.user,
                 StdDuration::from_secs(llm_timeout_s),
-            ).await;
+            )
+            .await;
             if let Ok(done) = res {
                 if let Some(xs) = parse_json_string_array(&done.content) {
                     candidates = xs;
@@ -982,7 +998,11 @@ impl Tool for ProofpatchTreeSearchNearestTool {
 
         while !frontier.is_empty() && trace.len() < max_nodes {
             for n in frontier.iter() {
-                let ok = n.verify_summary.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                let ok = n
+                    .verify_summary
+                    .get("ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if ok && n.sorries == 0 {
                     best_done = Some(n.clone());
                     break;
@@ -994,7 +1014,11 @@ impl Tool for ProofpatchTreeSearchNearestTool {
 
             frontier.sort_by(|a, b| {
                 score_key(&a.verify_summary, a.sorries, a.conservative_sorries)
-                    .cmp(&score_key(&b.verify_summary, b.sorries, b.conservative_sorries))
+                    .cmp(&score_key(
+                        &b.verify_summary,
+                        b.sorries,
+                        b.conservative_sorries,
+                    ))
                     .then_with(|| a.id.cmp(&b.id))
             });
             if frontier.len() > beam {
@@ -1046,15 +1070,24 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                     if trace.len() + new_frontier.len() >= max_nodes {
                         break;
                     }
-                    let Ok(patched) = plc::patch_first_sorry_in_region(&parent.text, region.0, region.1, cand) else {
+                    let Ok(patched) =
+                        plc::patch_first_sorry_in_region(&parent.text, region.0, region.1, cand)
+                    else {
                         continue;
                     };
-                    let raw = plc::verify_lean_text(&repo_root, &patched.text, StdDuration::from_secs(timeout_s)).await?;
+                    let raw = plc::verify_lean_text(
+                        &repo_root,
+                        &patched.text,
+                        StdDuration::from_secs(timeout_s),
+                    )
+                    .await?;
                     let raw_v = serde_json::to_value(raw)
                         .map_err(|e| format!("failed to serialize verify result: {}", e))?;
                     let summary = summarize_verify_like_output(&raw_v);
-                    let locs2 = plc::locate_sorries_in_text(&patched.text, 500, 1).unwrap_or_default();
-                    let conservative2 = plc::count_sorry_tokens_conservative(&patched.text).unwrap_or(0);
+                    let locs2 =
+                        plc::locate_sorries_in_text(&patched.text, 500, 1).unwrap_or_default();
+                    let conservative2 =
+                        plc::count_sorry_tokens_conservative(&patched.text).unwrap_or(0);
                     new_frontier.push(Node {
                         id: next_id,
                         parent: Some(parent.id),
@@ -1079,7 +1112,11 @@ impl Tool for ProofpatchTreeSearchNearestTool {
         if best.is_none() && !frontier.is_empty() {
             frontier.sort_by(|a, b| {
                 score_key(&a.verify_summary, a.sorries, a.conservative_sorries)
-                    .cmp(&score_key(&b.verify_summary, b.sorries, b.conservative_sorries))
+                    .cmp(&score_key(
+                        &b.verify_summary,
+                        b.sorries,
+                        b.conservative_sorries,
+                    ))
                     .then_with(|| a.id.cmp(&b.id))
             });
             best = Some(frontier[0].clone());
@@ -1095,9 +1132,15 @@ impl Tool for ProofpatchTreeSearchNearestTool {
             let mut best_idx = 0usize;
             let mut best_key = (i64::MAX, 9, i64::MAX, i64::MAX);
             for (i, v) in trace.iter().enumerate() {
-                let summary = v.get("verify").and_then(|x| x.get("summary")).unwrap_or(&serde_json::Value::Null);
+                let summary = v
+                    .get("verify")
+                    .and_then(|x| x.get("summary"))
+                    .unwrap_or(&serde_json::Value::Null);
                 let sorries = v.get("sorries").and_then(|x| x.as_u64()).unwrap_or(999) as usize;
-                let conservative = v.get("conservative_sorries").and_then(|x| x.as_u64()).unwrap_or(999) as usize;
+                let conservative = v
+                    .get("conservative_sorries")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(999) as usize;
                 let k = progress_score_key(summary, sorries, conservative);
                 if k < best_key {
                     best_key = k;
@@ -1108,15 +1151,28 @@ impl Tool for ProofpatchTreeSearchNearestTool {
             let chosen = &trace[best_idx];
             Node {
                 id: chosen.get("id").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
-                parent: chosen.get("parent").and_then(|x| x.as_u64()).map(|x| x as usize),
+                parent: chosen
+                    .get("parent")
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as usize),
                 depth: chosen.get("depth").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
                 text: best.text.clone(),
                 last_region: None,
                 last_replacement: None,
                 verify_raw: serde_json::Value::Null,
-                verify_summary: chosen.get("verify").and_then(|x| x.get("summary")).cloned().unwrap_or(serde_json::Value::Null),
-                sorries: chosen.get("sorries").and_then(|x| x.as_u64()).unwrap_or(999) as usize,
-                conservative_sorries: chosen.get("conservative_sorries").and_then(|x| x.as_u64()).unwrap_or(999) as usize,
+                verify_summary: chosen
+                    .get("verify")
+                    .and_then(|x| x.get("summary"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                sorries: chosen
+                    .get("sorries")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(999) as usize,
+                conservative_sorries: chosen
+                    .get("conservative_sorries")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(999) as usize,
             }
         };
 
@@ -1568,8 +1624,12 @@ fn apply_mechanical_fixes_for_first_error(
 
             // Avoid duplicating `classical` if it's already in the local tactic block.
             let scan0 = i0.saturating_sub(4);
-            let already_classical = (scan0..=i0)
-                .any(|j0| lines.get(j0).map(|s| s.trim() == "classical").unwrap_or(false));
+            let already_classical = (scan0..=i0).any(|j0| {
+                lines
+                    .get(j0)
+                    .map(|s| s.trim() == "classical")
+                    .unwrap_or(false)
+            });
             if already_classical {
                 continue;
             }
@@ -1649,8 +1709,7 @@ impl Tool for ProofpatchAgentStepTool {
         let verify0 =
             plc::verify_lean_file(&repo_root, &file, StdDuration::from_secs(timeout_s)).await?;
         let first_error_loc = plc::parse_first_error_loc(&verify0.stdout, &verify0.stderr);
-        let first_error_text =
-            first_error_snippet(&verify0.stdout, &verify0.stderr, 12);
+        let first_error_text = first_error_snippet(&verify0.stdout, &verify0.stderr, 12);
 
         let (patched_text, edits) = apply_mechanical_fixes_for_first_error(
             &original_text,
@@ -2487,7 +2546,9 @@ impl ProofpatchStdioMcp {
     // `serde_json::Value` to avoid duplicating schemas for less frequently used tools.
     // ---------------------------------------------------------------------
 
-    #[tool(description = "Extract the (system,user) prompt + excerpt for a lemma (`proofpatch prompt`).")]
+    #[tool(
+        description = "Extract the (system,user) prompt + excerpt for a lemma (`proofpatch prompt`)."
+    )]
     async fn proofpatch_prompt(
         &self,
         params: Parameters<PromptArgs>,
@@ -2499,7 +2560,9 @@ impl ProofpatchStdioMcp {
             .call(&v)
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 
     #[tool(description = "Elaboration-check a file (`proofpatch verify`).")]
@@ -2514,10 +2577,14 @@ impl ProofpatchStdioMcp {
             .call(&v)
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 
-    #[tool(description = "Elaboration-check a file, returning a small summary plus raw output (`proofpatch verify`).")]
+    #[tool(
+        description = "Elaboration-check a file, returning a small summary plus raw output (`proofpatch verify`)."
+    )]
     async fn proofpatch_verify_summary(
         &self,
         params: Parameters<VerifyArgs>,
@@ -2529,10 +2596,14 @@ impl ProofpatchStdioMcp {
             .call(&v)
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 
-    #[tool(description = "Locate `sorry` tokens in a file with line/col and suggested patch regions.")]
+    #[tool(
+        description = "Locate `sorry` tokens in a file with line/col and suggested patch regions."
+    )]
     async fn proofpatch_locate_sorries(
         &self,
         params: Parameters<LocateSorriesArgs>,
@@ -2544,10 +2615,14 @@ impl ProofpatchStdioMcp {
             .call(&v)
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 
-    #[tool(description = "Suggest a proof by running the configured LLM router (`proofpatch suggest`).")]
+    #[tool(
+        description = "Suggest a proof by running the configured LLM router (`proofpatch suggest`)."
+    )]
     async fn proofpatch_suggest(
         &self,
         params: Parameters<SuggestArgs>,
@@ -2559,10 +2634,14 @@ impl ProofpatchStdioMcp {
             .call(&v)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 
-    #[tool(description = "Patch a lemma’s first `sorry` with provided Lean code, then verify (`proofpatch patch`).")]
+    #[tool(
+        description = "Patch a lemma’s first `sorry` with provided Lean code, then verify (`proofpatch patch`)."
+    )]
     async fn proofpatch_patch(
         &self,
         params: Parameters<PatchArgs>,
@@ -2574,7 +2653,9 @@ impl ProofpatchStdioMcp {
             .call(&v)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 
     #[tool(description = "Patch the first `sorry` within a (line-based) region and verify.")]
@@ -2589,10 +2670,14 @@ impl ProofpatchStdioMcp {
             .call(&v)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 
-    #[tool(description = "Build a rubberduck/ideation prompt for a lemma (no proof code; plan + next moves).")]
+    #[tool(
+        description = "Build a rubberduck/ideation prompt for a lemma (no proof code; plan + next moves)."
+    )]
     async fn proofpatch_rubberduck_prompt(
         &self,
         params: Parameters<RubberduckArgs>,
@@ -2604,10 +2689,14 @@ impl ProofpatchStdioMcp {
             .call(&v)
             .await
             .map_err(|e| McpError::invalid_params(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 
-    #[tool(description = "Bounded loop: suggest → patch first `sorry` in lemma → verify (`proofpatch loop`).")]
+    #[tool(
+        description = "Bounded loop: suggest → patch first `sorry` in lemma → verify (`proofpatch loop`)."
+    )]
     async fn proofpatch_loop(
         &self,
         params: Parameters<LoopArgs>,
@@ -2619,7 +2708,9 @@ impl ProofpatchStdioMcp {
             .call(&v)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 
     #[tool(description = "Execute one safe agent step (no LLM): verify → mechanical fix → verify")]
@@ -2866,7 +2957,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let addr = std::env::var("PROOFPATCH_MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:8087".to_string());
+    let addr =
+        std::env::var("PROOFPATCH_MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:8087".to_string());
 
     // The default axum-mcp tool timeout is 30s, but `lake build` / `lake env lean` can take longer
     // even on successful runs (big mathlib files + linters + first-time dependency builds).
@@ -2895,7 +2987,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .tool("proofpatch_triage_file", ProofpatchTriageFileTool)?
             .tool("proofpatch_patch_region", ProofpatchPatchRegionTool)?
             .tool("proofpatch_patch_nearest", ProofpatchPatchNearestTool)?
-            .tool("proofpatch_tree_search_nearest", ProofpatchTreeSearchNearestTool)?,
+            .tool(
+                "proofpatch_tree_search_nearest",
+                ProofpatchTreeSearchNearestTool,
+            )?,
         "full" => McpServer::with_config(config)
             .tool("proofpatch_prompt", ProofpatchPromptTool)?
             .tool("proofpatch_verify", ProofpatchVerifyTool)?
@@ -2904,19 +2999,24 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .tool("proofpatch_patch", ProofpatchPatchTool)?
             .tool("proofpatch_patch_region", ProofpatchPatchRegionTool)?
             .tool("proofpatch_patch_nearest", ProofpatchPatchNearestTool)?
-            .tool("proofpatch_tree_search_nearest", ProofpatchTreeSearchNearestTool)?
+            .tool(
+                "proofpatch_tree_search_nearest",
+                ProofpatchTreeSearchNearestTool,
+            )?
             .tool("proofpatch_locate_sorries", ProofpatchLocateSorriesTool)?
             .tool("proofpatch_context_pack", ProofpatchContextPackTool)?
             .tool("proofpatch_triage_file", ProofpatchTriageFileTool)?
             .tool("proofpatch_agent_step", ProofpatchAgentStepTool)?
             .tool("proofpatch_report_html", ProofpatchReportHtmlTool)?
-            .tool("proofpatch_rubberduck_prompt", ProofpatchRubberduckPromptTool)?
+            .tool(
+                "proofpatch_rubberduck_prompt",
+                ProofpatchRubberduckPromptTool,
+            )?
             .tool("proofpatch_loop", ProofpatchLoopTool)?,
         other => {
-            return Err(format!(
-                "unknown PROOFPATCH_MCP_TOOLSET={other} (expected minimal|full)"
+            return Err(
+                format!("unknown PROOFPATCH_MCP_TOOLSET={other} (expected minimal|full)").into(),
             )
-            .into())
         }
     };
 
@@ -2956,8 +3056,14 @@ mod tests {
 
         mk(&ws_root);
         mk(&lean_root);
-        touch(&lean_root.join("lean-toolchain"), "leanprover/lean4:stable\n");
-        touch(&lean_root.join("lakefile.toml"), "[package]\nname = \"leanproj\"\n");
+        touch(
+            &lean_root.join("lean-toolchain"),
+            "leanprover/lean4:stable\n",
+        );
+        touch(
+            &lean_root.join("lakefile.toml"),
+            "[package]\nname = \"leanproj\"\n",
+        );
         touch(&file_abs, "theorem hello : True := by\n  trivial\n");
 
         // User passes a super-workspace root, but a file path that points into a Lean project.

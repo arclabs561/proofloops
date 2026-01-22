@@ -2,44 +2,29 @@
 
 use proofpatch_core as plc;
 use serde_json::json;
-use schemars::schema_for;
 use similar::TextDiff;
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 use std::{fs, io};
-use durability::storage::Directory as _; // for `atomic_write`
-use durability::FsDirectory;
+use tempfile::NamedTempFile;
 
 fn extract_json_from_text(s: &str) -> Option<serde_json::Value> {
-    // 1) Prefer fenced ```json ... ``` blocks.
-    if let Some(i) = s.find("```json") {
-        let rest = &s[i + "```json".len()..];
-        if let Some(j) = rest.find("```") {
-            let cand = rest[..j].trim();
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(cand) {
-                return Some(v);
-            }
-        }
-    }
-    // 2) Fall back to first {...} span.
-    let i = s.find('{')?;
-    let j = s.rfind('}')?;
-    if j <= i {
-        return None;
-    }
-    let cand = s[i..=j].trim();
-    serde_json::from_str::<serde_json::Value>(cand).ok()
+    plc::json_extract::extract_first_json_value(s)
 }
 
+#[cfg(feature = "axi-agent")]
 fn default_context_lines() -> u64 {
     8
 }
+#[cfg(feature = "axi-agent")]
 fn default_nearby_lines() -> u64 {
     120
 }
+#[cfg(feature = "axi-agent")]
 fn default_max_nearby() -> u64 {
     30
 }
+#[cfg(feature = "axi-agent")]
 fn default_max_imports() -> u64 {
     30
 }
@@ -53,53 +38,10 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     out
 }
 
-fn env_reasoning_request() -> Option<axi::ReasoningRequest> {
-    // Best-effort env wiring for “extra reasoning”.
-    //
-    // This is intentionally conservative: if the env vars are absent or invalid,
-    // we default to `None` (no special request).
-    //
-    // Supported env vars:
-    // - PROOFPATCH_REASONING_EFFORT = low|medium|high
-    // - PROOFPATCH_REASONING_BUDGET_TOKENS = <usize>
-    let effort = std::env::var("PROOFPATCH_REASONING_EFFORT")
-        .ok()
-        .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
-            "low" => Some(axi::ReasoningEffort::Low),
-            "medium" => Some(axi::ReasoningEffort::Medium),
-            "high" => Some(axi::ReasoningEffort::High),
-            _ => None,
-        });
+// NOTE: Advanced “agent tool-calling” mode (axi-based) is not part of the public, standalone
+// build of proofpatch-core. Keep `proofpatch` usable without any extra workspace crates.
 
-    let budget_tokens = std::env::var("PROOFPATCH_REASONING_BUDGET_TOKENS")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok());
-
-    if effort.is_none() && budget_tokens.is_none() {
-        return None;
-    }
-    Some(axi::ReasoningRequest {
-        effort,
-        budget_tokens,
-    })
-}
-
-fn default_agent_reasoning_request(_provider: &str) -> Option<axi::ReasoningRequest> {
-    // Internal defaults (conservative):
-    //
-    // When tool calling is enabled, some provider routes (notably OpenRouter → Anthropic)
-    // can become less reliable if “thinking” is enabled, due to strict content block
-    // sequencing requirements around tool_use/tool_result.
-    //
-    // So: default to *no* explicit reasoning request for agent/tool runs.
-    None
-}
-
-fn effective_agent_reasoning_request(provider: &str) -> Option<axi::ReasoningRequest> {
-    // Env is an advanced override; otherwise fall back to internal default.
-    env_reasoning_request().or_else(|| default_agent_reasoning_request(provider))
-}
-
+#[cfg(feature = "axi-agent")]
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -127,10 +69,12 @@ struct ContextPackArgs {
     max_imports: u64,
 }
 
+#[cfg(feature = "axi-agent")]
 fn default_timeout_s() -> u64 {
     90
 }
 
+#[cfg(feature = "axi-agent")]
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -141,14 +85,17 @@ struct VerifySummaryArgs {
     timeout_s: u64,
 }
 
+#[cfg(feature = "axi-agent")]
 fn default_sorry_context_lines() -> u64 {
     1
 }
 
+#[cfg(feature = "axi-agent")]
 fn default_max_sorries() -> u64 {
     30
 }
 
+#[cfg(feature = "axi-agent")]
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -162,18 +109,22 @@ struct LocateSorriesArgs {
     context_lines: u64,
 }
 
+#[cfg(feature = "axi-agent")]
 fn default_patch_timeout_s() -> u64 {
     120
 }
 
+#[cfg(feature = "axi-agent")]
 fn default_patch_verify() -> bool {
     true
 }
 
+#[cfg(feature = "axi-agent")]
 fn default_patch_write() -> bool {
     false
 }
 
+#[cfg(feature = "axi-agent")]
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -245,16 +196,24 @@ fn read_json(path: &std::path::Path) -> Option<serde_json::Value> {
 }
 
 fn durable_atomic_write(cache_root: &std::path::Path, rel: &str, data: &[u8]) {
-    // Best-effort: durability provides atomic write + sync barriers on fs backends.
-    // If it fails (permissions, etc.), fall back to a plain write.
-    if let Ok(dir) = FsDirectory::new(cache_root) {
-        let _ = dir.atomic_write(rel, data);
-    } else {
-        let p = cache_root.join(rel);
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+    // Standalone atomic-ish write: write temp file then rename.
+    // We intentionally avoid extra workspace dependencies here.
+    let p = cache_root.join(rel);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Some(parent) = p.parent() else {
         let _ = std::fs::write(p, data);
+        return;
+    };
+    match NamedTempFile::new_in(parent) {
+        Ok(mut tmp) => {
+            let _ = std::io::Write::write_all(&mut tmp, data);
+            let _ = tmp.persist(&p);
+        }
+        Err(_) => {
+            let _ = std::fs::write(p, data);
+        }
     }
 }
 
@@ -422,7 +381,11 @@ fn cache_write_planner(
 }
 
 #[cfg(feature = "smt")]
-fn cache_read_smt_entails(cache_dir: &std::path::Path, state_key: u64, goal_sig: u64) -> Option<bool> {
+fn cache_read_smt_entails(
+    cache_dir: &std::path::Path,
+    state_key: u64,
+    goal_sig: u64,
+) -> Option<bool> {
     let p = cache_dir
         .join("smt")
         .join(format!("{state_key}_{goal_sig}.json"));
@@ -431,7 +394,12 @@ fn cache_read_smt_entails(cache_dir: &std::path::Path, state_key: u64, goal_sig:
 }
 
 #[cfg(feature = "smt")]
-fn cache_write_smt_entails(cache_dir: &std::path::Path, state_key: u64, goal_sig: u64, entails: bool) {
+fn cache_write_smt_entails(
+    cache_dir: &std::path::Path,
+    state_key: u64,
+    goal_sig: u64,
+    entails: bool,
+) {
     let rel = format!("smt/{state_key}_{goal_sig}.json");
     let v = json!({ "state_key": state_key, "goal_sig": goal_sig, "entails": entails });
     durable_atomic_write(cache_dir, &rel, v.to_string().as_bytes());
@@ -458,7 +426,12 @@ fn smt_sanitize_name(s: &str) -> String {
         out = "x".to_string();
     }
     // SMT-LIB symbols cannot start with a digit unless quoted; keep it simple.
-    if out.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if out
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         out.insert(0, '_');
     }
     out
@@ -539,16 +512,15 @@ fn parse_linear_expr_int(s: &str) -> Option<LinearExpr> {
         // identifier (unicode alnum + '_' + '.' treated as part; we sanitize later)
         if ch.is_alphanumeric() || ch == '_' || ch == '.' {
             let mut j = i + 1;
-            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '.') {
+            while j < chars.len()
+                && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '.')
+            {
                 j += 1;
             }
             let raw: String = chars[i..j].iter().collect();
             let name = smt_sanitize_name(&raw);
-            *coeffs.entry(name).or_insert(0) = coeffs
-                .get(&name)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(sign);
+            *coeffs.entry(name).or_insert(0) =
+                coeffs.get(&name).copied().unwrap_or(0).saturating_add(sign);
             i = j;
             continue;
         }
@@ -636,13 +608,14 @@ fn smt_entails_from_pp_dump(
         .and_then(|a| a.first())
         .ok_or_else(|| "pp_dump missing goals[0]".to_string())?;
 
-    let pretty = goal
-        .get("pretty")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let pretty = goal.get("pretty").and_then(|v| v.as_str()).unwrap_or("");
     let target = pretty
         .lines()
-        .find_map(|ln| ln.trim_start().strip_prefix("⊢").map(|r| r.trim().to_string()))
+        .find_map(|ln| {
+            ln.trim_start()
+                .strip_prefix("⊢")
+                .map(|r| r.trim().to_string())
+        })
         .unwrap_or_default();
     if target.is_empty() {
         return Ok(None);
@@ -652,7 +625,8 @@ fn smt_entails_from_pp_dump(
     //
     // This is a deliberately *conservative* guardrail: if we cannot confidently classify
     // all variables as Int/Nat, we return `Ok(None)` rather than risk an unsound “entailed”.
-    let mut var_kinds: std::collections::BTreeMap<String, SmtVarKind> = std::collections::BTreeMap::new();
+    let mut var_kinds: std::collections::BTreeMap<String, SmtVarKind> =
+        std::collections::BTreeMap::new();
     if let Some(hyps) = goal.get("hyps").and_then(|v| v.as_array()) {
         for h in hyps {
             if let Some(txt) = h.get("text").and_then(|v| v.as_str()) {
@@ -688,7 +662,11 @@ fn smt_entails_from_pp_dump(
     // Ensure all mentioned vars have known kinds.
     // If a variable slips through with an unknown sort, we abort. This keeps the SMT hint as a
     // safe heuristic (it might be missing, but it shouldn't be wrong for type/sort reasons).
-    for m in target_rel.vars.iter().chain(hyp_rels.iter().flat_map(|r| r.vars.iter())) {
+    for m in target_rel
+        .vars
+        .iter()
+        .chain(hyp_rels.iter().flat_map(|r| r.vars.iter()))
+    {
         if !var_kinds.contains_key(m) {
             // Unknown sort; abort rather than risk unsound “entails”.
             return Ok(None);
@@ -723,7 +701,8 @@ fn smt_entails_from_pp_dump(
     // - UNSAT ⇒ hyps ⇒ target  (within our parsed LIA fragment)
     // - SAT   ⇒ hyps ⊬ target  (found countermodel in LIA)
     // - UNKNOWN ⇒ do not use as a signal
-    sess.assert_sexp(&t::not(target_rel.sexp)).map_err(|e| e.to_string())?;
+    sess.assert_sexp(&t::not(target_rel.sexp))
+        .map_err(|e| e.to_string())?;
     let st = sess.check_sat().map_err(|e| e.to_string())?;
     match st {
         smtkit::session::Status::Unsat => Ok(Some(true)),
@@ -1356,12 +1335,8 @@ fn main() -> Result<(), String> {
                 None
             };
 
-            let payload = plc::build_rubberduck_prompt(
-                &repo_root,
-                &file,
-                &lemma,
-                diagnostics.as_deref(),
-            )?;
+            let payload =
+                plc::build_rubberduck_prompt(&repo_root, &file, &lemma, diagnostics.as_deref())?;
             let out = serde_json::to_value(payload).map_err(|e| format!("json encode: {e}"))?;
 
             if let Some(p) = output_json {
@@ -1399,7 +1374,10 @@ fn main() -> Result<(), String> {
             });
             if let Some(p) = output_json {
                 write_json(&p, &out)?;
-                println!("{}", json!({"ok": true, "written": p.display().to_string()}).to_string());
+                println!(
+                    "{}",
+                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                );
             } else {
                 println!("{}", out.to_string());
             }
@@ -1443,7 +1421,10 @@ fn main() -> Result<(), String> {
 
             if let Some(p) = output_json {
                 write_json(&p, &out)?;
-                println!("{}", json!({"ok": true, "written": p.display().to_string()}).to_string());
+                println!(
+                    "{}",
+                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                );
             } else {
                 println!("{}", out.to_string());
             }
@@ -1543,9 +1524,11 @@ fn main() -> Result<(), String> {
                 .map(PathBuf::from)?;
             let file = arg_value(rest, "--file").ok_or_else(|| "missing --file".to_string())?;
             let start_line = arg_u64(rest, "--start-line")
-                .ok_or_else(|| "missing --start-line".to_string())? as usize;
+                .ok_or_else(|| "missing --start-line".to_string())?
+                as usize;
             let end_line = arg_u64(rest, "--end-line")
-                .ok_or_else(|| "missing --end-line".to_string())? as usize;
+                .ok_or_else(|| "missing --end-line".to_string())?
+                as usize;
             let replacement_file = arg_value(rest, "--replacement-file")
                 .ok_or_else(|| "missing --replacement-file".to_string())
                 .map(PathBuf::from)?;
@@ -1567,7 +1550,12 @@ fn main() -> Result<(), String> {
             let replacement = std::fs::read_to_string(&replacement_file)
                 .map_err(|e| format!("read {}: {e}", replacement_file.display()))?;
 
-            let patched = plc::patch_first_sorry_in_region(&original_text, start_line, end_line, &replacement)?;
+            let patched = plc::patch_first_sorry_in_region(
+                &original_text,
+                start_line,
+                end_line,
+                &replacement,
+            )?;
 
             // “still contains sorry” is scoped to the patched region (post-patch).
             let region_text = patched
@@ -1630,7 +1618,10 @@ fn main() -> Result<(), String> {
 
             if let Some(p) = output_json {
                 write_json(&p, &out)?;
-                println!("{}", json!({"ok": true, "written": p.display().to_string()}).to_string());
+                println!(
+                    "{}",
+                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                );
             } else {
                 println!("{}", out.to_string());
             }
@@ -1785,7 +1776,10 @@ fn main() -> Result<(), String> {
 
             if let Some(p) = output_json {
                 write_json(&p, &out)?;
-                println!("{}", json!({"ok": true, "written": p.display().to_string()}).to_string());
+                println!(
+                    "{}",
+                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                );
             } else {
                 println!("{}", out.to_string());
             }
@@ -1831,9 +1825,10 @@ fn main() -> Result<(), String> {
             }
 
             use plc::tree_search::{
-                adapt_candidates_for_error, adapt_candidates_for_sorry_context, default_det_candidates,
-                extract_initial_goal_block, hash_text, is_made_no_progress, parse_json_string_array,
-                progress_score_key, sanitize_candidates, verify_score_key, hash_state_key,
+                adapt_candidates_for_error, adapt_candidates_for_sorry_context,
+                default_det_candidates, extract_initial_goal_block, hash_state_key, hash_text,
+                is_made_no_progress, parse_json_string_array, progress_score_key,
+                sanitize_candidates, verify_score_key,
             };
 
             let repo_root = arg_value(rest, "--repo")
@@ -1841,7 +1836,9 @@ fn main() -> Result<(), String> {
                 .map(PathBuf::from)?;
             let file = arg_value(rest, "--file").ok_or_else(|| "missing --file".to_string())?;
             let timeout_s = arg_u64(rest, "--timeout-s").unwrap_or(120);
-            let total_timeout_s = arg_u64(rest, "--total-timeout-s").unwrap_or(timeout_s).max(1);
+            let total_timeout_s = arg_u64(rest, "--total-timeout-s")
+                .unwrap_or(timeout_s)
+                .max(1);
             let log_level = arg_u64(rest, "--log-level").unwrap_or(1);
             let events_jsonl = arg_value(rest, "--events-jsonl").map(PathBuf::from);
             let events_keep = arg_u64(rest, "--events-keep")
@@ -1895,15 +1892,18 @@ fn main() -> Result<(), String> {
             let beam = arg_u64(rest, "--beam").unwrap_or(4) as usize;
             let max_nodes = arg_u64(rest, "--max-nodes").unwrap_or(20) as usize;
             let depth = arg_u64(rest, "--depth").unwrap_or(2) as usize;
-            let candidates_mode = arg_value(rest, "--candidates").unwrap_or_else(|| "det".to_string());
+            let candidates_mode =
+                arg_value(rest, "--candidates").unwrap_or_else(|| "det".to_string());
             let lean_oracle_per_node = arg_flag(rest, "--lean-oracle-per-node");
-            let lean_oracle_max_calls = arg_u64(rest, "--lean-oracle-max-calls").unwrap_or(12) as usize;
+            let lean_oracle_max_calls =
+                arg_u64(rest, "--lean-oracle-max-calls").unwrap_or(12) as usize;
             let rollout_k = arg_u64(rest, "--rollout-k").unwrap_or(0) as usize;
             let dedup_goal_expansions = arg_flag(rest, "--dedup-goal-expansions");
             let goal_first_k = arg_u64(rest, "--goal-first-k").unwrap_or(0) as usize;
             let fill_mode_raw = arg_value(rest, "--fill-mode");
             let focus_line_override = arg_u64(rest, "--focus-line").map(|x| x as usize);
-            let max_candidates_per_node = arg_u64(rest, "--max-candidates-per-node").map(|x| x as usize);
+            let max_candidates_per_node =
+                arg_u64(rest, "--max-candidates-per-node").map(|x| x as usize);
             let verify_k = arg_u64(rest, "--verify-k").map(|x| x as usize);
             // Optional heuristic knobs (default off; meant for experimentation).
             // - goal_meta_penalty: penalize selecting holes whose target contains metavariables (?m / ?_)
@@ -1980,7 +1980,11 @@ fn main() -> Result<(), String> {
             let cache_dir = if no_cache {
                 None
             } else if let Some(p) = cache_dir_opt {
-                Some(if p.is_absolute() { p } else { repo_root.join(p) })
+                Some(if p.is_absolute() {
+                    p
+                } else {
+                    repo_root.join(p)
+                })
             } else {
                 Some(repo_root.join(".generated").join("proofpatch-cache"))
             };
@@ -2034,7 +2038,8 @@ fn main() -> Result<(), String> {
 
             let mut events_tail: Vec<serde_json::Value> = Vec::new();
             let mut events_all: Vec<serde_json::Value> = Vec::new();
-            let mut events_by_kind: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            let mut events_by_kind: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
             let mut record_event = |kind: &str, mut v: serde_json::Value| {
                 *events_by_kind.entry(kind.to_string()).or_insert(0) += 1;
                 let t_ms = prof_t0.elapsed().as_millis() as u64;
@@ -2047,7 +2052,12 @@ fn main() -> Result<(), String> {
                 }
                 events_tail.push(v);
                 if events_all.len() < events_all_keep {
-                    events_all.push(events_tail.last().cloned().unwrap_or(serde_json::Value::Null));
+                    events_all.push(
+                        events_tail
+                            .last()
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    );
                 }
             };
 
@@ -2115,7 +2125,11 @@ fn main() -> Result<(), String> {
             };
             let goal_first_k = if candidates_mode == "lean-try" {
                 // Default “goal-first” probing for LeanTree-ish behavior.
-                if goal_first_k == 0 { 3 } else { goal_first_k }
+                if goal_first_k == 0 {
+                    3
+                } else {
+                    goal_first_k
+                }
             } else {
                 goal_first_k
             };
@@ -2146,7 +2160,11 @@ fn main() -> Result<(), String> {
             };
             // Default higher oracle budget for `lean-try` unless explicitly set.
             let lean_oracle_max_calls = if candidates_mode == "lean-try" {
-                if arg_value(rest, "--lean-oracle-max-calls").is_some() { lean_oracle_max_calls } else { 24 }
+                if arg_value(rest, "--lean-oracle-max-calls").is_some() {
+                    lean_oracle_max_calls
+                } else {
+                    24
+                }
             } else {
                 lean_oracle_max_calls
             };
@@ -2202,10 +2220,14 @@ fn main() -> Result<(), String> {
                 }
             } else if candidates_mode == "lean" {
                 let ls = if let Some(dur) = budget_dur(oracle_timeout_s) {
-                    rt.block_on(plc::lean_suggest_nearest(&repo_root, &file, dur)).ok()
+                    rt.block_on(plc::lean_suggest_nearest(&repo_root, &file, dur))
+                        .ok()
                 } else {
                     bailed_total_timeout = true;
-                    record_event("bailout_total_timeout", json!({ "where": "lean_suggest_nearest" }));
+                    record_event(
+                        "bailout_total_timeout",
+                        json!({ "where": "lean_suggest_nearest" }),
+                    );
                     None
                 };
                 lean_suggest_v = ls.clone();
@@ -2256,7 +2278,12 @@ fn main() -> Result<(), String> {
                 // - PROOFPATCH_LEAN_TRY_SEED_ORACLE=1
                 let seed_oracle = std::env::var("PROOFPATCH_LEAN_TRY_SEED_ORACLE")
                     .ok()
-                    .map(|s| matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
+                    .map(|s| {
+                        matches!(
+                            s.trim().to_lowercase().as_str(),
+                            "1" | "true" | "yes" | "y" | "on"
+                        )
+                    })
                     .unwrap_or(false);
 
                 let mut xs: Vec<String>;
@@ -2264,7 +2291,8 @@ fn main() -> Result<(), String> {
                     record_event("oracle_seed_call", json!({ "timeout_s": oracle_timeout_s }));
                     let t0 = std::time::Instant::now();
                     let ls = if let Some(dur) = budget_dur(oracle_timeout_s) {
-                        rt.block_on(plc::lean_suggest_nearest(&repo_root, &file, dur)).ok()
+                        rt.block_on(plc::lean_suggest_nearest(&repo_root, &file, dur))
+                            .ok()
                     } else {
                         bailed_total_timeout = true;
                         record_event(
@@ -2414,7 +2442,11 @@ fn main() -> Result<(), String> {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
                             let derived = plc::derive_candidates_from_goal_pretty(pretty);
-                            if derived.is_empty() { None } else { Some(derived) }
+                            if derived.is_empty() {
+                                None
+                            } else {
+                                Some(derived)
+                            }
                         })
                     })
                     .unwrap_or_else(default_det_candidates);
@@ -2486,7 +2518,8 @@ fn main() -> Result<(), String> {
             let mut lean_oracle_goal_dedup_skips: usize = 0;
             let mut lean_oracle_cache: std::collections::HashMap<(u64, usize, usize), Vec<String>> =
                 std::collections::HashMap::new();
-            let mut expanded_goal_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut expanded_goal_hashes: std::collections::HashSet<u64> =
+                std::collections::HashSet::new();
 
             // LeanTree-ish state-key caches (goal-state based, not text based).
             const UNKNOWN_STATE_KEY: u64 = u64::MAX;
@@ -2498,25 +2531,31 @@ fn main() -> Result<(), String> {
             // Values are a small score where lower is better (more promising).
             let mut state_action_cache: std::collections::HashMap<(u64, u64), i32> =
                 std::collections::HashMap::new(); // ((state_key, cand_hash) -> score)
-            // Cheap goal-dump cache for picking goals (keyed by (text_hash,len,focus_line)).
+                                                  // Cheap goal-dump cache for picking goals (keyed by (text_hash,len,focus_line)).
             let mut goal_dump_calls: usize = 0;
             let mut goal_dump_cache_hits: usize = 0;
             let mut goal_dump_cache_misses: usize = 0;
-            let mut goal_dump_cache: std::collections::HashMap<(u64, usize, usize), (u64, usize, usize, String)> =
-                std::collections::HashMap::new(); // (state_key, n_goals, hyps_total, target)
-            // Companion cache for `hyps_texts` (used by SMT ranking and tactic reranking).
+            let mut goal_dump_cache: std::collections::HashMap<
+                (u64, usize, usize),
+                (u64, usize, usize, String),
+            > = std::collections::HashMap::new(); // (state_key, n_goals, hyps_total, target)
+                                                  // Companion cache for `hyps_texts` (used by SMT ranking and tactic reranking).
             let mut goal_dump_hyps_cache_hits: usize = 0;
             let mut goal_dump_hyps_cache_misses: usize = 0;
-            let mut goal_dump_hyps_cache: std::collections::HashMap<(u64, usize, usize), Vec<String>> =
-                std::collections::HashMap::new(); // (text_hash,len,line) -> hyps_texts
-            // Interpretation of these counters:
-            // - “hits” means we got `hyps_texts` without calling Lean (memory or disk).
-            // - “misses” means we *wanted* `hyps_texts` (for SMT/ranking) but couldn't find them.
-            // This is meant to track whether our “no extra Lean calls” design is actually working.
+            let mut goal_dump_hyps_cache: std::collections::HashMap<
+                (u64, usize, usize),
+                Vec<String>,
+            > = std::collections::HashMap::new(); // (text_hash,len,line) -> hyps_texts
+                                                  // Interpretation of these counters:
+                                                  // - “hits” means we got `hyps_texts` without calling Lean (memory or disk).
+                                                  // - “misses” means we *wanted* `hyps_texts` (for SMT/ranking) but couldn't find them.
+                                                  // This is meant to track whether our “no extra Lean calls” design is actually working.
 
             #[cfg(feature = "planner")]
-            let mut planner_cache: std::collections::HashMap<(u64, u64), plc::planner::PlannerDecision> =
-                std::collections::HashMap::new(); // ((state_key, goal_sig) -> decision)
+            let mut planner_cache: std::collections::HashMap<
+                (u64, u64),
+                plc::planner::PlannerDecision,
+            > = std::collections::HashMap::new(); // ((state_key, goal_sig) -> decision)
             #[cfg(feature = "planner")]
             let mut planner_cache_hits: u64 = 0;
             #[cfg(feature = "planner")]
@@ -2541,38 +2580,41 @@ fn main() -> Result<(), String> {
             let _prof_smt_ms: u64 = 0;
 
             // Baseline verify (for first-error line; also returned in output).
-            let (baseline_raw_v, baseline_summary, baseline_ms, baseline_skipped) = if let Some(dur) = budget_dur(timeout_s) {
-                let t0 = std::time::Instant::now();
-                let baseline = rt
-                    .block_on(plc::verify_lean_file(&repo_root, &file, dur))
-                    .map_err(|e| format!("verify failed: {e}"))?;
-                let baseline_ms = t0.elapsed().as_millis() as u64;
-                prof_verify_baseline_ms = prof_verify_baseline_ms.saturating_add(baseline_ms);
-                prof_verify_baseline_calls += 1;
-                let baseline_raw_v =
-                    serde_json::to_value(baseline).map_err(|e| format!("serialize verify: {e}"))?;
-                let baseline_summary = verify_summary_from_raw_value(&baseline_raw_v);
-                (baseline_raw_v, baseline_summary, baseline_ms, false)
-            } else {
-                bailed_total_timeout = true;
-                record_event(
-                    "bailout_total_timeout",
-                    json!({ "where": "baseline_verify" }),
-                );
-                let raw = plc::VerifyResult {
-                    ok: false,
-                    timeout: true,
-                    returncode: None,
-                    stdout: String::new(),
-                    stderr: "total timeout (budget exhausted before baseline verify)".to_string(),
-                    cmd: vec![],
-                    cwd: repo_root.display().to_string(),
-                    tmp_file: None,
+            let (baseline_raw_v, baseline_summary, baseline_ms, baseline_skipped) =
+                if let Some(dur) = budget_dur(timeout_s) {
+                    let t0 = std::time::Instant::now();
+                    let baseline = rt
+                        .block_on(plc::verify_lean_file(&repo_root, &file, dur))
+                        .map_err(|e| format!("verify failed: {e}"))?;
+                    let baseline_ms = t0.elapsed().as_millis() as u64;
+                    prof_verify_baseline_ms = prof_verify_baseline_ms.saturating_add(baseline_ms);
+                    prof_verify_baseline_calls += 1;
+                    let baseline_raw_v = serde_json::to_value(baseline)
+                        .map_err(|e| format!("serialize verify: {e}"))?;
+                    let baseline_summary = verify_summary_from_raw_value(&baseline_raw_v);
+                    (baseline_raw_v, baseline_summary, baseline_ms, false)
+                } else {
+                    bailed_total_timeout = true;
+                    record_event(
+                        "bailout_total_timeout",
+                        json!({ "where": "baseline_verify" }),
+                    );
+                    let raw = plc::VerifyResult {
+                        ok: false,
+                        timeout: true,
+                        returncode: None,
+                        stdout: String::new(),
+                        stderr: "total timeout (budget exhausted before baseline verify)"
+                            .to_string(),
+                        cmd: vec![],
+                        cwd: repo_root.display().to_string(),
+                        tmp_file: None,
+                    };
+                    let raw_v =
+                        serde_json::to_value(raw).map_err(|e| format!("serialize verify: {e}"))?;
+                    let summary = verify_summary_from_raw_value(&raw_v);
+                    (raw_v, summary, 0u64, true)
                 };
-                let raw_v = serde_json::to_value(raw).map_err(|e| format!("serialize verify: {e}"))?;
-                let summary = verify_summary_from_raw_value(&raw_v);
-                (raw_v, summary, 0u64, true)
-            };
             record_event(
                 "baseline_verify",
                 json!({
@@ -2625,11 +2667,14 @@ fn main() -> Result<(), String> {
                 let s = first_error.unwrap_or("").to_lowercase();
                 if s.contains("unknown tactic") {
                     "unknown_tactic"
-                } else if s.contains("synthinstancefailed") || s.contains("failed to synthesize instance") {
+                } else if s.contains("synthinstancefailed")
+                    || s.contains("failed to synthesize instance")
+                {
                     "typeclass_instance_failed"
                 } else if s.contains("unsolved goals") {
                     "unsolved_goals"
-                } else if s.contains("omega could not prove") || s.contains("no usable constraints") {
+                } else if s.contains("omega could not prove") || s.contains("no usable constraints")
+                {
                     "omega_failed"
                 } else if s.contains("linarith failed") {
                     "linarith_failed"
@@ -2649,7 +2694,8 @@ fn main() -> Result<(), String> {
 
             let mut next_id = 1usize;
             let mut all: Vec<Node> = Vec::new();
-            let mut eval_cache: std::collections::HashMap<u64, CachedEval> = std::collections::HashMap::new();
+            let mut eval_cache: std::collections::HashMap<u64, CachedEval> =
+                std::collections::HashMap::new();
             let mut disk_cache_eval_hits: u64 = 0;
             let mut disk_cache_eval_misses: u64 = 0;
             // Always compute root sorry counts so early bailouts still have meaningful output.
@@ -2688,12 +2734,17 @@ fn main() -> Result<(), String> {
                 for n in frontier.iter_mut() {
                     if std::time::Instant::now() >= run_deadline {
                         bailed_total_timeout = true;
-                        record_event("bailout_total_timeout", json!({ "where": "frontier_prefill" }));
+                        record_event(
+                            "bailout_total_timeout",
+                            json!({ "where": "frontier_prefill" }),
+                        );
                         break;
                     }
                     // Disk cache (eval) prefill: if we have the full eval for this text, it supplies
                     // verify + sorry counts in one shot and avoids redundant work.
-                    if (n.verify_summary.is_none() || n.sorries.is_none()) && n.verify_raw.is_some() == false {
+                    if (n.verify_summary.is_none() || n.sorries.is_none())
+                        && n.verify_raw.is_some() == false
+                    {
                         if let Some(cd) = cache_dir.as_ref() {
                             let h = hash_text(&n.text);
                             if let Some((raw_v, summary, sorries, conservative)) =
@@ -2728,8 +2779,8 @@ fn main() -> Result<(), String> {
                             let t0 = std::time::Instant::now();
                             let locs =
                                 plc::locate_sorries_in_text(&n.text, 500, 1).unwrap_or_default();
-                            prof_locate_sorries_ms =
-                                prof_locate_sorries_ms.saturating_add(t0.elapsed().as_millis() as u64);
+                            prof_locate_sorries_ms = prof_locate_sorries_ms
+                                .saturating_add(t0.elapsed().as_millis() as u64);
                             n.sorries = Some(locs.len());
                             let t0 = std::time::Instant::now();
                             n.conservative_sorries =
@@ -2770,19 +2821,18 @@ fn main() -> Result<(), String> {
                             }
                             let Some(dur) = budget_dur(timeout_s) else {
                                 bailed_total_timeout = true;
-                                record_event("bailout_total_timeout", json!({ "where": "frontier_verify" }));
+                                record_event(
+                                    "bailout_total_timeout",
+                                    json!({ "where": "frontier_verify" }),
+                                );
                                 break;
                             };
                             let t0 = std::time::Instant::now();
                             let raw = rt
-                                .block_on(plc::verify_lean_text(
-                                    &repo_root,
-                                    &n.text,
-                                    dur,
-                                ))
+                                .block_on(plc::verify_lean_text(&repo_root, &n.text, dur))
                                 .map_err(|e| format!("verify failed: {e}"))?;
-                            prof_verify_nodes_ms =
-                                prof_verify_nodes_ms.saturating_add(t0.elapsed().as_millis() as u64);
+                            prof_verify_nodes_ms = prof_verify_nodes_ms
+                                .saturating_add(t0.elapsed().as_millis() as u64);
                             prof_verify_nodes_calls += 1;
                             let raw_v = serde_json::to_value(raw)
                                 .map_err(|e| format!("serialize verify: {e}"))?;
@@ -2846,12 +2896,22 @@ fn main() -> Result<(), String> {
                 frontier.sort_by(|a, b| {
                     let sa = a.verify_summary.as_ref().unwrap();
                     let sb = b.verify_summary.as_ref().unwrap();
-                    let mut ka = verify_score_key(sa, a.sorries.unwrap_or(999), a.conservative_sorries.unwrap_or(999));
-                    let mut kb = verify_score_key(sb, b.sorries.unwrap_or(999), b.conservative_sorries.unwrap_or(999));
+                    let mut ka = verify_score_key(
+                        sa,
+                        a.sorries.unwrap_or(999),
+                        a.conservative_sorries.unwrap_or(999),
+                    );
+                    let mut kb = verify_score_key(
+                        sb,
+                        b.sorries.unwrap_or(999),
+                        b.conservative_sorries.unwrap_or(999),
+                    );
                     if depth_bonus > 0 {
                         // Lower is better; subtracting rewards deeper nodes slightly (tie-break/escape hatch).
-                        ka.1 = ka.1.saturating_sub(depth_bonus.saturating_mul(a.depth as i64));
-                        kb.1 = kb.1.saturating_sub(depth_bonus.saturating_mul(b.depth as i64));
+                        ka.1 =
+                            ka.1.saturating_sub(depth_bonus.saturating_mul(a.depth as i64));
+                        kb.1 =
+                            kb.1.saturating_sub(depth_bonus.saturating_mul(b.depth as i64));
                     }
                     ka.cmp(&kb).then_with(|| a.id.cmp(&b.id))
                 });
@@ -2904,14 +2964,19 @@ fn main() -> Result<(), String> {
                     }
 
                     // Pick next sorry to patch in this node.
-                    let locs_all = plc::locate_sorries_in_text(&parent.text, 200, 1).unwrap_or_default();
+                    let locs_all =
+                        plc::locate_sorries_in_text(&parent.text, 200, 1).unwrap_or_default();
                     let locs = if let Some(dn) = parent.focus_decl_name.as_deref() {
                         let xs: Vec<plc::SorryLocation> = locs_all
                             .iter()
                             .cloned()
                             .filter(|l| l.decl_name.as_deref() == Some(dn))
                             .collect();
-                        if xs.is_empty() { locs_all } else { xs }
+                        if xs.is_empty() {
+                            locs_all
+                        } else {
+                            xs
+                        }
                     } else {
                         locs_all
                     };
@@ -2923,13 +2988,20 @@ fn main() -> Result<(), String> {
                         for l in locs.iter() {
                             let k = (th, parent.text.len(), l.line);
                             // In-memory target from goal-dump cache.
-                            let mut goal_sig_opt = goal_dump_cache
-                                .get(&k)
-                                .and_then(|(_, _, _, tgt)| if tgt.is_empty() { None } else { Some(hash_text(tgt)) });
+                            let mut goal_sig_opt =
+                                goal_dump_cache.get(&k).and_then(|(_, _, _, tgt)| {
+                                    if tgt.is_empty() {
+                                        None
+                                    } else {
+                                        Some(hash_text(tgt))
+                                    }
+                                });
                             // Disk fallback (still cache-only).
                             if goal_sig_opt.is_none() {
                                 if let Some(cd) = cache_dir.as_ref() {
-                                    if let Some(tup) = cache_read_goal_dump(cd, th, parent.text.len(), l.line) {
+                                    if let Some(tup) =
+                                        cache_read_goal_dump(cd, th, parent.text.len(), l.line)
+                                    {
                                         let (_sk, _ng, _ht, tgt) = tup.clone();
                                         if !tgt.is_empty() {
                                             goal_sig_opt = Some(hash_text(&tgt));
@@ -2943,7 +3015,11 @@ fn main() -> Result<(), String> {
                                 xs.push(l.clone());
                             }
                         }
-                        if xs.is_empty() { locs } else { xs }
+                        if xs.is_empty() {
+                            locs
+                        } else {
+                            xs
+                        }
                     } else {
                         locs
                     };
@@ -2954,10 +3030,16 @@ fn main() -> Result<(), String> {
                         .and_then(|l| l.get("line"))
                         .and_then(|v| v.as_u64())
                         .map(|x| x as usize);
-                    let selected = if candidates_mode == "lean-try" && goal_first_k > 0 && !locs.is_empty() {
+                    let selected = if candidates_mode == "lean-try"
+                        && goal_first_k > 0
+                        && !locs.is_empty()
+                    {
                         // Goal-first scheduler (bounded): probe a few candidate holes with a cheap goal dump,
                         // compute a state key and a crude "difficulty" score, then pick the easiest.
-                        let fl = parent.focus_line.or(first_error_line_1).unwrap_or(locs[0].line);
+                        let fl = parent
+                            .focus_line
+                            .or(first_error_line_1)
+                            .unwrap_or(locs[0].line);
                         let mut cands: Vec<plc::SorryLocation> = locs.clone();
                         cands.sort_by_key(|l| (l.line as i64 - fl as i64).abs());
                         cands.truncate(goal_first_k);
@@ -2967,95 +3049,131 @@ fn main() -> Result<(), String> {
                         let planner_selected: Option<plc::SorryLocation> = if llm_planner {
                             #[cfg(not(feature = "planner"))]
                             {
-                                return Err("--llm-planner requires building with cargo feature `planner`".to_string());
+                                return Err(
+                                    "--llm-planner requires building with cargo feature `planner`"
+                                        .to_string(),
+                                );
                             }
                             #[cfg(feature = "planner")]
                             {
                                 let mut picked_sel: Option<plc::SorryLocation> = None;
 
                                 // Probe only the closest hole to build planner evidence.
-                                let seed = cands.first().cloned().unwrap_or_else(|| locs[0].clone());
+                                let seed =
+                                    cands.first().cloned().unwrap_or_else(|| locs[0].clone());
                                 let th = hash_text(&parent.text);
                                 let key = (th, parent.text.len(), seed.line);
 
                                 // Ensure we have (state_key,n_goals,hyps_total,target) for the seed.
                                 let mut target: String = String::new();
-                                let (state_key, n_goals, hyps_total, target_cached) = if let Some(v) = goal_dump_cache.get(&key) {
-                                    v.clone()
-                                } else {
-                                    if lean_oracle_calls >= lean_oracle_max_calls {
-                                        // No budget to probe; skip planner.
-                                        (UNKNOWN_STATE_KEY, 0usize, 0usize, String::new())
+                                let (state_key, n_goals, hyps_total, target_cached) =
+                                    if let Some(v) = goal_dump_cache.get(&key) {
+                                        v.clone()
                                     } else {
-                                        goal_dump_calls += 1;
-                                        lean_oracle_calls += 1;
-                                        let t0 = std::time::Instant::now();
-                                        let gd = if let Some(dur) = budget_dur(goal_dump_timeout_s) {
-                                            rt.block_on(plc::goal_dump_in_text_at(
-                                                &repo_root,
-                                                &file,
-                                                &parent.text,
-                                                dur,
-                                                Some(seed.line),
-                                                first_error_line_1,
-                                            ))
-                                            .ok()
+                                        if lean_oracle_calls >= lean_oracle_max_calls {
+                                            // No budget to probe; skip planner.
+                                            (UNKNOWN_STATE_KEY, 0usize, 0usize, String::new())
                                         } else {
-                                            bailed_total_timeout = true;
-                                            record_event(
-                                                "bailout_total_timeout",
-                                                json!({ "where": "goal_dump_planner_seed" }),
-                                            );
-                                            None
-                                        };
-                                        let elapsed_ms = t0.elapsed().as_millis() as u64;
-                                        prof_goal_dump_ms = prof_goal_dump_ms.saturating_add(elapsed_ms);
+                                            goal_dump_calls += 1;
+                                            lean_oracle_calls += 1;
+                                            let t0 = std::time::Instant::now();
+                                            let gd = if let Some(dur) =
+                                                budget_dur(goal_dump_timeout_s)
+                                            {
+                                                rt.block_on(plc::goal_dump_in_text_at(
+                                                    &repo_root,
+                                                    &file,
+                                                    &parent.text,
+                                                    dur,
+                                                    Some(seed.line),
+                                                    first_error_line_1,
+                                                ))
+                                                .ok()
+                                            } else {
+                                                bailed_total_timeout = true;
+                                                record_event(
+                                                    "bailout_total_timeout",
+                                                    json!({ "where": "goal_dump_planner_seed" }),
+                                                );
+                                                None
+                                            };
+                                            let elapsed_ms = t0.elapsed().as_millis() as u64;
+                                            prof_goal_dump_ms =
+                                                prof_goal_dump_ms.saturating_add(elapsed_ms);
 
-                                        let pp = gd.as_ref().and_then(|v| v.get("pp_dump"));
-                                        let state_key = pp.and_then(|pp| hash_state_key(pp)).unwrap_or(UNKNOWN_STATE_KEY);
-                                        let n_goals = pp
-                                            .and_then(|pp| pp.get("goals"))
-                                            .and_then(|v| v.as_array())
-                                            .map(|a| a.len())
-                                            .unwrap_or(0);
-                                        let hyps_total = pp
-                                            .and_then(|pp| pp.get("goals"))
-                                            .and_then(|v| v.as_array())
-                                            .map(|a| {
-                                                a.iter()
-                                                    .map(|g| g.get("hyps").and_then(|h| h.as_array()).map(|x| x.len()).unwrap_or(0))
-                                                    .sum::<usize>()
-                                            })
-                                            .unwrap_or(0);
-                                        target = pp
-                                            .and_then(|pp| pp.get("goals"))
-                                            .and_then(|v| v.as_array())
-                                            .and_then(|a| a.first())
-                                            .and_then(|g| g.get("pretty"))
-                                            .and_then(|v| v.as_str())
-                                            .and_then(|s| s.lines().find_map(|ln| ln.trim_start().strip_prefix("⊢").map(|r| r.trim().to_string())))
-                                            .unwrap_or_default();
-                                        let hyps_texts: Vec<String> = pp
-                                            .and_then(|pp| pp.get("goals"))
-                                            .and_then(|v| v.as_array())
-                                            .and_then(|a| a.first())
-                                            .and_then(|g| g.get("hyps"))
-                                            .and_then(|v| v.as_array())
-                                            .map(|a| {
-                                                a.iter()
-                                                    .filter_map(|h| h.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                                                    .collect::<Vec<_>>()
-                                            })
-                                            .unwrap_or_default();
-                                        let tup = (state_key, n_goals, hyps_total, target.clone());
-                                        goal_dump_cache.insert(key, tup.clone());
-                                        goal_dump_hyps_cache.insert(key, hyps_texts.clone());
-                                        if let Some(cd) = cache_dir.as_ref() {
-                                            cache_write_goal_dump(cd, th, parent.text.len(), seed.line, state_key, n_goals, hyps_total, &target, &hyps_texts);
+                                            let pp = gd.as_ref().and_then(|v| v.get("pp_dump"));
+                                            let state_key = pp
+                                                .and_then(|pp| hash_state_key(pp))
+                                                .unwrap_or(UNKNOWN_STATE_KEY);
+                                            let n_goals = pp
+                                                .and_then(|pp| pp.get("goals"))
+                                                .and_then(|v| v.as_array())
+                                                .map(|a| a.len())
+                                                .unwrap_or(0);
+                                            let hyps_total = pp
+                                                .and_then(|pp| pp.get("goals"))
+                                                .and_then(|v| v.as_array())
+                                                .map(|a| {
+                                                    a.iter()
+                                                        .map(|g| {
+                                                            g.get("hyps")
+                                                                .and_then(|h| h.as_array())
+                                                                .map(|x| x.len())
+                                                                .unwrap_or(0)
+                                                        })
+                                                        .sum::<usize>()
+                                                })
+                                                .unwrap_or(0);
+                                            target = pp
+                                                .and_then(|pp| pp.get("goals"))
+                                                .and_then(|v| v.as_array())
+                                                .and_then(|a| a.first())
+                                                .and_then(|g| g.get("pretty"))
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|s| {
+                                                    s.lines().find_map(|ln| {
+                                                        ln.trim_start()
+                                                            .strip_prefix("⊢")
+                                                            .map(|r| r.trim().to_string())
+                                                    })
+                                                })
+                                                .unwrap_or_default();
+                                            let hyps_texts: Vec<String> = pp
+                                                .and_then(|pp| pp.get("goals"))
+                                                .and_then(|v| v.as_array())
+                                                .and_then(|a| a.first())
+                                                .and_then(|g| g.get("hyps"))
+                                                .and_then(|v| v.as_array())
+                                                .map(|a| {
+                                                    a.iter()
+                                                        .filter_map(|h| {
+                                                            h.get("text")
+                                                                .and_then(|v| v.as_str())
+                                                                .map(|s| s.to_string())
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                })
+                                                .unwrap_or_default();
+                                            let tup =
+                                                (state_key, n_goals, hyps_total, target.clone());
+                                            goal_dump_cache.insert(key, tup.clone());
+                                            goal_dump_hyps_cache.insert(key, hyps_texts.clone());
+                                            if let Some(cd) = cache_dir.as_ref() {
+                                                cache_write_goal_dump(
+                                                    cd,
+                                                    th,
+                                                    parent.text.len(),
+                                                    seed.line,
+                                                    state_key,
+                                                    n_goals,
+                                                    hyps_total,
+                                                    &target,
+                                                    &hyps_texts,
+                                                );
+                                            }
+                                            tup
                                         }
-                                        tup
-                                    }
-                                };
+                                    };
 
                                 if target.is_empty() {
                                     target = target_cached;
@@ -3063,12 +3181,18 @@ fn main() -> Result<(), String> {
                                 let goal_sig = hash_text(&target);
                                 let cache_key = (state_key, goal_sig);
 
-                                let decision = if let Some(d) = planner_cache.get(&cache_key).cloned() {
+                                let decision = if let Some(d) =
+                                    planner_cache.get(&cache_key).cloned()
+                                {
                                     planner_cache_hits += 1;
                                     Some(d)
                                 } else if let Some(cd) = cache_dir.as_ref() {
                                     if let Some(v) = cache_read_planner(cd, state_key, goal_sig) {
-                                        if let Ok(d) = serde_json::from_value::<plc::planner::PlannerDecision>(v.clone()) {
+                                        if let Ok(d) =
+                                            serde_json::from_value::<plc::planner::PlannerDecision>(
+                                                v.clone(),
+                                            )
+                                        {
                                             planner_cache_hits += 1;
                                             planner_cache.insert(cache_key, d.clone());
                                             Some(d)
@@ -3126,14 +3250,16 @@ Constraints:
 - Keep oracle_tactics within {"simp?","exact?","apply?","aesop?"}.
 - For inequality-heavy goals, ban "aesop?".
 "#;
-                                    let ev_json = serde_json::to_string(&evidence).unwrap_or_else(|_| "{}".to_string());
+                                    let ev_json = serde_json::to_string(&evidence)
+                                        .unwrap_or_else(|_| "{}".to_string());
                                     let t0 = std::time::Instant::now();
                                     let res = rt.block_on(plc::planner::plan(
                                         system,
                                         &ev_json,
                                         StdDuration::from_secs(llm_planner_timeout_s),
                                     ));
-                                    prof_planner_ms = prof_planner_ms.saturating_add(t0.elapsed().as_millis() as u64);
+                                    prof_planner_ms = prof_planner_ms
+                                        .saturating_add(t0.elapsed().as_millis() as u64);
                                     let d = match res {
                                         Ok((d, _raw)) => d,
                                         Err(_) => plc::planner::PlannerDecision {
@@ -3156,16 +3282,27 @@ Constraints:
 
                                 if decision.confidence >= 0.4 {
                                     if let Some(passes) = decision.oracle_passes {
-                                        std::env::set_var("PROOFPATCH_ORACLE_PASSES", passes.to_string());
+                                        std::env::set_var(
+                                            "PROOFPATCH_ORACLE_PASSES",
+                                            passes.to_string(),
+                                        );
                                     }
                                     if !decision.oracle_tactics.is_empty() {
-                                        std::env::set_var("PROOFPATCH_ORACLE_TACTICS", decision.oracle_tactics.join(","));
+                                        std::env::set_var(
+                                            "PROOFPATCH_ORACLE_TACTICS",
+                                            decision.oracle_tactics.join(","),
+                                        );
                                     }
                                     if !decision.ban_oracle_tactics.is_empty() {
-                                        std::env::set_var("PROOFPATCH_ORACLE_BAN", decision.ban_oracle_tactics.join(","));
+                                        std::env::set_var(
+                                            "PROOFPATCH_ORACLE_BAN",
+                                            decision.ban_oracle_tactics.join(","),
+                                        );
                                     }
                                     if let Some(fl1) = decision.focus_line_1 {
-                                        if let Some(picked) = cands.iter().find(|h| h.line as u64 == fl1).cloned() {
+                                        if let Some(picked) =
+                                            cands.iter().find(|h| h.line as u64 == fl1).cloned()
+                                        {
                                             picked_sel = Some(picked);
                                         }
                                     }
@@ -3180,30 +3317,189 @@ Constraints:
                         if planner_selected.is_some() {
                             planner_selected
                         } else {
-                        let mut best: Option<(i64, plc::SorryLocation)> = None;
-                        let goal_first_slow_ms = std::env::var("PROOFPATCH_GOAL_FIRST_SLOW_MS")
-                            .ok()
-                            .and_then(|s| s.trim().parse::<u64>().ok())
-                            .unwrap_or(1200);
-                        for s0 in cands {
-                            let mut last_probe_ms: Option<u64> = None;
-                            // Cache lookup: (text hash, len, focus_line)
-                            let th = hash_text(&parent.text);
-                            let key = (th, parent.text.len(), s0.line);
-                            let (state_key, n_goals, hyps_total, _target) = if let Some(v) = goal_dump_cache.get(&key) {
-                                goal_dump_cache_hits += 1;
-                                v.clone()
-                            } else if let Some(cd) = cache_dir.as_ref() {
-                                if let Some(tup) = cache_read_goal_dump(cd, th, parent.text.len(), s0.line) {
+                            let mut best: Option<(i64, plc::SorryLocation)> = None;
+                            let goal_first_slow_ms = std::env::var("PROOFPATCH_GOAL_FIRST_SLOW_MS")
+                                .ok()
+                                .and_then(|s| s.trim().parse::<u64>().ok())
+                                .unwrap_or(1200);
+                            for s0 in cands {
+                                let mut last_probe_ms: Option<u64> = None;
+                                // Cache lookup: (text hash, len, focus_line)
+                                let th = hash_text(&parent.text);
+                                let key = (th, parent.text.len(), s0.line);
+                                let (state_key, n_goals, hyps_total, _target) = if let Some(v) =
+                                    goal_dump_cache.get(&key)
+                                {
                                     goal_dump_cache_hits += 1;
-                                    goal_dump_cache.insert(key, tup.clone());
-                                    if let Some(hyps) = cache_read_goal_dump_hyps_texts(cd, th, parent.text.len(), s0.line) {
-                                        goal_dump_hyps_cache_hits += 1;
-                                        goal_dump_hyps_cache.insert(key, hyps);
+                                    v.clone()
+                                } else if let Some(cd) = cache_dir.as_ref() {
+                                    if let Some(tup) =
+                                        cache_read_goal_dump(cd, th, parent.text.len(), s0.line)
+                                    {
+                                        goal_dump_cache_hits += 1;
+                                        goal_dump_cache.insert(key, tup.clone());
+                                        if let Some(hyps) = cache_read_goal_dump_hyps_texts(
+                                            cd,
+                                            th,
+                                            parent.text.len(),
+                                            s0.line,
+                                        ) {
+                                            goal_dump_hyps_cache_hits += 1;
+                                            goal_dump_hyps_cache.insert(key, hyps);
+                                        } else {
+                                            goal_dump_hyps_cache_misses += 1;
+                                        }
+                                        tup
                                     } else {
-                                        goal_dump_hyps_cache_misses += 1;
+                                        goal_dump_cache_misses += 1;
+                                        // Bounded: share budget with oracle calls.
+                                        if lean_oracle_calls >= lean_oracle_max_calls {
+                                            continue;
+                                        }
+                                        goal_dump_calls += 1;
+                                        lean_oracle_calls += 1;
+                                        let t0 = std::time::Instant::now();
+                                        let gd = if let Some(dur) = budget_dur(goal_dump_timeout_s)
+                                        {
+                                            rt.block_on(plc::goal_dump_in_text_at(
+                                                &repo_root,
+                                                &file,
+                                                &parent.text,
+                                                dur,
+                                                Some(s0.line),
+                                                first_error_line_1,
+                                            ))
+                                            .ok()
+                                        } else {
+                                            bailed_total_timeout = true;
+                                            record_event(
+                                                "bailout_total_timeout",
+                                                json!({ "where": "goal_dump_goal_first" }),
+                                            );
+                                            None
+                                        };
+                                        let elapsed_ms = t0.elapsed().as_millis() as u64;
+                                        last_probe_ms = Some(elapsed_ms);
+                                        prof_goal_dump_ms =
+                                            prof_goal_dump_ms.saturating_add(elapsed_ms);
+                                        let pp = gd.as_ref().and_then(|v| v.get("pp_dump"));
+                                        let state_key = pp
+                                            .and_then(|pp| hash_state_key(pp))
+                                            .unwrap_or(UNKNOWN_STATE_KEY);
+                                        let n_goals = pp
+                                            .and_then(|pp| pp.get("goals"))
+                                            .and_then(|v| v.as_array())
+                                            .map(|a| a.len())
+                                            .unwrap_or(0);
+                                        let hyps_total = pp
+                                            .and_then(|pp| pp.get("goals"))
+                                            .and_then(|v| v.as_array())
+                                            .map(|a| {
+                                                a.iter()
+                                                    .map(|g| {
+                                                        g.get("hyps")
+                                                            .and_then(|h| h.as_array())
+                                                            .map(|x| x.len())
+                                                            .unwrap_or(0)
+                                                    })
+                                                    .sum::<usize>()
+                                            })
+                                            .unwrap_or(0);
+                                        let target = pp
+                                            .and_then(|pp| pp.get("goals"))
+                                            .and_then(|v| v.as_array())
+                                            .and_then(|a| a.first())
+                                            .and_then(|g| g.get("pretty"))
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| {
+                                                s.lines().find_map(|ln| {
+                                                    ln.trim_start()
+                                                        .strip_prefix("⊢")
+                                                        .map(|r| r.trim().to_string())
+                                                })
+                                            })
+                                            .unwrap_or_default();
+                                        let hyps_texts: Vec<String> = pp
+                                            .and_then(|pp| pp.get("goals"))
+                                            .and_then(|v| v.as_array())
+                                            .and_then(|a| a.first())
+                                            .and_then(|g| g.get("hyps"))
+                                            .and_then(|v| v.as_array())
+                                            .map(|a| {
+                                                a.iter()
+                                                    .filter_map(|h| {
+                                                        h.get("text")
+                                                            .and_then(|v| v.as_str())
+                                                            .map(|s| s.to_string())
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            })
+                                            .unwrap_or_default();
+                                        let tup = (state_key, n_goals, hyps_total, target.clone());
+                                        goal_dump_cache.insert(key, tup.clone());
+                                        goal_dump_hyps_cache.insert(key, hyps_texts.clone());
+                                        cache_write_goal_dump(
+                                            cd,
+                                            th,
+                                            parent.text.len(),
+                                            s0.line,
+                                            state_key,
+                                            n_goals,
+                                            hyps_total,
+                                            &target,
+                                            &hyps_texts,
+                                        );
+
+                                        // SMT precheck: if hyps entail target (LIA-only), take this hole immediately.
+                                        #[cfg(feature = "smt")]
+                                        if smt_precheck {
+                                            if let Some(pp0) = pp {
+                                                let goal_sig = hash_text(&target);
+                                                let ck = (state_key, goal_sig);
+                                                let mut entails_opt: Option<bool> = None;
+                                                if let Some(v) = smt_entails_cache.get(&ck).copied()
+                                                {
+                                                    smt_cache_hits += 1;
+                                                    entails_opt = Some(v);
+                                                } else if let Some(cd2) = cache_dir.as_ref() {
+                                                    if let Some(v) = cache_read_smt_entails(
+                                                        cd2, state_key, goal_sig,
+                                                    ) {
+                                                        smt_cache_hits += 1;
+                                                        smt_entails_cache.insert(ck, v);
+                                                        entails_opt = Some(v);
+                                                    }
+                                                }
+                                                if entails_opt.is_none() {
+                                                    smt_cache_misses += 1;
+                                                    let t_smt0 = std::time::Instant::now();
+                                                    let entails = smt_entails_from_pp_dump(
+                                                        pp0,
+                                                        smt_timeout_ms,
+                                                        smt_seed,
+                                                    )
+                                                    .unwrap_or(None);
+                                                    prof_smt_ms = prof_smt_ms.saturating_add(
+                                                        t_smt0.elapsed().as_millis() as u64,
+                                                    );
+                                                    if let Some(b) = entails {
+                                                        smt_entails_cache.insert(ck, b);
+                                                        if let Some(cd2) = cache_dir.as_ref() {
+                                                            cache_write_smt_entails(
+                                                                cd2, state_key, goal_sig, b,
+                                                            );
+                                                        }
+                                                        entails_opt = Some(b);
+                                                    }
+                                                }
+                                                if entails_opt == Some(true) {
+                                                    best = Some((-1, s0));
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        tup
                                     }
-                                    tup
                                 } else {
                                     goal_dump_cache_misses += 1;
                                     // Bounded: share budget with oracle calls.
@@ -3227,13 +3523,14 @@ Constraints:
                                         bailed_total_timeout = true;
                                         record_event(
                                             "bailout_total_timeout",
-                                            json!({ "where": "goal_dump_goal_first" }),
+                                            json!({ "where": "goal_dump_goal_first_smt" }),
                                         );
                                         None
                                     };
                                     let elapsed_ms = t0.elapsed().as_millis() as u64;
                                     last_probe_ms = Some(elapsed_ms);
-                                    prof_goal_dump_ms = prof_goal_dump_ms.saturating_add(elapsed_ms);
+                                    prof_goal_dump_ms =
+                                        prof_goal_dump_ms.saturating_add(elapsed_ms);
                                     let pp = gd.as_ref().and_then(|v| v.get("pp_dump"));
                                     let state_key = pp
                                         .and_then(|pp| hash_state_key(pp))
@@ -3248,7 +3545,12 @@ Constraints:
                                         .and_then(|v| v.as_array())
                                         .map(|a| {
                                             a.iter()
-                                                .map(|g| g.get("hyps").and_then(|h| h.as_array()).map(|x| x.len()).unwrap_or(0))
+                                                .map(|g| {
+                                                    g.get("hyps")
+                                                        .and_then(|h| h.as_array())
+                                                        .map(|x| x.len())
+                                                        .unwrap_or(0)
+                                                })
                                                 .sum::<usize>()
                                         })
                                         .unwrap_or(0);
@@ -3258,7 +3560,13 @@ Constraints:
                                         .and_then(|a| a.first())
                                         .and_then(|g| g.get("pretty"))
                                         .and_then(|v| v.as_str())
-                                        .and_then(|s| s.lines().find_map(|ln| ln.trim_start().strip_prefix("⊢").map(|r| r.trim().to_string())))
+                                        .and_then(|s| {
+                                            s.lines().find_map(|ln| {
+                                                ln.trim_start()
+                                                    .strip_prefix("⊢")
+                                                    .map(|r| r.trim().to_string())
+                                            })
+                                        })
                                         .unwrap_or_default();
                                     let hyps_texts: Vec<String> = pp
                                         .and_then(|pp| pp.get("goals"))
@@ -3268,16 +3576,32 @@ Constraints:
                                         .and_then(|v| v.as_array())
                                         .map(|a| {
                                             a.iter()
-                                                .filter_map(|h| h.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                                                .filter_map(|h| {
+                                                    h.get("text")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(|s| s.to_string())
+                                                })
                                                 .collect::<Vec<_>>()
                                         })
                                         .unwrap_or_default();
                                     let tup = (state_key, n_goals, hyps_total, target.clone());
                                     goal_dump_cache.insert(key, tup.clone());
                                     goal_dump_hyps_cache.insert(key, hyps_texts.clone());
-                                    cache_write_goal_dump(cd, th, parent.text.len(), s0.line, state_key, n_goals, hyps_total, &target, &hyps_texts);
+                                    if let Some(cd) = cache_dir.as_ref() {
+                                        cache_write_goal_dump(
+                                            cd,
+                                            th,
+                                            parent.text.len(),
+                                            s0.line,
+                                            state_key,
+                                            n_goals,
+                                            hyps_total,
+                                            &target,
+                                            &hyps_texts,
+                                        );
+                                    }
 
-                                    // SMT precheck: if hyps entail target (LIA-only), take this hole immediately.
+                                    // SMT precheck (same logic as above, but after the no-cache path).
                                     #[cfg(feature = "smt")]
                                     if smt_precheck {
                                         if let Some(pp0) = pp {
@@ -3288,7 +3612,9 @@ Constraints:
                                                 smt_cache_hits += 1;
                                                 entails_opt = Some(v);
                                             } else if let Some(cd2) = cache_dir.as_ref() {
-                                                if let Some(v) = cache_read_smt_entails(cd2, state_key, goal_sig) {
+                                                if let Some(v) =
+                                                    cache_read_smt_entails(cd2, state_key, goal_sig)
+                                                {
                                                     smt_cache_hits += 1;
                                                     smt_entails_cache.insert(ck, v);
                                                     entails_opt = Some(v);
@@ -3297,12 +3623,21 @@ Constraints:
                                             if entails_opt.is_none() {
                                                 smt_cache_misses += 1;
                                                 let t_smt0 = std::time::Instant::now();
-                                                let entails = smt_entails_from_pp_dump(pp0, smt_timeout_ms, smt_seed).unwrap_or(None);
-                                                prof_smt_ms = prof_smt_ms.saturating_add(t_smt0.elapsed().as_millis() as u64);
+                                                let entails = smt_entails_from_pp_dump(
+                                                    pp0,
+                                                    smt_timeout_ms,
+                                                    smt_seed,
+                                                )
+                                                .unwrap_or(None);
+                                                prof_smt_ms = prof_smt_ms.saturating_add(
+                                                    t_smt0.elapsed().as_millis() as u64,
+                                                );
                                                 if let Some(b) = entails {
                                                     smt_entails_cache.insert(ck, b);
                                                     if let Some(cd2) = cache_dir.as_ref() {
-                                                        cache_write_smt_entails(cd2, state_key, goal_sig, b);
+                                                        cache_write_smt_entails(
+                                                            cd2, state_key, goal_sig, b,
+                                                        );
                                                     }
                                                     entails_opt = Some(b);
                                                 }
@@ -3314,229 +3649,137 @@ Constraints:
                                         }
                                     }
                                     tup
-                                }
-                            } else {
-                                goal_dump_cache_misses += 1;
-                                // Bounded: share budget with oracle calls.
-                                if lean_oracle_calls >= lean_oracle_max_calls {
-                                    continue;
-                                }
-                                goal_dump_calls += 1;
-                                lean_oracle_calls += 1;
-                                let t0 = std::time::Instant::now();
-                                let gd = if let Some(dur) = budget_dur(goal_dump_timeout_s) {
-                                    rt.block_on(plc::goal_dump_in_text_at(
-                                        &repo_root,
-                                        &file,
-                                        &parent.text,
-                                        dur,
-                                        Some(s0.line),
-                                        first_error_line_1,
-                                    ))
-                                    .ok()
-                                } else {
-                                    bailed_total_timeout = true;
-                                    record_event(
-                                        "bailout_total_timeout",
-                                        json!({ "where": "goal_dump_goal_first_smt" }),
-                                    );
-                                    None
                                 };
-                                let elapsed_ms = t0.elapsed().as_millis() as u64;
-                                last_probe_ms = Some(elapsed_ms);
-                                prof_goal_dump_ms = prof_goal_dump_ms.saturating_add(elapsed_ms);
-                                let pp = gd.as_ref().and_then(|v| v.get("pp_dump"));
-                                let state_key = pp
-                                    .and_then(|pp| hash_state_key(pp))
-                                    .unwrap_or(UNKNOWN_STATE_KEY);
-                                let n_goals = pp
-                                    .and_then(|pp| pp.get("goals"))
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| a.len())
-                                    .unwrap_or(0);
-                                let hyps_total = pp
-                                    .and_then(|pp| pp.get("goals"))
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter()
-                                            .map(|g| g.get("hyps").and_then(|h| h.as_array()).map(|x| x.len()).unwrap_or(0))
-                                            .sum::<usize>()
-                                    })
-                                    .unwrap_or(0);
-                                let target = pp
-                                    .and_then(|pp| pp.get("goals"))
-                                    .and_then(|v| v.as_array())
-                                    .and_then(|a| a.first())
-                                    .and_then(|g| g.get("pretty"))
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|s| s.lines().find_map(|ln| ln.trim_start().strip_prefix("⊢").map(|r| r.trim().to_string())))
-                                    .unwrap_or_default();
-                                let hyps_texts: Vec<String> = pp
-                                    .and_then(|pp| pp.get("goals"))
-                                    .and_then(|v| v.as_array())
-                                    .and_then(|a| a.first())
-                                    .and_then(|g| g.get("hyps"))
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|h| h.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default();
-                                let tup = (state_key, n_goals, hyps_total, target.clone());
-                                goal_dump_cache.insert(key, tup.clone());
-                                goal_dump_hyps_cache.insert(key, hyps_texts.clone());
-                                if let Some(cd) = cache_dir.as_ref() {
-                                    cache_write_goal_dump(cd, th, parent.text.len(), s0.line, state_key, n_goals, hyps_total, &target, &hyps_texts);
-                                }
 
-                                // SMT precheck (same logic as above, but after the no-cache path).
-                                #[cfg(feature = "smt")]
-                                if smt_precheck {
-                                    if let Some(pp0) = pp {
-                                        let goal_sig = hash_text(&target);
-                                        let ck = (state_key, goal_sig);
-                                        let mut entails_opt: Option<bool> = None;
-                                        if let Some(v) = smt_entails_cache.get(&ck).copied() {
-                                            smt_cache_hits += 1;
-                                            entails_opt = Some(v);
-                                        } else if let Some(cd2) = cache_dir.as_ref() {
-                                            if let Some(v) = cache_read_smt_entails(cd2, state_key, goal_sig) {
-                                                smt_cache_hits += 1;
-                                                smt_entails_cache.insert(ck, v);
-                                                entails_opt = Some(v);
-                                            }
-                                        }
-                                        if entails_opt.is_none() {
-                                            smt_cache_misses += 1;
-                                            let t_smt0 = std::time::Instant::now();
-                                            let entails = smt_entails_from_pp_dump(pp0, smt_timeout_ms, smt_seed).unwrap_or(None);
-                                            prof_smt_ms = prof_smt_ms.saturating_add(t_smt0.elapsed().as_millis() as u64);
-                                            if let Some(b) = entails {
-                                                smt_entails_cache.insert(ck, b);
-                                                if let Some(cd2) = cache_dir.as_ref() {
-                                                    cache_write_smt_entails(cd2, state_key, goal_sig, b);
-                                                }
-                                                entails_opt = Some(b);
-                                            }
-                                        }
-                                        if entails_opt == Some(true) {
-                                            best = Some((-1, s0));
-                                            break;
-                                        }
-                                    }
-                                }
-                                tup
-                            };
+                                // Difficulty heuristic: fewer goals, fewer hyps, smaller state_key==0 means unknown (penalize).
+                                let unknown_pen = if state_key == UNKNOWN_STATE_KEY {
+                                    10_000
+                                } else {
+                                    0
+                                };
+                                let meta_vars_pen = if goal_meta_penalty > 0 {
+                                    // If the target contains metavariables, treat it as harder to avoid wasting budget.
+                                    let th = hash_text(&parent.text);
+                                    let k = (th, parent.text.len(), s0.line);
+                                    let target = goal_dump_cache
+                                        .get(&k)
+                                        .map(|(_, _, _, t)| t.clone())
+                                        .unwrap_or_default();
+                                    let meta =
+                                        target.matches("?m").count() + target.matches("?_").count();
+                                    (meta as i64).saturating_mul(goal_meta_penalty)
+                                } else {
+                                    0
+                                };
+                                let score0 = unknown_pen as i64
+                                    + (n_goals as i64 * 100)
+                                    + hyps_total as i64
+                                    + meta_vars_pen;
 
-                            // Difficulty heuristic: fewer goals, fewer hyps, smaller state_key==0 means unknown (penalize).
-                            let unknown_pen = if state_key == UNKNOWN_STATE_KEY { 10_000 } else { 0 };
-                            let meta_vars_pen = if goal_meta_penalty > 0 {
-                                // If the target contains metavariables, treat it as harder to avoid wasting budget.
-                                let th = hash_text(&parent.text);
-                                let k = (th, parent.text.len(), s0.line);
-                                let target = goal_dump_cache
-                                    .get(&k)
-                                    .map(|(_, _, _, t)| t.clone())
-                                    .unwrap_or_default();
-                                let meta = target.matches("?m").count() + target.matches("?_").count();
-                                (meta as i64).saturating_mul(goal_meta_penalty)
-                            } else {
-                                0
-                            };
-                            let score0 =
-                                unknown_pen as i64 + (n_goals as i64 * 100) + hyps_total as i64 + meta_vars_pen;
-
-                            // Optional SMT hint: if the target is implied by (some) integer constraints in the local context,
-                            // treat this hole as very easy (it likely succumbs to `omega`/`linarith`/`simp`).
-                            let score = {
-                                #[cfg(feature = "smt")]
-                                {
-                                    let mut score = score0;
-                                    if smt_precheck && state_key != UNKNOWN_STATE_KEY {
-                                        let th = hash_text(&parent.text);
-                                        let k = (th, parent.text.len(), s0.line);
-                                        let target = goal_dump_cache
-                                            .get(&k)
-                                            .map(|(_, _, _, t)| t.clone())
-                                            .unwrap_or_default();
-                                        if !target.is_empty() {
-                                            let goal_sig = hash_text(&target);
-                                            let ck = (state_key, goal_sig);
-                                            let mut cached = smt_entails_cache.get(&ck).copied();
-                                            if cached.is_none() {
-                                                if let Some(cd) = cache_dir.as_ref() {
-                                                    if let Some(ent) = cache_read_smt_entails(cd, state_key, goal_sig) {
-                                                        cached = Some(ent);
-                                                        smt_entails_cache.insert(ck, ent);
-                                                        smt_cache_hits += 1;
+                                // Optional SMT hint: if the target is implied by (some) integer constraints in the local context,
+                                // treat this hole as very easy (it likely succumbs to `omega`/`linarith`/`simp`).
+                                let score = {
+                                    #[cfg(feature = "smt")]
+                                    {
+                                        let mut score = score0;
+                                        if smt_precheck && state_key != UNKNOWN_STATE_KEY {
+                                            let th = hash_text(&parent.text);
+                                            let k = (th, parent.text.len(), s0.line);
+                                            let target = goal_dump_cache
+                                                .get(&k)
+                                                .map(|(_, _, _, t)| t.clone())
+                                                .unwrap_or_default();
+                                            if !target.is_empty() {
+                                                let goal_sig = hash_text(&target);
+                                                let ck = (state_key, goal_sig);
+                                                let mut cached =
+                                                    smt_entails_cache.get(&ck).copied();
+                                                if cached.is_none() {
+                                                    if let Some(cd) = cache_dir.as_ref() {
+                                                        if let Some(ent) = cache_read_smt_entails(
+                                                            cd, state_key, goal_sig,
+                                                        ) {
+                                                            cached = Some(ent);
+                                                            smt_entails_cache.insert(ck, ent);
+                                                            smt_cache_hits += 1;
+                                                        }
                                                     }
                                                 }
-                                            }
-                                            if cached.is_none() {
-                                                // No extra Lean calls. If we have cached hypothesis text for this hole,
-                                                // we can still run SMT without Lean (best-effort LIA).
-                                                smt_cache_misses += 1;
-                                                let hyps_texts = if let Some(xs) = goal_dump_hyps_cache.get(&k).cloned() {
-                                                    goal_dump_hyps_cache_hits += 1;
-                                                    xs
-                                                } else if let Some(cd) = cache_dir.as_ref() {
-                                                    if let Some(xs) =
-                                                        cache_read_goal_dump_hyps_texts(cd, th, parent.text.len(), s0.line)
+                                                if cached.is_none() {
+                                                    // No extra Lean calls. If we have cached hypothesis text for this hole,
+                                                    // we can still run SMT without Lean (best-effort LIA).
+                                                    smt_cache_misses += 1;
+                                                    let hyps_texts = if let Some(xs) =
+                                                        goal_dump_hyps_cache.get(&k).cloned()
                                                     {
                                                         goal_dump_hyps_cache_hits += 1;
-                                                        goal_dump_hyps_cache.insert(k, xs.clone());
                                                         xs
+                                                    } else if let Some(cd) = cache_dir.as_ref() {
+                                                        if let Some(xs) =
+                                                            cache_read_goal_dump_hyps_texts(
+                                                                cd,
+                                                                th,
+                                                                parent.text.len(),
+                                                                s0.line,
+                                                            )
+                                                        {
+                                                            goal_dump_hyps_cache_hits += 1;
+                                                            goal_dump_hyps_cache
+                                                                .insert(k, xs.clone());
+                                                            xs
+                                                        } else {
+                                                            goal_dump_hyps_cache_misses += 1;
+                                                            Vec::new()
+                                                        }
                                                     } else {
                                                         goal_dump_hyps_cache_misses += 1;
                                                         Vec::new()
-                                                    }
-                                                } else {
-                                                    goal_dump_hyps_cache_misses += 1;
-                                                    Vec::new()
-                                                };
-                                                if !hyps_texts.is_empty() {
-                                                    let t0 = std::time::Instant::now();
-                                                    let ent = smt_entails_from_hyps_target(
-                                                        &hyps_texts,
-                                                        &target,
-                                                        smt_timeout_ms,
-                                                        smt_seed,
-                                                    )
-                                                    .unwrap_or(None);
-                                                    prof_smt_ms =
-                                                        prof_smt_ms.saturating_add(t0.elapsed().as_millis() as u64);
-                                                    if let Some(ent) = ent {
-                                                        smt_entails_cache.insert(ck, ent);
-                                                        if let Some(cd) = cache_dir.as_ref() {
-                                                            cache_write_smt_entails(cd, state_key, goal_sig, ent);
+                                                    };
+                                                    if !hyps_texts.is_empty() {
+                                                        let t0 = std::time::Instant::now();
+                                                        let ent = smt_entails_from_hyps_target(
+                                                            &hyps_texts,
+                                                            &target,
+                                                            smt_timeout_ms,
+                                                            smt_seed,
+                                                        )
+                                                        .unwrap_or(None);
+                                                        prof_smt_ms = prof_smt_ms.saturating_add(
+                                                            t0.elapsed().as_millis() as u64,
+                                                        );
+                                                        if let Some(ent) = ent {
+                                                            smt_entails_cache.insert(ck, ent);
+                                                            if let Some(cd) = cache_dir.as_ref() {
+                                                                cache_write_smt_entails(
+                                                                    cd, state_key, goal_sig, ent,
+                                                                );
+                                                            }
+                                                            cached = Some(ent);
                                                         }
-                                                        cached = Some(ent);
                                                     }
                                                 }
-                                            }
-                                            if cached == Some(true) {
-                                                score = score.saturating_sub(10_000);
+                                                if cached == Some(true) {
+                                                    score = score.saturating_sub(10_000);
+                                                }
                                             }
                                         }
+                                        score
                                     }
-                                    score
+                                    #[cfg(not(feature = "smt"))]
+                                    {
+                                        score0
+                                    }
+                                };
+                                if best.as_ref().map(|(b, _)| score < *b).unwrap_or(true) {
+                                    best = Some((score, s0));
                                 }
-                                #[cfg(not(feature = "smt"))]
-                                {
-                                    score0
+                                if let Some(ms) = last_probe_ms {
+                                    if ms >= goal_first_slow_ms {
+                                        break;
+                                    }
                                 }
-                            };
-                            if best.as_ref().map(|(b, _)| score < *b).unwrap_or(true) {
-                                best = Some((score, s0));
                             }
-                            if let Some(ms) = last_probe_ms {
-                                if ms >= goal_first_slow_ms {
-                                    break;
-                                }
-                            }
-                        }
-                        best.map(|(_, s)| s)
+                            best.map(|(_, s)| s)
                         }
                     } else if let Some(fl) = parent.focus_line.or(first_error_line_1) {
                         // Choose the `sorry` closest to `fl` to keep the search locally focused.
@@ -3585,7 +3828,8 @@ Constraints:
                                     break;
                                 }
                                 // Stop at a declaration boundary at smaller indentation.
-                                let ind_k = l.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+                                let ind_k =
+                                    l.chars().take_while(|c| *c == ' ' || *c == '\t').count();
                                 if ind_k < indent
                                     && (t.starts_with("lemma ")
                                         || t.starts_with("theorem ")
@@ -3610,7 +3854,10 @@ Constraints:
                     // then fall back to deterministic fill candidates.
                     let mut oracle_candidates: Option<Vec<String>> = None;
                     let mut force_fill_candidates = false;
-                    if candidates_mode == "lean-try" && lean_oracle_per_node && lean_oracle_calls < lean_oracle_max_calls {
+                    if candidates_mode == "lean-try"
+                        && lean_oracle_per_node
+                        && lean_oracle_calls < lean_oracle_max_calls
+                    {
                         let focus_line = sel.line;
                         let h = hash_text(&parent.text);
                         let key = (h, parent.text.len(), focus_line);
@@ -3656,7 +3903,10 @@ Constraints:
                             );
                             let Some(dur) = budget_dur(oracle_timeout_s) else {
                                 bailed_total_timeout = true;
-                                record_event("bailout_total_timeout", json!({ "where": "oracle_call" }));
+                                record_event(
+                                    "bailout_total_timeout",
+                                    json!({ "where": "oracle_call" }),
+                                );
                                 break;
                             };
                             let ls_res = rt.block_on(plc::lean_suggest_in_text_at(
@@ -3693,9 +3943,12 @@ Constraints:
                                 .as_ref()
                                 .and_then(|v| v.get("verify"))
                                 .and_then(|v| v.get("raw"));
-                            let verify_ok = verify_raw.and_then(|v| v.get("ok")).and_then(|v| v.as_bool());
-                            let verify_timeout =
-                                verify_raw.and_then(|v| v.get("timeout")).and_then(|v| v.as_bool());
+                            let verify_ok = verify_raw
+                                .and_then(|v| v.get("ok"))
+                                .and_then(|v| v.as_bool());
+                            let verify_timeout = verify_raw
+                                .and_then(|v| v.get("timeout"))
+                                .and_then(|v| v.as_bool());
                             let verify_cmd0 = verify_raw
                                 .and_then(|v| v.get("cmd"))
                                 .and_then(|v| v.as_array())
@@ -3754,10 +4007,17 @@ Constraints:
                                     .and_then(|a| a.first())
                                     .and_then(|g| g.get("pretty"))
                                     .and_then(|v| v.as_str())
-                                    .and_then(|s| s.lines().find_map(|ln| ln.trim_start().strip_prefix("⊢").map(|r| r.trim().to_string())))
+                                    .and_then(|s| {
+                                        s.lines().find_map(|ln| {
+                                            ln.trim_start()
+                                                .strip_prefix("⊢")
+                                                .map(|r| r.trim().to_string())
+                                        })
+                                    })
                                     .unwrap_or_default();
                                 let sk = goal_hash.unwrap_or(UNKNOWN_STATE_KEY);
-                                goal_dump_cache.insert(key, (sk, n_goals, hyps_total, target.clone()));
+                                goal_dump_cache
+                                    .insert(key, (sk, n_goals, hyps_total, target.clone()));
                                 // Best-effort: record local-context lines so SMT precheck can run without re-calling Lean.
                                 let hyps_texts: Vec<String> = pp
                                     .get("goals")
@@ -3767,13 +4027,27 @@ Constraints:
                                     .and_then(|v| v.as_array())
                                     .map(|a| {
                                         a.iter()
-                                            .filter_map(|h| h.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                                            .filter_map(|h| {
+                                                h.get("text")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(|s| s.to_string())
+                                            })
                                             .collect::<Vec<_>>()
                                     })
                                     .unwrap_or_default();
                                 goal_dump_hyps_cache.insert(key, hyps_texts.clone());
                                 if let Some(cd) = cache_dir.as_ref() {
-                                    cache_write_goal_dump(cd, h, parent.text.len(), focus_line, sk, n_goals, hyps_total, &target, &hyps_texts);
+                                    cache_write_goal_dump(
+                                        cd,
+                                        h,
+                                        parent.text.len(),
+                                        focus_line,
+                                        sk,
+                                        n_goals,
+                                        hyps_total,
+                                        &target,
+                                        &hyps_texts,
+                                    );
                                 }
                                 // Use first goal pretty as a cheap heuristic source.
                                 if let Some(pretty) = pp
@@ -3787,7 +4061,10 @@ Constraints:
                                 }
                                 // Also derive from the target + hypothesis snippets (often includes type hints).
                                 if !target.trim().is_empty() {
-                                    let mut more = plc::derive_candidates_from_goal_context(&hyps_texts, &target);
+                                    let mut more = plc::derive_candidates_from_goal_context(
+                                        &hyps_texts,
+                                        &target,
+                                    );
                                     derived.append(&mut more);
                                 }
                             }
@@ -3851,7 +4128,9 @@ Constraints:
                         if let Some((sk, _, _, _)) = goal_dump_cache.get(&key).cloned() {
                             if sk != UNKNOWN_STATE_KEY {
                                 if let Some(xs) = oracle_candidates.as_ref() {
-                                    lean_state_candidates_cache.entry(sk).or_insert_with(|| xs.clone());
+                                    lean_state_candidates_cache
+                                        .entry(sk)
+                                        .or_insert_with(|| xs.clone());
                                 }
                             }
                         }
@@ -3868,9 +4147,13 @@ Constraints:
                     } else {
                         &candidates_fill
                     };
-                    let candidates_here0 = adapt_candidates_for_error(base_candidates, parent_first_error);
                     let candidates_here0 =
-                        adapt_candidates_for_sorry_context(&candidates_here0, &sel.line_text, is_tactic_context);
+                        adapt_candidates_for_error(base_candidates, parent_first_error);
+                    let candidates_here0 = adapt_candidates_for_sorry_context(
+                        &candidates_here0,
+                        &sel.line_text,
+                        is_tactic_context,
+                    );
 
                     // Optional: if deterministic tactics stalled, opportunistically ask the LLM
                     // for more candidates for this exact region.
@@ -3929,7 +4212,8 @@ Constraints:
                                 merged.extend(xs);
                                 sanitize_candidates(merged)
                             } else {
-                                llm_escalate_last_error = Some("llm_response_not_json_string_array".to_string());
+                                llm_escalate_last_error =
+                                    Some("llm_response_not_json_string_array".to_string());
                                 candidates_here0
                             }
                         } else {
@@ -3957,7 +4241,10 @@ Constraints:
                     // This is used to re-rank candidates: if the goal is implied by a linear arithmetic fragment,
                     // prioritize arithmetic tactics; if not implied, de-prioritize them.
                     #[cfg(feature = "smt")]
-                    let (smt_entails_opt, smt_hint_json): (Option<bool>, Option<serde_json::Value>) = if smt_precheck {
+                    let (smt_entails_opt, smt_hint_json): (
+                        Option<bool>,
+                        Option<serde_json::Value>,
+                    ) = if smt_precheck {
                         if let Some(sk) = state_key_opt {
                             let th = hash_text(&parent.text);
                             let k = (th, parent.text.len(), sel.line);
@@ -4004,19 +4291,23 @@ Constraints:
                                 } else {
                                     // Try to compute from cached hyps_texts + target (no Lean).
                                     smt_cache_misses += 1;
-                                    let hyps_texts = if let Some(xs) = goal_dump_hyps_cache.get(&k).cloned() {
-                                        goal_dump_hyps_cache_hits += 1;
-                                        xs
-                                    } else if let Some(xs) =
-                                        cache_read_goal_dump_hyps_texts(cd, th, parent.text.len(), sel.line)
-                                    {
-                                        goal_dump_hyps_cache_hits += 1;
-                                        goal_dump_hyps_cache.insert(k, xs.clone());
-                                        xs
-                                    } else {
-                                        goal_dump_hyps_cache_misses += 1;
-                                        Vec::new()
-                                    };
+                                    let hyps_texts =
+                                        if let Some(xs) = goal_dump_hyps_cache.get(&k).cloned() {
+                                            goal_dump_hyps_cache_hits += 1;
+                                            xs
+                                        } else if let Some(xs) = cache_read_goal_dump_hyps_texts(
+                                            cd,
+                                            th,
+                                            parent.text.len(),
+                                            sel.line,
+                                        ) {
+                                            goal_dump_hyps_cache_hits += 1;
+                                            goal_dump_hyps_cache.insert(k, xs.clone());
+                                            xs
+                                        } else {
+                                            goal_dump_hyps_cache_misses += 1;
+                                            Vec::new()
+                                        };
                                     if hyps_texts.is_empty() {
                                         (
                                             None,
@@ -4036,7 +4327,8 @@ Constraints:
                                             smt_seed,
                                         )
                                         .unwrap_or(None);
-                                        prof_smt_ms = prof_smt_ms.saturating_add(t0.elapsed().as_millis() as u64);
+                                        prof_smt_ms = prof_smt_ms
+                                            .saturating_add(t0.elapsed().as_millis() as u64);
                                         if let Some(ent) = ent {
                                             smt_entails_cache.insert(ck, ent);
                                             cache_write_smt_entails(cd, sk, goal_sig, ent);
@@ -4092,7 +4384,8 @@ Constraints:
                         goal_dump_cache
                             .get(&k)
                             .map(|(_, ng, ht, target)| {
-                                let meta = target.matches("?m").count() + target.matches("?_").count();
+                                let meta =
+                                    target.matches("?m").count() + target.matches("?_").count();
                                 (*ng as i64, *ht as i64, meta as i64)
                             })
                             .unwrap_or((0, 0, 0))
@@ -4218,8 +4511,11 @@ Constraints:
                             let holes = c.matches("?_").count() as i64;
                             let bullets = c.matches("\n·").count() as i64;
                             let len = c.chars().count() as i64;
-                            let complexity =
-                                holes * (50 + 10 * n_goals) + bullets * 10 + lines * 5 + len / 40 + hyps_total / 20;
+                            let complexity = holes * (50 + 10 * n_goals)
+                                + bullets * 10
+                                + lines * 5
+                                + len / 40
+                                + hyps_total / 20;
                             CandRank {
                                 cand: c,
                                 cand_h,
@@ -4240,7 +4536,12 @@ Constraints:
                     // the same `state_key` + candidate hash.
                     let state_action_skip = std::env::var("PROOFPATCH_STATE_ACTION_SKIP")
                         .ok()
-                        .map(|s| matches!(s.trim().to_lowercase().as_str(), "0" | "false" | "no" | "n" | "off"))
+                        .map(|s| {
+                            matches!(
+                                s.trim().to_lowercase().as_str(),
+                                "0" | "false" | "no" | "n" | "off"
+                            )
+                        })
                         .map(|disabled| !disabled)
                         .unwrap_or(true);
                     let mut cand_vec: Vec<String> = Vec::new();
@@ -4348,9 +4649,10 @@ Constraints:
                         let mut roll_last_replacement: Option<String> = Some(cand.clone());
                         for _ in 0..rollout_k {
                             let t0 = std::time::Instant::now();
-                            let locs_r = plc::locate_sorries_in_text(&rolled_text, 200, 1).unwrap_or_default();
-                            prof_locate_sorries_ms =
-                                prof_locate_sorries_ms.saturating_add(t0.elapsed().as_millis() as u64);
+                            let locs_r = plc::locate_sorries_in_text(&rolled_text, 200, 1)
+                                .unwrap_or_default();
+                            prof_locate_sorries_ms = prof_locate_sorries_ms
+                                .saturating_add(t0.elapsed().as_millis() as u64);
                             if locs_r.is_empty() {
                                 break;
                             }
@@ -4358,7 +4660,9 @@ Constraints:
                                 .iter()
                                 .min_by_key(|l| (l.line as i64 - rolled_line as i64).abs())
                                 .cloned();
-                            let Some(sel_r) = next else { break; };
+                            let Some(sel_r) = next else {
+                                break;
+                            };
 
                             // Detect tactic context for this `sorry` (including bullet/case).
                             let is_tactic_context_r = {
@@ -4387,8 +4691,10 @@ Constraints:
                                             found = true;
                                             break;
                                         }
-                                        let ind_k =
-                                            l.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+                                        let ind_k = l
+                                            .chars()
+                                            .take_while(|c| *c == ' ' || *c == '\t')
+                                            .count();
                                         if ind_k < indent
                                             && (t.starts_with("lemma ")
                                                 || t.starts_with("theorem ")
@@ -4417,7 +4723,9 @@ Constraints:
                                 sel_r.region_end,
                                 &fill_repl,
                             );
-                            let Ok(patched_r) = patched_r else { break; };
+                            let Ok(patched_r) = patched_r else {
+                                break;
+                            };
                             rolled_text = patched_r.text;
                             rolled_line = patched_r.line;
                             roll_last_region = Some((sel_r.region_start, sel_r.region_end));
@@ -4460,7 +4768,10 @@ Constraints:
                                     verify_cache = "none";
                                     let Some(dur) = budget_dur(timeout_s) else {
                                         bailed_total_timeout = true;
-                                        record_event("bailout_total_timeout", json!({ "where": "verify_node" }));
+                                        record_event(
+                                            "bailout_total_timeout",
+                                            json!({ "where": "verify_node" }),
+                                        );
                                         break;
                                     };
                                     let t0 = std::time::Instant::now();
@@ -4494,7 +4805,8 @@ Constraints:
                                         .saturating_add(t0.elapsed().as_millis() as u64);
                                     let t0 = std::time::Instant::now();
                                     let conservative2 =
-                                        plc::count_sorry_tokens_conservative(&rolled_text).unwrap_or(0);
+                                        plc::count_sorry_tokens_conservative(&rolled_text)
+                                            .unwrap_or(0);
                                     prof_conservative_sorries_ms = prof_conservative_sorries_ms
                                         .saturating_add(t0.elapsed().as_millis() as u64);
                                     eval_cache.insert(
@@ -4519,57 +4831,56 @@ Constraints:
                                     (raw_v, summary, locs2.len(), conservative2)
                                 }
                             } else {
-                            verify_cache = "none";
-                            let Some(dur) = budget_dur(timeout_s) else {
-                                bailed_total_timeout = true;
-                                record_event("bailout_total_timeout", json!({ "where": "verify_node" }));
-                                break;
-                            };
-                            let t0 = std::time::Instant::now();
-                            let raw = rt
-                                .block_on(plc::verify_lean_text(
-                                    &repo_root,
-                                    &rolled_text,
-                                    dur,
-                                ))
-                                .unwrap_or(plc::VerifyResult {
-                                    ok: false,
-                                    timeout: false,
-                                    returncode: None,
-                                    stdout: String::new(),
-                                    stderr: "verify failed".to_string(),
-                                    cmd: vec![],
-                                    cwd: repo_root.display().to_string(),
-                                    tmp_file: None,
-                                });
-                            verify_ms = t0.elapsed().as_millis() as u64;
-                            prof_verify_nodes_ms =
-                                prof_verify_nodes_ms.saturating_add(verify_ms);
-                            prof_verify_nodes_calls += 1;
-                            let raw_v = serde_json::to_value(raw)
-                                .map_err(|e| format!("serialize verify: {e}"))?;
-                            let summary = verify_summary_from_raw_value(&raw_v);
-                            let t0 = std::time::Instant::now();
-                            let locs2 =
-                                plc::locate_sorries_in_text(&rolled_text, 500, 1).unwrap_or_default();
-                            prof_locate_sorries_ms =
-                                prof_locate_sorries_ms.saturating_add(t0.elapsed().as_millis() as u64);
-                            let t0 = std::time::Instant::now();
-                            let conservative2 =
-                                plc::count_sorry_tokens_conservative(&rolled_text).unwrap_or(0);
-                            prof_conservative_sorries_ms = prof_conservative_sorries_ms
-                                .saturating_add(t0.elapsed().as_millis() as u64);
-                            eval_cache.insert(
-                                h,
-                                CachedEval {
-                                    len: rolled_text.len(),
-                                    verify_raw: raw_v.clone(),
-                                    verify_summary: summary.clone(),
-                                    sorries: locs2.len(),
-                                    conservative_sorries: conservative2,
-                                },
-                            );
-                            (raw_v, summary, locs2.len(), conservative2)
+                                verify_cache = "none";
+                                let Some(dur) = budget_dur(timeout_s) else {
+                                    bailed_total_timeout = true;
+                                    record_event(
+                                        "bailout_total_timeout",
+                                        json!({ "where": "verify_node" }),
+                                    );
+                                    break;
+                                };
+                                let t0 = std::time::Instant::now();
+                                let raw = rt
+                                    .block_on(plc::verify_lean_text(&repo_root, &rolled_text, dur))
+                                    .unwrap_or(plc::VerifyResult {
+                                        ok: false,
+                                        timeout: false,
+                                        returncode: None,
+                                        stdout: String::new(),
+                                        stderr: "verify failed".to_string(),
+                                        cmd: vec![],
+                                        cwd: repo_root.display().to_string(),
+                                        tmp_file: None,
+                                    });
+                                verify_ms = t0.elapsed().as_millis() as u64;
+                                prof_verify_nodes_ms =
+                                    prof_verify_nodes_ms.saturating_add(verify_ms);
+                                prof_verify_nodes_calls += 1;
+                                let raw_v = serde_json::to_value(raw)
+                                    .map_err(|e| format!("serialize verify: {e}"))?;
+                                let summary = verify_summary_from_raw_value(&raw_v);
+                                let t0 = std::time::Instant::now();
+                                let locs2 = plc::locate_sorries_in_text(&rolled_text, 500, 1)
+                                    .unwrap_or_default();
+                                prof_locate_sorries_ms = prof_locate_sorries_ms
+                                    .saturating_add(t0.elapsed().as_millis() as u64);
+                                let t0 = std::time::Instant::now();
+                                let conservative2 =
+                                    plc::count_sorry_tokens_conservative(&rolled_text).unwrap_or(0);
+                                prof_conservative_sorries_ms = prof_conservative_sorries_ms
+                                    .saturating_add(t0.elapsed().as_millis() as u64);
+                                eval_cache.insert(
+                                    h,
+                                    CachedEval {
+                                        len: rolled_text.len(),
+                                        verify_raw: raw_v.clone(),
+                                        verify_summary: summary.clone(),
+                                        sorries: locs2.len(),
+                                        conservative_sorries: conservative2,
+                                    },
+                                );
+                                (raw_v, summary, locs2.len(), conservative2)
                             }
                         };
                         record_event(
@@ -4620,14 +4931,23 @@ Constraints:
                             let k = (th, parent.text.len(), sel.line);
                             goal_dump_cache
                                 .get(&k)
-                                .and_then(|(_, _, _, tgt)| if tgt.is_empty() { None } else { Some(hash_text(tgt)) })
+                                .and_then(|(_, _, _, tgt)| {
+                                    if tgt.is_empty() {
+                                        None
+                                    } else {
+                                        Some(hash_text(tgt))
+                                    }
+                                })
                                 .or(parent.focus_goal_sig)
                         };
                         new_frontier.push(Node {
                             id: next_id,
                             depth: parent.depth + 1,
                             text: rolled_text.clone(),
-                            focus_decl_name: parent.focus_decl_name.clone().or_else(|| sel.decl_name.clone()),
+                            focus_decl_name: parent
+                                .focus_decl_name
+                                .clone()
+                                .or_else(|| sel.decl_name.clone()),
                             focus_line: Some(rolled_line),
                             focus_goal_sig,
                             last_region: roll_last_region,
@@ -4655,33 +4975,44 @@ Constraints:
             } else if all.is_empty() {
                 // If we bailed early (e.g. total-timeout) before moving any nodes into `all`,
                 // fall back to the root node so we can still emit a useful partial result.
-                frontier
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| Node {
-                        id: 0,
-                        depth: 0,
-                        text: original_text.clone(),
-                        focus_decl_name: focus_decl_name.clone(),
-                        focus_line: focus_line_1,
-                        focus_goal_sig: None,
-                        last_region: None,
-                        last_replacement: None,
-                        parent_id: None,
-                        verify_raw: Some(baseline_raw_v.clone()),
-                        verify_summary: Some(baseline_summary.clone()),
-                        sorries: Some(plc::locate_sorries_in_text(&original_text, 500, 1).unwrap_or_default().len()),
-                        conservative_sorries: Some(plc::count_sorry_tokens_conservative(&original_text).unwrap_or(0)),
-                        smt_hint: None,
-                        rank_hint: None,
-                    })
+                frontier.first().cloned().unwrap_or_else(|| Node {
+                    id: 0,
+                    depth: 0,
+                    text: original_text.clone(),
+                    focus_decl_name: focus_decl_name.clone(),
+                    focus_line: focus_line_1,
+                    focus_goal_sig: None,
+                    last_region: None,
+                    last_replacement: None,
+                    parent_id: None,
+                    verify_raw: Some(baseline_raw_v.clone()),
+                    verify_summary: Some(baseline_summary.clone()),
+                    sorries: Some(
+                        plc::locate_sorries_in_text(&original_text, 500, 1)
+                            .unwrap_or_default()
+                            .len(),
+                    ),
+                    conservative_sorries: Some(
+                        plc::count_sorry_tokens_conservative(&original_text).unwrap_or(0),
+                    ),
+                    smt_hint: None,
+                    rank_hint: None,
+                })
             } else {
                 let mut xs = all.clone();
                 xs.sort_by(|a, b| {
                     let sa = a.verify_summary.as_ref().unwrap();
                     let sb = b.verify_summary.as_ref().unwrap();
-                    let ka = verify_score_key(sa, a.sorries.unwrap_or(999), a.conservative_sorries.unwrap_or(999));
-                    let kb = verify_score_key(sb, b.sorries.unwrap_or(999), b.conservative_sorries.unwrap_or(999));
+                    let ka = verify_score_key(
+                        sa,
+                        a.sorries.unwrap_or(999),
+                        a.conservative_sorries.unwrap_or(999),
+                    );
+                    let kb = verify_score_key(
+                        sb,
+                        b.sorries.unwrap_or(999),
+                        b.conservative_sorries.unwrap_or(999),
+                    );
                     ka.cmp(&kb).then_with(|| a.id.cmp(&b.id))
                 });
                 xs[0].clone()
@@ -4696,8 +5027,16 @@ Constraints:
                 xs.sort_by(|a, b| {
                     let sa = a.verify_summary.as_ref().unwrap();
                     let sb = b.verify_summary.as_ref().unwrap();
-                    let ka = progress_score_key(sa, a.sorries.unwrap_or(999), a.conservative_sorries.unwrap_or(999));
-                    let kb = progress_score_key(sb, b.sorries.unwrap_or(999), b.conservative_sorries.unwrap_or(999));
+                    let ka = progress_score_key(
+                        sa,
+                        a.sorries.unwrap_or(999),
+                        a.conservative_sorries.unwrap_or(999),
+                    );
+                    let kb = progress_score_key(
+                        sb,
+                        b.sorries.unwrap_or(999),
+                        b.conservative_sorries.unwrap_or(999),
+                    );
                     ka.cmp(&kb).then_with(|| a.id.cmp(&b.id))
                 });
                 xs[0].clone()
@@ -4793,19 +5132,34 @@ Constraints:
                     (psw as i64) - (b_sw as i64),
                 );
                 if let Some(dn) = focus_decl_name.as_deref() {
-                    eprintln!("[tree-search-nearest] focus decl={dn} line={}", focus_line_1.unwrap_or(0));
+                    eprintln!(
+                        "[tree-search-nearest] focus decl={dn} line={}",
+                        focus_line_1.unwrap_or(0)
+                    );
                 }
                 if bailed_total_timeout {
-                    eprintln!("[tree-search-nearest] bailout total_timeout=true remaining_ms={}", remaining_ms(run_deadline));
+                    eprintln!(
+                        "[tree-search-nearest] bailout total_timeout=true remaining_ms={}",
+                        remaining_ms(run_deadline)
+                    );
                 }
 
                 if log_level >= 2 {
                     let oracle_n = events_by_kind.get("oracle_call").copied().unwrap_or(0);
                     let verify_node_n = events_by_kind.get("verify_node").copied().unwrap_or(0);
-                    let bailout_n = events_by_kind.get("bailout_total_timeout").copied().unwrap_or(0);
+                    let bailout_n = events_by_kind
+                        .get("bailout_total_timeout")
+                        .copied()
+                        .unwrap_or(0);
                     let seed_call_n = events_by_kind.get("oracle_seed_call").copied().unwrap_or(0);
-                    let seed_result_n = events_by_kind.get("oracle_seed_result").copied().unwrap_or(0);
-                    let seed_skipped_n = events_by_kind.get("oracle_seed_skipped").copied().unwrap_or(0);
+                    let seed_result_n = events_by_kind
+                        .get("oracle_seed_result")
+                        .copied()
+                        .unwrap_or(0);
+                    let seed_skipped_n = events_by_kind
+                        .get("oracle_seed_skipped")
+                        .copied()
+                        .unwrap_or(0);
                     let interesting = bailed_total_timeout
                         || bailout_n > 0
                         || oracle_n > 0
@@ -4818,9 +5172,12 @@ Constraints:
                     if interesting {
                         // Prefer a compact view: omit low-signal boilerplate events unless we're in a total-timeout
                         // situation where they explain why no work happened.
-                        let include_seed_skipped = bailed_total_timeout || seed_call_n > 0 || seed_result_n > 0;
+                        let include_seed_skipped =
+                            bailed_total_timeout || seed_call_n > 0 || seed_result_n > 0;
                         let is_noise_kind = |k: &str| -> bool {
-                            k == "start" || k == "budgets" || (!include_seed_skipped && k == "oracle_seed_skipped")
+                            k == "start"
+                                || k == "budgets"
+                                || (!include_seed_skipped && k == "oracle_seed_skipped")
                         };
                         let filtered: Vec<&serde_json::Value> = events_tail
                             .iter()
@@ -4829,7 +5186,11 @@ Constraints:
                                 !is_noise_kind(k)
                             })
                             .collect();
-                        let list = if filtered.is_empty() { events_tail.iter().collect() } else { filtered };
+                        let list = if filtered.is_empty() {
+                            events_tail.iter().collect()
+                        } else {
+                            filtered
+                        };
 
                         eprintln!(
                             "[tree-search-nearest] events bailout={} oracle_call={} verify_node={} seed_call={} seed_skipped={}",
@@ -4844,52 +5205,61 @@ Constraints:
                         let shown = list.len().min(max_events);
                         eprintln!("[tree-search-nearest] timeline (last {shown} events)");
                         for ev in list.iter().rev().take(shown).rev() {
-                        let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-                        let t_ms = ev.get("t_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let detail = match kind {
-                            "baseline_verify" => ev
-                                .get("skipped")
-                                .and_then(|v| v.as_bool())
-                                .filter(|b| *b)
-                                .map(|_| "skipped=true".to_string())
-                                .or_else(|| {
-                                    ev.get("ms")
-                                        .and_then(|v| v.as_u64())
-                                        .map(|ms| format!("ms={ms}"))
-                                })
-                                .unwrap_or_default(),
-                            "focus" => {
-                                let line = ev.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-                                format!("line={line}")
-                            }
-                            "oracle_result" => {
-                                let ok = ev.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                                let n = ev.get("suggestions_n").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let ms = ev.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                                format!("ok={ok} n={n} ms={ms}")
-                            }
-                            "verify_node" => {
-                                let ok = ev.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                                let s = ev.get("sorries").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let cache = ev.get("cache").and_then(|v| v.as_str()).unwrap_or("?");
-                                let ms_opt = ev.get("ms").and_then(|v| v.as_u64());
-                                if let Some(ms) = ms_opt {
-                                    format!("ok={ok} sorries={s} ms={ms} cache={cache}")
-                                } else {
-                                    format!("ok={ok} sorries={s} cache={cache}")
+                            let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                            let t_ms = ev.get("t_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let detail = match kind {
+                                "baseline_verify" => ev
+                                    .get("skipped")
+                                    .and_then(|v| v.as_bool())
+                                    .filter(|b| *b)
+                                    .map(|_| "skipped=true".to_string())
+                                    .or_else(|| {
+                                        ev.get("ms")
+                                            .and_then(|v| v.as_u64())
+                                            .map(|ms| format!("ms={ms}"))
+                                    })
+                                    .unwrap_or_default(),
+                                "focus" => {
+                                    let line = ev.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    format!("line={line}")
                                 }
+                                "oracle_result" => {
+                                    let ok =
+                                        ev.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    let n = ev
+                                        .get("suggestions_n")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let ms = ev.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    format!("ok={ok} n={n} ms={ms}")
+                                }
+                                "verify_node" => {
+                                    let ok =
+                                        ev.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    let s = ev.get("sorries").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let cache =
+                                        ev.get("cache").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let ms_opt = ev.get("ms").and_then(|v| v.as_u64());
+                                    if let Some(ms) = ms_opt {
+                                        format!("ok={ok} sorries={s} ms={ms} cache={cache}")
+                                    } else {
+                                        format!("ok={ok} sorries={s} cache={cache}")
+                                    }
+                                }
+                                "end" => {
+                                    let rem = ev
+                                        .get("remaining_ms")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    format!("remaining_ms={rem}")
+                                }
+                                _ => String::new(),
+                            };
+                            if detail.is_empty() {
+                                eprintln!("  t={t_ms:>6} kind={kind}");
+                            } else {
+                                eprintln!("  t={t_ms:>6} kind={kind} {detail}");
                             }
-                            "end" => {
-                                let rem = ev.get("remaining_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                                format!("remaining_ms={rem}")
-                            }
-                            _ => String::new(),
-                        };
-                        if detail.is_empty() {
-                            eprintln!("  t={t_ms:>6} kind={kind}");
-                        } else {
-                            eprintln!("  t={t_ms:>6} kind={kind} {detail}");
-                        }
                         }
                     }
                 }
@@ -4922,11 +5292,22 @@ Constraints:
                     xs.sort_by(|a, b| {
                         let sa = a.verify_summary.as_ref().unwrap();
                         let sb = b.verify_summary.as_ref().unwrap();
-                        let ka = verify_score_key(sa, a.sorries.unwrap_or(999), a.conservative_sorries.unwrap_or(999));
-                        let kb = verify_score_key(sb, b.sorries.unwrap_or(999), b.conservative_sorries.unwrap_or(999));
+                        let ka = verify_score_key(
+                            sa,
+                            a.sorries.unwrap_or(999),
+                            a.conservative_sorries.unwrap_or(999),
+                        );
+                        let kb = verify_score_key(
+                            sb,
+                            b.sorries.unwrap_or(999),
+                            b.conservative_sorries.unwrap_or(999),
+                        );
                         ka.cmp(&kb).then_with(|| a.id.cmp(&b.id))
                     });
-                    eprintln!("[tree-search-nearest] trace nodes={} (showing top 6)", all.len());
+                    eprintln!(
+                        "[tree-search-nearest] trace nodes={} (showing top 6)",
+                        all.len()
+                    );
                     for n in xs.into_iter().take(6) {
                         let s = n.verify_summary.as_ref().unwrap();
                         let first = s.get("first_error").and_then(|v| v.as_str()).unwrap_or("");
@@ -4983,13 +5364,16 @@ Constraints:
             let mut diff_written: Option<String> = None;
             let mut diff_unified: serde_json::Value = serde_json::Value::Null;
             if include_diff || output_diff.is_some() {
-                let (d, truncated) = unified_diff_bounded(&original_text, &picked.text, diff_context, 120_000);
+                let (d, truncated) =
+                    unified_diff_bounded(&original_text, &picked.text, diff_context, 120_000);
                 if let Some(p) = output_diff.as_ref() {
                     if let Some(parent) = p.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| format!("failed to create dir {}: {}", parent.display(), e))?;
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            format!("failed to create dir {}: {}", parent.display(), e)
+                        })?;
                     }
-                    std::fs::write(p, d.as_bytes()).map_err(|e| format!("write diff {}: {e}", p.display()))?;
+                    std::fs::write(p, d.as_bytes())
+                        .map_err(|e| format!("write diff {}: {e}", p.display()))?;
                     diff_written = Some(p.display().to_string());
                 }
                 if include_diff {
@@ -5038,15 +5422,26 @@ Constraints:
                 md.push_str(&format!("- file: `{}`\n", file));
                 md.push_str(&format!("- candidates: `{}`\n", candidates_mode));
                 md.push_str(&format!("- picked: `{}` (depth {})\n", pick, picked.depth));
-                md.push_str(&format!("- picked ok/errors/sw/sorries: `{}/{}/{}/{}`\n",
+                md.push_str(&format!(
+                    "- picked ok/errors/sw/sorries: `{}/{}/{}/{}`\n",
                     ps.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
-                    ps.get("counts").and_then(|c| c.get("errors")).and_then(|v| v.as_u64()).unwrap_or(0),
-                    ps.get("counts").and_then(|c| c.get("sorry_warnings")).and_then(|v| v.as_u64()).unwrap_or(0),
+                    ps.get("counts")
+                        .and_then(|c| c.get("errors"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    ps.get("counts")
+                        .and_then(|c| c.get("sorry_warnings"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
                     picked.sorries.unwrap_or(999),
                 ));
                 md.push_str(&format!("- baseline sorries: `{}`\n", baseline_sorries));
                 if let Some(dn) = focus_decl_name.as_deref() {
-                    md.push_str(&format!("- focus decl: `{}` (line {})\n", dn, focus_line_1.unwrap_or(0)));
+                    md.push_str(&format!(
+                        "- focus decl: `{}` (line {})\n",
+                        dn,
+                        focus_line_1.unwrap_or(0)
+                    ));
                 }
                 md.push_str("\n### Primary failure mode\n\n");
                 md.push_str(&format!("- mode: `{}`\n", mode));
@@ -5062,17 +5457,43 @@ Constraints:
                             let id = n.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
                             let depth = n.get("depth").and_then(|v| v.as_u64()).unwrap_or(0);
                             let sorries = n.get("sorries").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let okv = n.get("verify").and_then(|v| v.get("summary")).and_then(|v| v.get("ok")).and_then(|v| v.as_bool()).unwrap_or(false);
-                            let errs = n.get("verify").and_then(|v| v.get("summary")).and_then(|v| v.get("counts")).and_then(|v| v.get("errors")).and_then(|v| v.as_u64()).unwrap_or(0);
-                            let sw = n.get("verify").and_then(|v| v.get("summary")).and_then(|v| v.get("counts")).and_then(|v| v.get("sorry_warnings")).and_then(|v| v.as_u64()).unwrap_or(0);
-                            let repl = n.get("last_replacement").and_then(|v| v.as_str()).unwrap_or("").replace('\n', " ");
-                            md.push_str(&format!("- id={} depth={} ok={} e={} sw={} sorries={} repl=`{}`\n", id, depth, okv, errs, sw, sorries, repl));
+                            let okv = n
+                                .get("verify")
+                                .and_then(|v| v.get("summary"))
+                                .and_then(|v| v.get("ok"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let errs = n
+                                .get("verify")
+                                .and_then(|v| v.get("summary"))
+                                .and_then(|v| v.get("counts"))
+                                .and_then(|v| v.get("errors"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let sw = n
+                                .get("verify")
+                                .and_then(|v| v.get("summary"))
+                                .and_then(|v| v.get("counts"))
+                                .and_then(|v| v.get("sorry_warnings"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let repl = n
+                                .get("last_replacement")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .replace('\n', " ");
+                            md.push_str(&format!(
+                                "- id={} depth={} ok={} e={} sw={} sorries={} repl=`{}`\n",
+                                id, depth, okv, errs, sw, sorries, repl
+                            ));
                         }
                     }
                 }
                 md.push_str("\n### Next actions\n\n");
                 md.push_str("- Re-run with `--summary-level 3 --include-trace` for a compact top-nodes view.\n");
-                md.push_str("- Re-run with `--report-md <path>` to persist this report alongside JSON.\n");
+                md.push_str(
+                    "- Re-run with `--report-md <path>` to persist this report alongside JSON.\n",
+                );
                 md.push_str("- If using `lean-try`, consider increasing `--lean-oracle-max-calls` and `--max-nodes`.\n");
                 md.push_str("- If the search is bouncing between holes, increase `--goal-first-k` (default 3 for lean-try).\n");
                 md.push_str("- If you want to prioritize actually closing goals, try `--fill-mode strict` or `--fill-mode hybrid`.\n");
@@ -5081,7 +5502,8 @@ Constraints:
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("failed to create dir {}: {}", parent.display(), e))?;
                 }
-                std::fs::write(p, md.as_bytes()).map_err(|e| format!("write report {}: {e}", p.display()))?;
+                std::fs::write(p, md.as_bytes())
+                    .map_err(|e| format!("write report {}: {e}", p.display()))?;
             }
 
             let events_jsonl_written: Option<String> = if let Some(p) = events_jsonl.as_ref() {
@@ -5327,7 +5749,8 @@ Constraints:
                 #[cfg(not(feature = "planner"))]
                 let (planner_ms_u64, planner_hits_u64, planner_misses_u64) = (0u64, 0u64, 0u64);
                 #[cfg(feature = "smt")]
-                let (smt_ms_u64, smt_hits_u64, smt_misses_u64) = (prof_smt_ms, smt_cache_hits, smt_cache_misses);
+                let (smt_ms_u64, smt_hits_u64, smt_misses_u64) =
+                    (prof_smt_ms, smt_cache_hits, smt_cache_misses);
                 #[cfg(not(feature = "smt"))]
                 let (smt_ms_u64, smt_hits_u64, smt_misses_u64) = (0u64, 0u64, 0u64);
                 let accounted = prof_verify_baseline_ms
@@ -5477,7 +5900,10 @@ Constraints:
 
             if let Some(p) = output_json {
                 write_json(&p, &out)?;
-                println!("{}", json!({"ok": true, "written": p.display().to_string()}).to_string());
+                println!(
+                    "{}",
+                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                );
             } else {
                 println!("{}", out.to_string());
             }
@@ -5863,8 +6289,8 @@ Constraints:
                     let stderr = raw_v.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
                     let errors =
                         stdout.matches(": error:").count() + stderr.matches(": error:").count();
-                    let warnings = stdout.matches(": warning:").count()
-                        + stderr.matches(": warning:").count();
+                    let warnings =
+                        stdout.matches(": warning:").count() + stderr.matches(": warning:").count();
                     let error_samples: Vec<String> = stdout
                         .lines()
                         .chain(stderr.lines())
@@ -5981,13 +6407,7 @@ Constraints:
             let out = match res {
                 Ok(r) => {
                     // Best-effort: extract the first JSON value from the model output.
-                    //
-                    // Use `axi`’s extractor to handle common failure modes:
-                    // - ```json fenced blocks
-                    // - leading/trailing commentary
-                    // - “JSON-ish” output where the object/array is embedded in text
-                    let review_struct =
-                        axi::json_extract::extract_first_json_value(&r.content).ok();
+                    let review_struct = extract_json_from_text(&r.content);
                     let mut review_struct = review_struct;
                     let mut postprocess_notes: Vec<String> = Vec::new();
 
@@ -5999,7 +6419,8 @@ Constraints:
                                 std::collections::BTreeSet::new();
                             for row in files {
                                 let ok = row.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
-                                let errors = row.get("errors").and_then(|x| x.as_u64()).unwrap_or(0);
+                                let errors =
+                                    row.get("errors").and_then(|x| x.as_u64()).unwrap_or(0);
                                 if ok && errors == 0 {
                                     if let Some(f) = row.get("file").and_then(|x| x.as_str()) {
                                         ok_files.insert(f.to_string());
@@ -6010,11 +6431,19 @@ Constraints:
                             if !ok_files.is_empty() {
                                 if let Some(rs) = review_struct.as_mut() {
                                     // top_issues: drop “truncation/parse/compile” claims for ok files.
-                                    if let Some(arr) = rs.get_mut("top_issues").and_then(|x| x.as_array_mut()) {
+                                    if let Some(arr) =
+                                        rs.get_mut("top_issues").and_then(|x| x.as_array_mut())
+                                    {
                                         let before = arr.len();
                                         arr.retain(|issue| {
-                                            let title = issue.get("title").and_then(|x| x.as_str()).unwrap_or("");
-                                            let detail = issue.get("detail").and_then(|x| x.as_str()).unwrap_or("");
+                                            let title = issue
+                                                .get("title")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or("");
+                                            let detail = issue
+                                                .get("detail")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or("");
                                             let t = format!("{title}\n{detail}").to_lowercase();
                                             let mentions_build_break = t.contains("truncat")
                                                 || t.contains("parse")
@@ -6106,24 +6535,25 @@ Constraints:
             let user_file = arg_value(rest, "--user-file").map(PathBuf::from);
             let require_key = arg_flag(rest, "--require-key");
             let timeout_s = arg_u64(rest, "--timeout-s").unwrap_or(90);
-            let max_tool_iters = arg_u64(rest, "--max-tool-iters").unwrap_or(4) as usize;
+            let _max_tool_iters = arg_u64(rest, "--max-tool-iters").unwrap_or(4) as usize;
             let tools = arg_value(rest, "--tools").unwrap_or_default();
             let output_json = arg_value(rest, "--output-json").map(PathBuf::from);
 
             let system_txt = if let Some(p) = system_file {
-                fs::read_to_string(&p)
-                    .map_err(|e| format!("read {}: {}", p.display(), e))?
+                fs::read_to_string(&p).map_err(|e| format!("read {}: {}", p.display(), e))?
             } else {
                 system.unwrap_or_default()
             };
             let user_txt = if let Some(p) = user_file {
-                fs::read_to_string(&p)
-                    .map_err(|e| format!("read {}: {}", p.display(), e))?
+                fs::read_to_string(&p).map_err(|e| format!("read {}: {}", p.display(), e))?
             } else {
                 user.unwrap_or_default()
             };
             if system_txt.trim().is_empty() && user_txt.trim().is_empty() {
-                return Err("llm-chat requires --system/--system-file and/or --user/--user-file".to_string());
+                return Err(
+                    "llm-chat requires --system/--system-file and/or --user/--user-file"
+                        .to_string(),
+                );
             }
             let system_txt = if system_txt.trim().is_empty() {
                 // Default: treat user input as structured JSON from proofpatch and respond tersely.
@@ -6158,330 +6588,14 @@ Constraints:
                 .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
 
             let tools = tools.trim();
-            let tools_mode = match tools {
-                "" => "none",
-                "agent" | "proofpatch" | "axi-proofpatch" => "agent",
-                _ => {
-                    return Err("llm-chat --tools must be: agent (or omit --tools for one-shot)".to_string());
-                }
-            };
-
-            let out = if tools_mode == "agent" {
-                let Some(rr) = repo_root.clone() else {
-                    return Err("llm-chat --tools agent requires --repo <path>".to_string());
-                };
-
-                // Select provider/model using the same routing logic as the rest of proofpatch.
-                let sel = rt
-                    .block_on(plc::llm::select_provider_info(StdDuration::from_secs(3)))
-                    .map_err(|e| format!("select provider: {e}"))?;
-
-                // Build an axi model adapter.
-                //
-                // NOTE: We prefer the provider-specific OpenRouter adapter here because it adds the
-                // headers OpenRouter expects and matches axi's tested request shape.
-                let model: Box<dyn axi::agent::Model> = if sel.provider == "openrouter" {
-                    let key = sel
-                        .api_key
-                        .clone()
-                        .ok_or_else(|| "missing OPENROUTER_API_KEY".to_string())?;
-                    Box::new(axi_providers::adapters::openrouter::OpenRouterAdapter::new(
-                        key,
-                        sel.model.clone(),
-                    ))
-                } else if sel.provider == "groq" {
-                    let key = sel
-                        .api_key
-                        .clone()
-                        .ok_or_else(|| "missing GROQ_API_KEY".to_string())?;
-                    Box::new(axi_providers::adapters::groq::GroqAdapter::new(
-                        key,
-                        sel.model.clone(),
-                    ))
-                } else if sel.provider == "ollama" {
-                    Box::new(axi_providers::adapters::ollama::OllamaAdapter::new(
-                        // Ollama's OpenAI-compatible endpoint uses /v1.
-                        format!("{}/v1", sel.base_url.trim_end_matches('/')),
-                        sel.model.clone(),
-                    ))
-                } else {
-                    let mut a = axi_providers::adapters::openai::GenericOpenAiAdapter::new(
-                        sel.base_url.clone(),
-                        sel.model.clone(),
-                    );
-                    if let Some(k) = sel.api_key.clone() {
-                        a = a.with_api_key(k);
-                    }
-                    Box::new(a)
-                };
-
-                // Each tool closure needs its own owned copy of the repo root.
-                // (DynamicTool stores the closure for the process lifetime.)
-                let rr_ctx = rr.clone();
-                let rr_verify = rr.clone();
-                let rr_sorries = rr.clone();
-
-                // Tool: proofpatch_context_pack
-                let args_schema = schema_for!(ContextPackArgs);
-                let tool = axi::tool::DynamicTool::new(
-                    "proofpatch_context_pack",
-                    "Return a bounded context pack (imports + excerpt + nearby decls) for a Lean file within the repo.",
-                    args_schema,
-                    move |raw_args: serde_json::Value| {
-                        let args: ContextPackArgs = serde_json::from_value(raw_args)
-                            .map_err(|e| axi::Error::ToolArgsInvalid(format!("proofpatch_context_pack: {e}")))?;
-                        let line_1 = args.line.map(|x| x as usize);
-                        let context_lines = args.context_lines as usize;
-                        let nearby_lines = args.nearby_lines as usize;
-                        let max_nearby = args.max_nearby as usize;
-                        let max_imports = args.max_imports as usize;
-                        let decl = args.decl.as_deref();
-                        let pack = plc::build_context_pack(
-                            &rr_ctx,
-                            &args.file,
-                            decl,
-                            line_1,
-                            context_lines,
-                            nearby_lines,
-                            max_nearby,
-                            max_imports,
-                        )
-                        .map_err(|e| axi::Error::ToolExecutionFailed(e))?;
-                        serde_json::to_value(pack)
-                            .map_err(|e| axi::Error::ToolExecutionFailed(format!("json: {e}")))
-                    },
+            if !tools.is_empty() {
+                return Err(
+                    "llm-chat --tools is not supported in the standalone proofpatch build (tool-calling backend not included)"
+                        .to_string(),
                 );
-
-                // Tool: proofpatch_verify_summary
-                let verify_args_schema = schema_for!(VerifySummaryArgs);
-                let verify_tool = axi::tool::DynamicTool::new(
-                    "proofpatch_verify_summary",
-                    "Verify a Lean file and return a bounded summary (no raw stdout/stderr).",
-                    verify_args_schema,
-                    move |raw_args: serde_json::Value| {
-                        let args: VerifySummaryArgs = serde_json::from_value(raw_args).map_err(|e| {
-                            axi::Error::ToolArgsInvalid(format!("proofpatch_verify_summary: {e}"))
-                        })?;
-                        let rt = tokio::runtime::Runtime::new().map_err(|e| {
-                            axi::Error::ToolExecutionFailed(format!("tokio runtime: {e}"))
-                        })?;
-                        let raw = rt
-                            .block_on(plc::verify_lean_file(
-                                &rr_verify,
-                                &args.file,
-                                StdDuration::from_secs(args.timeout_s),
-                            ))
-                            .map_err(axi::Error::ToolExecutionFailed)?;
-
-                        let stdout = raw.stdout.as_str();
-                        let stderr = raw.stderr.as_str();
-                        let first_error_loc = plc::parse_first_error_loc(stdout, stderr)
-                            .and_then(|loc| serde_json::to_value(loc).ok());
-
-                        let errors =
-                            stdout.matches(": error:").count() + stderr.matches(": error:").count();
-                        let warnings = stdout.matches(": warning:").count()
-                            + stderr.matches(": warning:").count();
-
-                        Ok(json!({
-                            "ok": raw.ok,
-                            "timeout": raw.timeout,
-                            "returncode": raw.returncode,
-                            "counts": { "errors": errors, "warnings": warnings },
-                            "first_error": stdout.lines().find(|l| l.contains(": error:"))
-                                .or_else(|| stderr.lines().find(|l| l.contains(": error:"))),
-                            "first_error_loc": first_error_loc,
-                            "cmd": raw.cmd,
-                            "cwd": raw.cwd,
-                        }))
-                    },
-                );
-
-                // Tool: proofpatch_locate_sorries
-                let sorries_args_schema = schema_for!(LocateSorriesArgs);
-                let sorries_tool = axi::tool::DynamicTool::new(
-                    "proofpatch_locate_sorries",
-                    "Locate `sorry`/`admit` occurrences in a file (bounded).",
-                    sorries_args_schema,
-                    move |raw_args: serde_json::Value| {
-                        let args: LocateSorriesArgs = serde_json::from_value(raw_args).map_err(|e| {
-                            axi::Error::ToolArgsInvalid(format!("proofpatch_locate_sorries: {e}"))
-                        })?;
-                        let locs = plc::locate_sorries_in_file(
-                            &rr_sorries,
-                            &args.file,
-                            args.max_sorries as usize,
-                            args.context_lines as usize,
-                        )
-                        .map_err(axi::Error::ToolExecutionFailed)?;
-                        serde_json::to_value(locs)
-                            .map_err(|e| axi::Error::ToolExecutionFailed(format!("json: {e}")))
-                    },
-                );
-
-                // Tool: proofpatch_patch_first_sorry_in_decl
-                let rr_patch = rr.clone();
-                let patch_args_schema = schema_for!(PatchDeclArgs);
-                let patch_tool = axi::tool::DynamicTool::new(
-                    "proofpatch_patch_first_sorry_in_decl",
-                    "Patch the first `sorry`/`admit` inside a declaration, optionally write to disk, optionally verify.",
-                    patch_args_schema,
-                    move |raw_args: serde_json::Value| {
-                        let args: PatchDeclArgs = serde_json::from_value(raw_args).map_err(|e| {
-                            axi::Error::ToolArgsInvalid(format!("proofpatch_patch_first_sorry_in_decl: {e}"))
-                        })?;
-
-                        let abs = rr_patch.join(&args.file);
-                        if !abs.exists() {
-                            return Err(axi::Error::ToolExecutionFailed(format!(
-                                "File not found: {}",
-                                abs.display()
-                            )));
-                        }
-                        let original_text = std::fs::read_to_string(&abs).map_err(|e| {
-                            axi::Error::ToolExecutionFailed(format!("read {}: {e}", abs.display()))
-                        })?;
-
-                        let patched = plc::patch_first_sorry_in_decl(
-                            &original_text,
-                            &args.decl,
-                            &args.replacement,
-                        )
-                        .map_err(axi::Error::ToolExecutionFailed)?;
-
-                        let lemma_still_contains_sorry =
-                            plc::decl_block_contains_sorry(&patched.text, &args.decl)
-                                .unwrap_or(true);
-
-                        let mut wrote_path: Option<String> = None;
-                        if args.write {
-                            std::fs::write(&abs, patched.text.as_bytes()).map_err(|e| {
-                                axi::Error::ToolExecutionFailed(format!("write {}: {e}", abs.display()))
-                            })?;
-                            wrote_path = Some(abs.display().to_string());
-                        }
-
-                        let verify_summary = if args.verify {
-                            let rt = tokio::runtime::Runtime::new().map_err(|e| {
-                                axi::Error::ToolExecutionFailed(format!("tokio runtime: {e}"))
-                            })?;
-                            let raw = if args.write {
-                                rt.block_on(plc::verify_lean_file(
-                                    &rr_patch,
-                                    &args.file,
-                                    StdDuration::from_secs(args.timeout_s),
-                                ))
-                                .map_err(axi::Error::ToolExecutionFailed)?
-                            } else {
-                                rt.block_on(plc::verify_lean_text(
-                                    &rr_patch,
-                                    &patched.text,
-                                    StdDuration::from_secs(args.timeout_s),
-                                ))
-                                .map_err(axi::Error::ToolExecutionFailed)?
-                            };
-
-                            let stdout = raw.stdout.as_str();
-                            let stderr = raw.stderr.as_str();
-                            let first_error_loc = plc::parse_first_error_loc(stdout, stderr)
-                                .and_then(|loc| serde_json::to_value(loc).ok());
-                            let errors =
-                                stdout.matches(": error:").count() + stderr.matches(": error:").count();
-                            let warnings = stdout.matches(": warning:").count()
-                                + stderr.matches(": warning:").count();
-                            let first_error = stdout
-                                .lines()
-                                .find(|l| l.contains(": error:"))
-                                .or_else(|| stderr.lines().find(|l| l.contains(": error:")))
-                                .map(|s| truncate_str(s, 400));
-
-                            Some(json!({
-                                "ok": raw.ok,
-                                "timeout": raw.timeout,
-                                "returncode": raw.returncode,
-                                "counts": { "errors": errors, "warnings": warnings },
-                                "first_error": first_error,
-                                "first_error_loc": first_error_loc,
-                                "cmd": raw.cmd,
-                                "cwd": raw.cwd,
-                            }))
-                        } else {
-                            None
-                        };
-
-                        Ok(json!({
-                            "file": args.file,
-                            "decl": args.decl,
-                            "write": args.write,
-                            "written_file": wrote_path,
-                            "patch": {
-                                "changed": patched.changed,
-                                "line": patched.line,
-                                "before": truncate_str(&patched.before, 800),
-                                "after": truncate_str(&patched.after, 800),
-                                "indent": patched.indent,
-                            },
-                            "decl_still_contains_sorry": lemma_still_contains_sorry,
-                            "verify_summary": verify_summary,
-                        }))
-                    },
-                );
-
-                let reasoning = effective_agent_reasoning_request(&sel.provider);
-                let reasoning_out = reasoning.clone();
-
-                // Agent config: bounded steps + best-effort wall clock budget (avoid runaway loops).
-                let cfg = axi::AgentConfig {
-                    max_steps: usize::max(3, max_tool_iters.saturating_mul(2) + 1),
-                    max_wall_time_ms: Some(timeout_s.saturating_mul(1000)),
-                    validate_schemas: true,
-                    output_spec: Some(axi::constraints::OutputSpec::json_object()),
-                    reasoning,
-                    ..axi::AgentConfig::default()
-                };
-
-                let agent = axi::Agent::new((), system_txt.clone())
-                    .with_config(cfg)
-                    .add_invariant(axi::agent::ToolProtocolInvariant)
-                    .add_tool(tool)
-                    .add_tool(verify_tool)
-                    .add_tool(sorries_tool)
-                    .add_tool(patch_tool);
-
-                let outcome = agent
-                    .run::<serde_json::Value>(model.as_ref(), user_txt.clone(), None)
-                    .map_err(|e| e.to_string());
-
-                match outcome {
-                    Ok(axi::RunOutcome::Completed(done)) => json!({
-                        "ok": true,
-                        "provider": sel.provider,
-                        "model": sel.model,
-                        "model_source": sel.model_source,
-                        "model_env": sel.model_env,
-                        "reasoning": reasoning_out,
-                        "content": serde_json::to_string(&done.output).unwrap_or_else(|_| String::new()),
-                        "content_struct": done.output,
-                        "axi_trace": done.trace.as_json(),
-                        "note": serde_json::Value::Null,
-                    }),
-                    Ok(axi::RunOutcome::Deferred(deferred)) => json!({
-                        "ok": false,
-                        "skipped": true,
-                        "reason": "agent deferred (pending tool calls)",
-                        "reasoning": reasoning_out,
-                        "pending": deferred.pending.iter().map(|p| json!({"id": p.id, "name": p.name, "reason": p.reason, "arguments": p.arguments})).collect::<Vec<_>>(),
-                        "axi_trace": deferred.state.trace.as_json(),
-                    }),
-                    Err(e) => {
-                        if require_key {
-                            return Err(format!("llm-chat failed: {e}"));
-                        }
-                        json!({"skipped": true, "reason": e})
-                    }
-                }
-            } else {
-                // Simple one-shot (existing non-agentic path).
+            }
+            let out = {
+                // Simple one-shot chat completion (no tools).
                 let res0 = rt.block_on(plc::llm::chat_completion(
                     &system_txt,
                     &user_txt,
@@ -6509,7 +6623,10 @@ Constraints:
 
             if let Some(p) = output_json {
                 write_json(&p, &out)?;
-                println!("{}", json!({"ok": true, "written": p.display().to_string()}).to_string());
+                println!(
+                    "{}",
+                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                );
             } else {
                 println!("{}", out.to_string());
             }
@@ -6905,14 +7022,8 @@ Constraints:
                     html.push_str(&format!("<b>count</b>: {}<br/>", sorries.len()));
                     for loc in sorries.iter().take(8) {
                         let token = loc.get("token").and_then(|v| v.as_str()).unwrap_or("sorry");
-                        let decl_kind = loc
-                            .get("decl_kind")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let decl_name = loc
-                            .get("decl_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let decl_kind = loc.get("decl_kind").and_then(|v| v.as_str()).unwrap_or("");
+                        let decl_name = loc.get("decl_name").and_then(|v| v.as_str()).unwrap_or("");
                         let decl_label = if !decl_kind.is_empty() && !decl_name.is_empty() {
                             format!("{} {}", decl_kind, decl_name)
                         } else {

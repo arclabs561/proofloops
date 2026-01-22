@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  e2e-lean:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install elan (Lean toolchain manager)
+        run: |
+          curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: build proofpatch binaries
+        run: |
+          cargo build -p proofpatch-core --bin proofpatch
+          cargo build -p proofpatch-mcp --bin proofpatch-mcp --features stdio
+
+      - name: proofpatch e2e (verify/triage)
+        run: |
+          proofpatch triage-file \
+            --repo fixtures/lean-fixture \
+            --file LeanFixture/Main.lean \
+            --timeout-s 120 \
+            --max-sorries 5 \
+            --context-lines 1
+        env:
+          LAKE: lake
+
+      - name: mcp stdio smoke (fixture repo)
+        run: cargo run -p proofpatch-mcp --features stdio --example stdio_smoke
+        env:
+          PROOFPATCH_SMOKE_REPO_ROOT: fixtures/lean-fixture
+          PROOFPATCH_SMOKE_FILE: LeanFixture/Main.lean
+

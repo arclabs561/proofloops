@@ -79,6 +79,10 @@ pub fn default_det_candidates() -> Vec<String> {
     ]
 }
 
+fn extract_first_json_value(s: &str) -> Option<Value> {
+    crate::json_extract::extract_first_json_value(s)
+}
+
 pub fn parse_json_string_array(s: &str) -> Option<Vec<String>> {
     fn parse_value(v: &Value) -> Option<Vec<String>> {
         let xs = v.as_array()?;
@@ -91,7 +95,11 @@ pub fn parse_json_string_array(s: &str) -> Option<Vec<String>> {
                 }
             }
         }
-        if out.is_empty() { None } else { Some(out) }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     // Fast path: entire string is a JSON array.
@@ -101,10 +109,9 @@ pub fn parse_json_string_array(s: &str) -> Option<Vec<String>> {
         }
     }
 
-    // Common LLM behavior: wrap JSON in markdown fences or extra text. Reuse `axi`’s
-    // bounded extractor to recover the first JSON value, then check whether it is a
-    // string array.
-    if let Ok(v) = axi::json_extract::extract_first_json_value(s) {
+    // Common LLM behavior: wrap JSON in markdown fences or extra text. Recover the first
+    // JSON value, then check whether it is a string array.
+    if let Some(v) = extract_first_json_value(s) {
         if let Some(xs) = parse_value(&v) {
             return Some(xs);
         }
@@ -263,7 +270,11 @@ pub fn extract_initial_goal_block(text: &str) -> Option<String> {
                 if t.trim().is_empty() {
                     break;
                 }
-                if t.contains(": error:") || t.contains(": error(") || t.contains(": warning:") || t.contains(": warning(") {
+                if t.contains(": error:")
+                    || t.contains(": error(")
+                    || t.contains(": warning:")
+                    || t.contains(": warning(")
+                {
                     break;
                 }
                 out.push_str(t);
@@ -279,7 +290,11 @@ pub fn extract_initial_goal_block(text: &str) -> Option<String> {
     None
 }
 
-pub fn verify_score_key(summary: &Value, sorries: usize, conservative: usize) -> (i32, i64, i64, i64) {
+pub fn verify_score_key(
+    summary: &Value,
+    sorries: usize,
+    conservative: usize,
+) -> (i32, i64, i64, i64) {
     let ok = summary.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     let errors = summary
         .get("counts")
@@ -308,10 +323,19 @@ pub fn verify_score_key(summary: &Value, sorries: usize, conservative: usize) ->
     // - fewer errors, then fewer synthetic-sorry warnings, then fewer `locate` sorries,
     //   then fewer conservative sorries, then fewer warnings
     let ok_key = if ok { 0 } else { 1 };
-    (ok_key, errors + np_penalty + (sorry_warnings * 10), sorries as i64, conservative as i64 + warnings)
+    (
+        ok_key,
+        errors + np_penalty + (sorry_warnings * 10),
+        sorries as i64,
+        conservative as i64 + warnings,
+    )
 }
 
-pub fn progress_score_key(summary: &Value, sorries: usize, conservative: usize) -> (i64, i32, i64, i64) {
+pub fn progress_score_key(
+    summary: &Value,
+    sorries: usize,
+    conservative: usize,
+) -> (i64, i32, i64, i64) {
     // Prefer fewer remaining sorries; use errors as a tiebreak.
     let ok = summary.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     let ok_key = if ok { 0 } else { 1 };
@@ -326,6 +350,10 @@ pub fn progress_score_key(summary: &Value, sorries: usize, conservative: usize) 
         .and_then(|v| v.as_u64())
         .unwrap_or(999) as i64;
     // Key: fewer synthetic-sorry warnings first, then fewer explicit sorries, then ok/errors.
-    (sorry_warnings, ok_key, sorries as i64, errors + conservative as i64)
+    (
+        sorry_warnings,
+        ok_key,
+        sorries as i64,
+        errors + conservative as i64,
+    )
 }
-
