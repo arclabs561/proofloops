@@ -38,6 +38,17 @@ jobs:
         run: |
           cargo build -p proofpatch-core --bin proofpatch
           cargo build -p proofpatch-mcp --bin proofpatch-mcp --features stdio
+          echo "$(pwd)/target/debug" >> "$GITHUB_PATH"
+
+      - name: build lean tools (for PROOFPATCH_EXTRA_LEAN_PATH)
+        run: |
+          cd lean-tools
+          lake build
+
+      - name: build fixture repo
+        run: |
+          cd fixtures/lean-fixture
+          lake build
 
       - name: proofpatch e2e (verify/triage)
         run: |
@@ -49,10 +60,24 @@ jobs:
             --context-lines 1
         env:
           LAKE: lake
+          PROOFPATCH_AUTO_BUILD: "1"
 
       - name: mcp stdio smoke (fixture repo)
         run: cargo run -p proofpatch-mcp --features stdio --example stdio_smoke
         env:
           PROOFPATCH_SMOKE_REPO_ROOT: fixtures/lean-fixture
           PROOFPATCH_SMOKE_FILE: LeanFixture/Main.lean
+
+      - name: proofpatch e2e (fixture imports ProofpatchTools)
+        run: |
+          proofpatch triage-file \
+            --repo fixtures/lean-fixture \
+            --file LeanFixture/WithTools.lean \
+            --timeout-s 120 \
+            --max-sorries 5 \
+            --context-lines 1
+        env:
+          LAKE: lake
+          PROOFPATCH_AUTO_BUILD: "1"
+          PROOFPATCH_EXTRA_LEAN_PATH: ${{ github.workspace }}/lean-tools/.lake/build/lib/lean
 
