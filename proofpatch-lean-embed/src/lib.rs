@@ -39,7 +39,10 @@ static INIT: OnceCell<()> = OnceCell::new();
 /// Safe to call multiple times; initialization is global and one-time.
 #[cfg(not(feature = "enabled"))]
 pub fn init() -> Result<(), String> {
-    Err("proofpatch-lean-embed is disabled (enable feature `proofpatch-lean-embed/enabled`)".to_string())
+    Err(
+        "proofpatch-lean-embed is disabled (enable feature `proofpatch-lean-embed/enabled`)"
+            .to_string(),
+    )
 }
 
 /// Initialize the embedded Lean runtime and the `LeanEmbedDemo.FFI` module.
@@ -73,7 +76,10 @@ pub fn init() -> Result<(), String> {
 /// Smoke-test function: calls Lean-exported `pp_add_u64`.
 #[cfg(not(feature = "enabled"))]
 pub fn add_u64(_a: u64, _b: u64) -> Result<u64, String> {
-    Err("proofpatch-lean-embed is disabled (enable feature `proofpatch-lean-embed/enabled`)".to_string())
+    Err(
+        "proofpatch-lean-embed is disabled (enable feature `proofpatch-lean-embed/enabled`)"
+            .to_string(),
+    )
 }
 
 /// Smoke-test function: calls Lean-exported `pp_add_u64`.
@@ -82,4 +88,3 @@ pub fn add_u64(a: u64, b: u64) -> Result<u64, String> {
     init()?;
     Ok(unsafe { pp_add_u64(a, b) })
 }
-

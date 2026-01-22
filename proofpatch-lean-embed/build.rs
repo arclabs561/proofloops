@@ -83,17 +83,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lean = resolve_tool("LEAN", "lean");
 
     // Build Lean IR, including generated C file.
-    run(
-        Command::new(&lake)
-            .current_dir(&lean_root)
-            .arg("build")
-            .arg("LeanEmbedDemo.FFI"),
-    )
+    run(Command::new(&lake)
+        .current_dir(&lean_root)
+        .arg("build")
+        .arg("LeanEmbedDemo.FFI"))
     .map_err(|e| format!("lake build failed: {e}"))?;
 
     // We compile the generated C ourselves to get a stable `.a` for Rust to link.
     let c_file = first_existing(&[lean_root.join(".lake/build/ir/LeanEmbedDemo/FFI.c")])
-        .ok_or_else(|| "could not find generated IR C file: .lake/build/ir/LeanEmbedDemo/FFI.c".to_string())?;
+        .ok_or_else(|| {
+            "could not find generated IR C file: .lake/build/ir/LeanEmbedDemo/FFI.c".to_string()
+        })?;
 
     let prefix = output(Command::new(&lean).arg("--print-prefix"))
         .or_else(|_| output(Command::new(&lean).arg("-print-prefix")))
@@ -132,4 +132,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-

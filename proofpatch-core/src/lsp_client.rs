@@ -1,18 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lsp_types::{
-    DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams,
-    InitializeParams,
-    LogMessageParams,
-    PublishDiagnosticsParams,
-    TextDocumentItem,
-    Uri,
-    VersionedTextDocumentIdentifier,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, InitializeParams, LogMessageParams,
+    PublishDiagnosticsParams, TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -86,7 +80,8 @@ enum LspRequest {
 }
 
 fn lsp_uri_for_path(p: &Path) -> Result<Uri, String> {
-    let u = url::Url::from_file_path(p).map_err(|_| format!("failed to build file:// uri for {}", p.display()))?;
+    let u = url::Url::from_file_path(p)
+        .map_err(|_| format!("failed to build file:// uri for {}", p.display()))?;
     Uri::from_str(u.as_str()).map_err(|e| format!("failed to parse uri: {e}"))
 }
 
@@ -385,17 +380,25 @@ async fn pump_stdout(mut state: ServerState, mut rx: tokio::sync::mpsc::Receiver
     }
 }
 
-async fn start_server(repo_root: &Path, timeout_s: Duration) -> Result<tokio::sync::mpsc::Sender<LspRequest>, String> {
+async fn start_server(
+    repo_root: &Path,
+    timeout_s: Duration,
+) -> Result<tokio::sync::mpsc::Sender<LspRequest>, String> {
     // Spawn: lake env lean --server
     let lake = crate::resolve_lake();
     let mut cmd = Command::new(&lake);
-    cmd.arg("env").arg("lean").arg("--server").current_dir(repo_root);
+    cmd.arg("env")
+        .arg("lean")
+        .arg("--server")
+        .current_dir(repo_root);
     crate::maybe_extend_lean_path_for_lake_env(&mut cmd);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn lean --server: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn lean --server: {e}"))?;
     let stdin = child.stdin.take().ok_or("missing stdin")?;
     let stdout = child.stdout.take().ok_or("missing stdout")?;
 
@@ -438,7 +441,9 @@ async fn start_server(repo_root: &Path, timeout_s: Duration) -> Result<tokio::sy
     });
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     state.resp_waiters.insert(init_id, resp_tx);
-    write_msg(&mut state.stdin, &init).await.map_err(|e| format!("failed to write initialize: {e}"))?;
+    write_msg(&mut state.stdin, &init)
+        .await
+        .map_err(|e| format!("failed to write initialize: {e}"))?;
 
     // Spawn pump loop
     tokio::spawn(pump_stdout(state, rx));
@@ -465,7 +470,9 @@ pub async fn check_text_via_lsp(
     // Serialize checks per repo_root to avoid same-URI in-flight collisions.
     let locks = LSP_REPO_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let lock = {
-        let mut g = locks.lock().map_err(|_| "lsp locks cache lock poisoned".to_string())?;
+        let mut g = locks
+            .lock()
+            .map_err(|_| "lsp locks cache lock poisoned".to_string())?;
         g.entry(repo_root.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -478,7 +485,9 @@ pub async fn check_text_via_lsp(
     let cache = LSP_SERVERS.get_or_init(|| Mutex::new(HashMap::new()));
     let key = repo_root.to_path_buf();
     let mut tx = {
-        let mut g = cache.lock().map_err(|_| "lsp cache lock poisoned".to_string())?;
+        let mut g = cache
+            .lock()
+            .map_err(|_| "lsp cache lock poisoned".to_string())?;
         if let Some(tx) = g.get(&key) {
             tx.clone()
         } else {
@@ -500,12 +509,16 @@ pub async fn check_text_via_lsp(
     if tx.send(req).await.is_err() {
         // Server likely died; drop cache entry and retry once.
         {
-            let mut g = cache.lock().map_err(|_| "lsp cache lock poisoned".to_string())?;
+            let mut g = cache
+                .lock()
+                .map_err(|_| "lsp cache lock poisoned".to_string())?;
             g.remove(&key);
         }
         tx = start_server(repo_root, timeout_s).await?;
         {
-            let mut g = cache.lock().map_err(|_| "lsp cache lock poisoned".to_string())?;
+            let mut g = cache
+                .lock()
+                .map_err(|_| "lsp cache lock poisoned".to_string())?;
             g.insert(key.clone(), tx.clone());
         }
 
@@ -532,4 +545,3 @@ pub async fn check_text_via_lsp(
         .map_err(|_| "lsp diag channel closed".to_string())?;
     Ok(diag)
 }
-

@@ -29,7 +29,9 @@ fn parse_json_string_array_can_extract_from_markdown_fence() {
 
 #[test]
 fn made_no_progress_detection() {
-    assert!(ts::is_made_no_progress(Some("tactic 'simp' made no progress")));
+    assert!(ts::is_made_no_progress(Some(
+        "tactic 'simp' made no progress"
+    )));
     assert!(!ts::is_made_no_progress(Some("unknown constant")));
 }
 
@@ -51,7 +53,10 @@ fn adapt_candidates_for_sorry_line_does_not_strip_on_bare_sorry() {
 fn adapt_candidates_for_sorry_context_strips_when_tactic_context() {
     let base = vec!["by\n  simp".to_string(), "by aesop".to_string()];
     let out = ts::adapt_candidates_for_sorry_context(&base, "  sorry", true);
-    assert_eq!(out, vec!["(simp; done)".to_string(), "(aesop; done)".to_string()]);
+    assert_eq!(
+        out,
+        vec!["(simp; done)".to_string(), "(aesop; done)".to_string()]
+    );
 }
 
 #[test]
@@ -68,4 +73,3 @@ Foo.lean:1:2: error: boom
     assert!(b.contains("Initial goal:"));
     assert!(b.contains("⊢ True"));
 }
-

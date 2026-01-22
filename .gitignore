@@ -18,3 +18,6 @@ tmp/
 # Research PDFs (keep repo light; store links + extracted notes instead)
 *.pdf
 
+# Scratch demo directory (keep local by default)
+lean-rust-embed-demo/
+

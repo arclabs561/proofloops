@@ -120,11 +120,7 @@ fn env_truthy(name: &str, default_on: bool) -> bool {
 fn default_model_from_env(provider_name: &str) -> Option<(String, String)> {
     // Provider-specific override wins.
     let key1 = format!("PROOFPATCH_DEFAULT_MODEL_{}", provider_name.to_uppercase());
-    for k in [
-        key1.as_str(),
-        "PROOFPATCH_DEFAULT_MODEL",
-    ]
-    {
+    for k in [key1.as_str(), "PROOFPATCH_DEFAULT_MODEL"] {
         if let Ok(v) = std::env::var(k) {
             let v = v.trim().to_string();
             if !v.is_empty() {
@@ -446,7 +442,10 @@ pub async fn chat_completion_raw(
     }
     // Inject selection metadata so callers don't have to re-run selection.
     if let Some(obj) = raw.as_object_mut() {
-        obj.insert("provider".to_string(), serde_json::Value::String(provider.name.to_string()));
+        obj.insert(
+            "provider".to_string(),
+            serde_json::Value::String(provider.name.to_string()),
+        );
         obj.insert("model".to_string(), serde_json::Value::String(model));
         obj.insert(
             "model_source".to_string(),
@@ -498,9 +497,7 @@ mod tests {
     #[test]
     fn provider_order_default() {
         let _lock = env_lock().lock().unwrap();
-        let _g = EnvGuard::new(&[
-            "PROOFPATCH_PROVIDER_ORDER",
-        ]);
+        let _g = EnvGuard::new(&["PROOFPATCH_PROVIDER_ORDER"]);
         std::env::remove_var("PROOFPATCH_PROVIDER_ORDER");
         assert_eq!(
             provider_order(),
@@ -650,10 +647,7 @@ mod tests {
             "OPENAI_API_KEY",
             "OPENAI_MODEL",
         ]);
-        std::env::set_var(
-            "PROOFPATCH_PROVIDER_ORDER",
-            "openrouter,openai,groq,ollama",
-        );
+        std::env::set_var("PROOFPATCH_PROVIDER_ORDER", "openrouter,openai,groq,ollama");
         std::env::remove_var("OLLAMA_MODEL");
         std::env::remove_var("GROQ_API_KEY");
         std::env::remove_var("GROQ_MODEL");

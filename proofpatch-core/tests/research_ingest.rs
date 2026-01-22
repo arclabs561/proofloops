@@ -66,7 +66,9 @@ fn ingest_propagates_origin_and_canonicalizes_arxiv_pdf() {
         .iter()
         .find(|s| s.url.starts_with("https://arxiv.org/"))
         .expect("missing arxiv source");
-    assert_eq!(arxiv_abs.canonical_url.as_deref(), Some("https://arxiv.org/abs/1234.5678"));
+    assert_eq!(
+        arxiv_abs.canonical_url.as_deref(),
+        Some("https://arxiv.org/abs/1234.5678")
+    );
     assert_eq!(arxiv_abs.origin.as_deref(), Some("arxiv"));
 }
-
