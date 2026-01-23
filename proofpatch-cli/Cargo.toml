@@ -15,9 +15,11 @@
  tokio = { version = "1", features = ["process", "time", "rt-multi-thread", "macros"] }
  similar = "2"
  schemars = { version = "1.2.0", features = ["derive"] }
+smtkit = { path = "../../smtkit" }
  
  [features]
- default = []
+# Default should include SMT prechecks in normal builds.
+default = ["smt"]
  lean-embed = ["proofpatch-core/lean-embed"]
  lsp = ["proofpatch-core/lsp"]
  planner = ["proofpatch-core/planner"]
