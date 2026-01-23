@@ -28,31 +28,31 @@ not something `proofpatch` depends on.
 From the repo root:
 
 ```bash
-cargo run --quiet -p proofpatch-core --bin proofpatch -- --help
+cargo run --quiet -p proofpatch-cli --bin proofpatch -- --help
 ```
 
 Common commands (all output JSON):
 
 ```bash
 # Verify + sorry scan (no LLM)
-cargo run --quiet -p proofpatch-core --bin proofpatch -- triage-file \
+cargo run --quiet -p proofpatch-cli --bin proofpatch -- triage-file \
   --repo /abs/path/to/lean-repo \
   --file Some/File.lean
 
 # Build a bounded context pack around a declaration (no LLM)
-cargo run --quiet -p proofpatch-core --bin proofpatch -- context-pack \
+cargo run --quiet -p proofpatch-cli --bin proofpatch -- context-pack \
   --repo /abs/path/to/lean-repo \
   --file Some/File.lean \
   --decl some_theorem
 
 # Suggest a proof for a lemma (LLM call)
-cargo run --quiet -p proofpatch-core --bin proofpatch -- suggest \
+cargo run --quiet -p proofpatch-cli --bin proofpatch -- suggest \
   --repo /abs/path/to/lean-repo \
   --file Some/File.lean \
   --lemma some_theorem
 
 # Patch first `sorry` in the lemma using a file and verify (in-memory; does not write)
-cargo run --quiet -p proofpatch-core --bin proofpatch -- patch \
+cargo run --quiet -p proofpatch-cli --bin proofpatch -- patch \
   --repo /abs/path/to/lean-repo \
   --file Some/File.lean \
   --lemma some_theorem \
