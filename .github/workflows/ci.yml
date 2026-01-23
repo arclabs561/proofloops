@@ -80,4 +80,3 @@ jobs:
           LAKE: lake
           PROOFPATCH_AUTO_BUILD: "1"
           PROOFPATCH_EXTRA_LEAN_PATH: ${{ github.workspace }}/lean-tools/.lake/build/lib/lean
-
