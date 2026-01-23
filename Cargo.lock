@@ -1363,6 +1363,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "proofpatch-cli"
+version = "0.1.0"
+dependencies = [
+ "proofpatch-core",
+ "schemars",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "proofpatch-core"
 version = "0.1.0"
 dependencies = [

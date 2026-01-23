@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "proofpatch-core",
+  "proofpatch-cli",
   "mcp-server",
   "proofpatch-lean-embed",
 ]
