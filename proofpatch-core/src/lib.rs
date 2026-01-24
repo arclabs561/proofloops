@@ -638,6 +638,12 @@ pub struct PromptPayload {
     pub excerpt: String,
     pub system: String,
     pub user: String,
+    /// Convenience: `system + "\n\n" + user` (exact concatenation).
+    pub prompt_combined: String,
+    /// SHA-256 of `prompt_combined` (hex).
+    pub prompt_combined_sha256: String,
+    /// Character count of `prompt_combined` (Unicode scalar values).
+    pub prompt_combined_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1586,6 +1592,14 @@ pub fn build_proof_prompt(
 
     let system = proof_system_prompt();
     let user = proof_user_prompt(&excerpt);
+    let prompt_combined = format!("{system}\n\n{user}");
+    let prompt_combined_chars = prompt_combined.chars().count();
+    let prompt_combined_sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(prompt_combined.as_bytes());
+        format!("{:x}", h.finalize())
+    };
 
     Ok(PromptPayload {
         repo_root: repo_root.display().to_string(),
@@ -1594,6 +1608,9 @@ pub fn build_proof_prompt(
         excerpt,
         system,
         user,
+        prompt_combined,
+        prompt_combined_sha256,
+        prompt_combined_chars,
     })
 }
 
@@ -1726,6 +1743,15 @@ pub fn build_rubberduck_prompt(
     user.push_str(&plan.to_string());
     user.push('\n');
 
+    let prompt_combined = format!("{system}\n\n{user}");
+    let prompt_combined_chars = prompt_combined.chars().count();
+    let prompt_combined_sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(prompt_combined.as_bytes());
+        format!("{:x}", h.finalize())
+    };
+
     Ok(PromptPayload {
         repo_root: repo_root.display().to_string(),
         file: p.display().to_string(),
@@ -1733,6 +1759,9 @@ pub fn build_rubberduck_prompt(
         excerpt,
         system,
         user,
+        prompt_combined,
+        prompt_combined_sha256,
+        prompt_combined_chars,
     })
 }
 
@@ -1827,6 +1856,15 @@ pub fn build_rubberduck_prompt_from_excerpt(
     user.push_str(&plan.to_string());
     user.push('\n');
 
+    let prompt_combined = format!("{system}\n\n{user}");
+    let prompt_combined_chars = prompt_combined.chars().count();
+    let prompt_combined_sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(prompt_combined.as_bytes());
+        format!("{:x}", h.finalize())
+    };
+
     Ok(PromptPayload {
         repo_root: repo_root.display().to_string(),
         file: p.display().to_string(),
@@ -1834,6 +1872,9 @@ pub fn build_rubberduck_prompt_from_excerpt(
         excerpt: excerpt.to_string(),
         system,
         user,
+        prompt_combined,
+        prompt_combined_sha256,
+        prompt_combined_chars,
     })
 }
 
@@ -1901,6 +1942,15 @@ pub fn build_region_patch_prompt(
         "\n\nTask: provide the Lean proof code that replaces the `sorry` (the proof term only).",
     );
 
+    let prompt_combined = format!("{system}\n\n{user}");
+    let prompt_combined_chars = prompt_combined.chars().count();
+    let prompt_combined_sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(prompt_combined.as_bytes());
+        format!("{:x}", h.finalize())
+    };
+
     Ok(PromptPayload {
         repo_root: repo_root.display().to_string(),
         file: p.display().to_string(),
@@ -1908,6 +1958,9 @@ pub fn build_region_patch_prompt(
         excerpt,
         system,
         user,
+        prompt_combined,
+        prompt_combined_sha256,
+        prompt_combined_chars,
     })
 }
 

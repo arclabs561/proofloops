@@ -173,6 +173,15 @@ fn arg_flag(args: &[String], key: &str) -> bool {
     args.iter().any(|a| a == key)
 }
 
+fn env_truthy(name: &str, default_on: bool) -> bool {
+    let v = std::env::var(name).ok().unwrap_or_default();
+    let v = v.trim().to_lowercase();
+    if v.is_empty() {
+        return default_on;
+    }
+    !matches!(v.as_str(), "0" | "false" | "no" | "off")
+}
+
 fn arg_u64(args: &[String], key: &str) -> Option<u64> {
     arg_value(args, key).and_then(|s| s.trim().parse::<u64>().ok())
 }
@@ -806,7 +815,7 @@ fn usage() -> String {
         "  patch       --repo <path> --file <relpath> --lemma <name> --replacement-file <path> [--timeout-s N] [--write] [--include-raw-verify] [--output-json <path>]",
         "  patch-region --repo <path> --file <relpath> --start-line N --end-line N --replacement-file <path> [--timeout-s N] [--write] [--include-raw-verify] [--output-json <path>]",
         "  patch-nearest --repo <path> --file <relpath> --replacement-file <path> [--timeout-s N] [--write] [--max-sorries N] [--context-lines N] [--include-raw-verify] [--output-json <path>]",
-        "  tree-search-nearest --repo <path> --file <relpath> [--timeout-s N] [--total-timeout-s N] [--log-level 0|1|2] [--events-jsonl <path>] [--events-keep N] [--events-all-keep N] [--beam N] [--max-nodes N] [--depth N] [--candidates det|auto|lean|lean-try|llm] [--focus-line N] [--lean-oracle-per-node] [--lean-oracle-max-calls N] [--rollout-k N] [--dedup-goal-expansions] [--goal-first-k N] [--goal-meta-penalty N] [--depth-bonus N] [--fill-mode safe|strict|hybrid] [--max-candidates-per-node N] [--verify-k N] [--cache-dir <path> | --no-cache] [--profile] [--summary-level 0|1|2|3] [--report-md <path>] [--llm-summary] [--llm-summary-timeout-s N] [--llm-planner] [--llm-planner-timeout-s N] [--smt-precheck] [--smt-timeout-ms N] [--smt-seed N] [--goal-dump] [--llm-timeout-s N] [--escalate-llm] [--allow-sorry-candidates] [--include-trace] [--pick best|best-ok|best-progress] [--quiet] [--research-notes-file <path>] [--include-diff] [--diff-context N] [--output-diff <path>] [--write | --write-to <path>] [--include-raw-verify] [--output-json <path>]",
+        "  tree-search-nearest --repo <path> --file <relpath> [--timeout-s N] [--total-timeout-s N] [--log-level 0|1|2] [--events-jsonl <path>] [--events-keep N] [--events-all-keep N] [--beam N] [--max-nodes N] [--depth N] [--candidates det|auto|lean|lean-try|llm] [--focus-line N] [--lean-oracle-per-node] [--lean-oracle-max-calls N] [--rollout-k N] [--dedup-goal-expansions] [--goal-first-k N] [--goal-meta-penalty N] [--depth-bonus N] [--fill-mode safe|strict|hybrid] [--max-candidates-per-node N] [--verify-k N] [--cache-dir <path> | --no-cache] [--profile] [--summary-level 0|1|2|3] [--report-md <path>] [--auto-artifacts] [--llm-summary] [--llm-summary-timeout-s N] [--llm-planner] [--llm-planner-timeout-s N] [--smt-precheck] [--smt-timeout-ms N] [--smt-seed N] [--goal-dump] [--llm-timeout-s N] [--escalate-llm] [--allow-sorry-candidates] [--include-trace] [--pick best|best-ok|best-progress] [--quiet] [--research-notes-file <path>] [--include-diff] [--diff-context N] [--output-diff <path>] [--write | --write-to <path>] [--include-raw-verify] [--output-json <path>]",
         "  suggest     --repo <path> --file <relpath> --lemma <name> [--timeout-s N] [--output-json <path>]",
         "  loop        --repo <path> --file <relpath> --lemma <name> [--max-iters N] [--timeout-s N] [--output-json <path>]",
         "  review-prompt --repo <path> [--scope auto|staged|worktree] [--max-total-bytes N] [--per-file-bytes N] [--transcript-bytes N] [--cache-version STR] [--cache-model STR] [--output-json <path>]",
@@ -1828,7 +1837,8 @@ fn main() -> Result<(), String> {
                 .unwrap_or(timeout_s)
                 .max(1);
             let log_level = arg_u64(rest, "--log-level").unwrap_or(1);
-            let events_jsonl = arg_value(rest, "--events-jsonl").map(PathBuf::from);
+            let events_jsonl_requested = arg_value(rest, "--events-jsonl").map(PathBuf::from);
+            let mut events_jsonl = events_jsonl_requested.clone();
             let events_keep = arg_u64(rest, "--events-keep")
                 .unwrap_or(512)
                 .clamp(16, 10_000) as usize;
@@ -1902,7 +1912,8 @@ fn main() -> Result<(), String> {
             let cache_dir_opt = arg_value(rest, "--cache-dir").map(PathBuf::from);
             let profile = arg_flag(rest, "--profile");
             let summary_level = arg_u64(rest, "--summary-level").unwrap_or(2);
-            let report_md = arg_value(rest, "--report-md").map(PathBuf::from);
+            let report_md_requested = arg_value(rest, "--report-md").map(PathBuf::from);
+            let mut report_md = report_md_requested.clone();
             let llm_summary = arg_flag(rest, "--llm-summary");
             let llm_summary_timeout_s = arg_u64(rest, "--llm-summary-timeout-s").unwrap_or(20);
             let llm_planner = arg_flag(rest, "--llm-planner");
@@ -1924,7 +1935,8 @@ fn main() -> Result<(), String> {
             let research_notes_file = arg_value(rest, "--research-notes-file").map(PathBuf::from);
             let include_diff = arg_flag(rest, "--include-diff");
             let diff_context = arg_u64(rest, "--diff-context").unwrap_or(3) as usize;
-            let output_diff = arg_value(rest, "--output-diff").map(PathBuf::from);
+            let output_diff_requested = arg_value(rest, "--output-diff").map(PathBuf::from);
+            let mut output_diff = output_diff_requested.clone();
             let write = arg_flag(rest, "--write");
             let write_to = arg_value(rest, "--write-to").map(PathBuf::from);
             let include_raw_verify = arg_flag(rest, "--include-raw-verify");
@@ -1966,6 +1978,33 @@ fn main() -> Result<(), String> {
             }
             let original_text = std::fs::read_to_string(&abs)
                 .map_err(|e| format!("read {}: {e}", abs.display()))?;
+
+            // Local default: when caching is enabled, auto-write useful artifacts unless disabled.
+            // This makes `.generated/*.json` “actionable” even when the caller didn't pass paths.
+            let auto_artifacts = arg_flag(rest, "--auto-artifacts")
+                || env_truthy("PROOFPATCH_TREE_SEARCH_AUTO_ARTIFACTS", true);
+            let run_key = hash_text(&format!(
+                "{}|focus_line={:?}|beam={}|max_nodes={}|depth={}|candidates={}",
+                file, focus_line_override, beam, max_nodes, depth, candidates_mode
+            ));
+            let mk_path = |subdir: &str, ext: &str| -> Option<PathBuf> {
+                cache_dir.as_ref().map(|root| {
+                    root.join("tree_search")
+                        .join(subdir)
+                        .join(format!("{run_key}.{ext}"))
+                })
+            };
+            if auto_artifacts {
+                if events_jsonl.is_none() {
+                    events_jsonl = mk_path("events", "jsonl");
+                }
+                if report_md.is_none() {
+                    report_md = mk_path("reports", "md");
+                }
+                if include_diff && output_diff.is_none() {
+                    output_diff = mk_path("diffs", "diff");
+                }
+            }
 
             let mut research_notes: Option<serde_json::Value> = None;
             let mut research_notes_text: Option<String> = None;
@@ -2590,7 +2629,7 @@ fn main() -> Result<(), String> {
             //
             // If the user provided `--focus-line`, use the `sorry` closest to that line as the
             // focus decl/line (otherwise we tend to get stuck on the first `sorry` in the file).
-            let (focus_decl_name, focus_line_1) = {
+            let (focus_decl_name, focus_line_1, focus_sorry, focus_source) = {
                 let locs0 = plc::locate_sorries_in_text(&original_text, 200, 1).unwrap_or_default();
                 if let Some(fl) = focus_line_override {
                     let picked = locs0
@@ -2599,7 +2638,9 @@ fn main() -> Result<(), String> {
                         .cloned();
                     (
                         picked.as_ref().and_then(|s| s.decl_name.clone()),
-                        picked.map(|s| s.line),
+                        picked.as_ref().map(|s| s.line),
+                        picked,
+                        "focus_line",
                     )
                 } else {
                     let first_error_line_1 = baseline_summary
@@ -2610,7 +2651,9 @@ fn main() -> Result<(), String> {
                     let picked = plc::select_primary_sorry(first_error_line_1, &locs0);
                     (
                         picked.as_ref().and_then(|s| s.decl_name.clone()),
-                        picked.map(|s| s.line),
+                        picked.as_ref().map(|s| s.line),
+                        picked,
+                        "first_error_or_primary_sorry",
                     )
                 }
             };
@@ -2619,7 +2662,7 @@ fn main() -> Result<(), String> {
                 json!({
                     "decl": focus_decl_name,
                     "line": focus_line_1,
-                    "source": if focus_line_override.is_some() { "focus_line" } else { "first_error_or_primary_sorry" },
+                    "source": focus_source,
                 }),
             );
 
@@ -5349,7 +5392,7 @@ Constraints:
             };
 
             // Optional human-friendly Markdown report.
-            if let Some(p) = report_md.as_ref() {
+            let report_md_written: Option<String> = if let Some(p) = report_md.as_ref() {
                 let baseline_sorries = plc::locate_sorries_in_text(&original_text, 500, 1)
                     .unwrap_or_default()
                     .len();
@@ -5443,8 +5486,13 @@ Constraints:
                 }
                 std::fs::write(p, md.as_bytes())
                     .map_err(|e| format!("write report {}: {e}", p.display()))?;
-            }
+                Some(p.display().to_string())
+            } else {
+                None
+            };
 
+            let events_jsonl_effective: Option<String> =
+                events_jsonl.as_ref().map(|p| p.display().to_string());
             let events_jsonl_written: Option<String> = if let Some(p) = events_jsonl.as_ref() {
                 if let Some(parent) = p.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -5477,7 +5525,20 @@ Constraints:
                 "diff": diff_unified,
                 "diff_written": diff_written,
                 "artifacts": {
-                    "events_jsonl": events_jsonl_written,
+                    "events_jsonl": {
+                        "requested": events_jsonl_requested.as_ref().map(|p| p.display().to_string()),
+                        "effective": events_jsonl_effective,
+                        "written": events_jsonl_written
+                    },
+                    "report_md": {
+                        "requested": report_md_requested.as_ref().map(|p| p.display().to_string()),
+                        "written": report_md_written
+                    },
+                    "diff_output": {
+                        "requested": output_diff_requested.as_ref().map(|p| p.display().to_string()),
+                        "effective": output_diff.as_ref().map(|p| p.display().to_string()),
+                        "written": diff_written
+                    }
                 },
                 "events": {
                     "counts_by_kind": events_by_kind,
@@ -5677,6 +5738,76 @@ Constraints:
                         "raw": if include_raw_verify { picked.verify_raw.clone().unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null }
                     }
                 },
+                // Extra “artifact pointers” so consumers don't have to parse nested JSON to
+                // recover the selected patch text. When caching is enabled, we also write
+                // the replacement text to a stable path under `.generated/proofpatch-cache/`.
+                "replacement_artifacts": {
+                    "picked": {
+                        "region": picked.last_region.map(|(a,b)| json!({"start_line": a, "end_line": b})),
+                        "preview": picked.last_replacement.as_ref().map(|s| truncate_str(s, 400)),
+                        "chars": picked.last_replacement.as_ref().map(|s| s.chars().count()),
+                        "hash64": picked.last_replacement.as_ref().map(|s| hash_text(s)),
+                        "path": picked.last_replacement.as_ref().and_then(|s| {
+                            cache_dir.as_ref().map(|root| {
+                                let h = hash_text(s);
+                                let rel = format!("tree_search/replacements/picked_{h}.lean");
+                                durable_atomic_write(root, &rel, s.as_bytes());
+                                root.join(rel).display().to_string()
+                            })
+                        })
+                    },
+                    "best_ok": {
+                        "region": best_ok.last_region.map(|(a,b)| json!({"start_line": a, "end_line": b})),
+                        "preview": best_ok.last_replacement.as_ref().map(|s| truncate_str(s, 400)),
+                        "chars": best_ok.last_replacement.as_ref().map(|s| s.chars().count()),
+                        "hash64": best_ok.last_replacement.as_ref().map(|s| hash_text(s)),
+                        "path": best_ok.last_replacement.as_ref().and_then(|s| {
+                            cache_dir.as_ref().map(|root| {
+                                let h = hash_text(s);
+                                let rel = format!("tree_search/replacements/best_ok_{h}.lean");
+                                durable_atomic_write(root, &rel, s.as_bytes());
+                                root.join(rel).display().to_string()
+                            })
+                        })
+                    },
+                    "best_progress": {
+                        "region": best_progress.last_region.map(|(a,b)| json!({"start_line": a, "end_line": b})),
+                        "preview": best_progress.last_replacement.as_ref().map(|s| truncate_str(s, 400)),
+                        "chars": best_progress.last_replacement.as_ref().map(|s| s.chars().count()),
+                        "hash64": best_progress.last_replacement.as_ref().map(|s| hash_text(s)),
+                        "path": best_progress.last_replacement.as_ref().and_then(|s| {
+                            cache_dir.as_ref().map(|root| {
+                                let h = hash_text(s);
+                                let rel = format!("tree_search/replacements/best_progress_{h}.lean");
+                                durable_atomic_write(root, &rel, s.as_bytes());
+                                root.join(rel).display().to_string()
+                            })
+                        })
+                    }
+                },
+                // A compact summary that is easy to `jq` / grep.
+                "human_summary": {
+                    "picked": pick,
+                    "focus_decl": focus_decl_name,
+                    "focus_line": focus_line_1,
+                    "baseline": baseline_summary,
+                    "picked_verify": picked.verify_summary
+                },
+                "focus": {
+                    "source": focus_source,
+                    "primary_sorry": focus_sorry.as_ref().map(|s| json!({
+                        "token": s.token,
+                        "decl_kind": s.decl_kind,
+                        "decl_name": s.decl_name,
+                        "decl_line": s.decl_line,
+                        "line": s.line,
+                        "col": s.col,
+                        "region_start": s.region_start,
+                        "region_end": s.region_end,
+                        "line_text": truncate_str(&s.line_text, 200),
+                        "excerpt": truncate_str(&s.excerpt, 800),
+                    }))
+                },
                 "trace": trace
             });
 
@@ -5834,6 +5965,57 @@ Constraints:
                 }
             }
 
+            // Human headline to stderr for transparency (keeps stdout machine-readable).
+            // This is intentionally compact and stable-ish, but not a contract surface (JSON is).
+            if !quiet {
+                let baseline_counts = baseline_summary
+                    .get("counts")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let picked_counts = picked
+                    .verify_summary
+                    .as_ref()
+                    .and_then(|v| v.get("counts"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
+                let artifacts_events = out
+                    .pointer("/artifacts/events_jsonl/written")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let artifacts_report = out
+                    .pointer("/artifacts/report_md/written")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let artifacts_diff = out
+                    .pointer("/artifacts/diff_output/written")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+
+                let focus_decl_s = focus_decl_name.clone().unwrap_or_else(|| "-".to_string());
+                let focus_line_s = focus_line_1
+                    .map(|l| l.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+
+                let baseline_counts_s =
+                    serde_json::to_string(&baseline_counts).unwrap_or_else(|_| "null".to_string());
+                let picked_counts_s =
+                    serde_json::to_string(&picked_counts).unwrap_or_else(|_| "null".to_string());
+
+                eprintln!(
+                    "tree-search-nearest: pick={} focus={}@{} source={} baseline_counts={} picked_counts={} artifacts(events_jsonl={}, report_md={}, diff_output={})",
+                    pick,
+                    focus_decl_s,
+                    focus_line_s,
+                    focus_source,
+                    baseline_counts_s,
+                    picked_counts_s,
+                    artifacts_events,
+                    artifacts_report,
+                    artifacts_diff
+                );
+            }
+
             if let Some(p) = output_json {
                 write_json(&p, &out)?;
                 println!(
@@ -5876,6 +6058,10 @@ Constraints:
                 "model": res.model,
                 "lemma": lemma,
                 "file": payload.file,
+                "prompt": {
+                    "combined_chars": payload.prompt_combined_chars,
+                    "combined_sha256": payload.prompt_combined_sha256,
+                },
                 "suggestion": res.content,
                 "raw": res.raw
             });
