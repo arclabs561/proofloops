@@ -144,12 +144,28 @@ pub fn adapt_candidates_for_error(base: &[String], first_error: Option<&str>) ->
 
     // If automation made no progress, widen the surface with suggestion tactics.
     if err.contains("made no progress") {
+        // If the failure is specifically `simp`/`simp_all` making no progress, don't respond by
+        // trying *more* `simp`-ish candidates — it tends to produce the same error repeatedly.
+        //
+        // (This exact loop showed up in our LLL termination scaffolding work.)
+        let simp_stalled = err.contains("`simp` made no progress")
+            || err.contains("simp made no progress")
+            || err.contains("`simp_all` made no progress")
+            || err.contains("simp_all made no progress");
+        if simp_stalled {
+            out.retain(|c| {
+                let t = c.to_lowercase();
+                !(t.contains("simp") || t.contains("simp_all"))
+            });
+        }
         // Prefer *real* tactics; Mathlib `...?` suggestion tactics can hide admitted proofs
         // (they often end with a synthetic `sorry`).
-        out.push("by\n  (simp; done)".to_string());
         out.push("by\n  aesop".to_string());
-        out.push("by\n  classical\n  (simp; done)".to_string());
         out.push("by\n  classical\n  aesop".to_string());
+        // Arithmetic-ish fallbacks (still cheap).
+        out.push("by\n  (omega; done)".to_string());
+        out.push("by\n  (linarith; done)".to_string());
+        out.push("by\n  (nlinarith; done)".to_string());
     }
 
     // Some goals need classical instances for automation.

@@ -18,12 +18,10 @@
 smtkit = { path = "../../smtkit" }
  
  [features]
-# Default should include SMT prechecks in normal builds.
-default = ["smt"]
+default = []
  lean-embed = ["proofpatch-core/lean-embed"]
  lsp = ["proofpatch-core/lsp"]
  planner = ["proofpatch-core/planner"]
- smt = ["proofpatch-core/smt"]
  axi-agent = ["proofpatch-core/axi-agent"]
  
  [[bin]]
