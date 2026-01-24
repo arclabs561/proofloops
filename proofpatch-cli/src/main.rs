@@ -380,7 +380,6 @@ fn cache_write_planner(
     durable_atomic_write(cache_dir, &rel, v.to_string().as_bytes());
 }
 
-#[cfg(feature = "smt")]
 fn cache_read_smt_entails(
     cache_dir: &std::path::Path,
     state_key: u64,
@@ -393,7 +392,6 @@ fn cache_read_smt_entails(
     v.get("entails").and_then(|x| x.as_bool())
 }
 
-#[cfg(feature = "smt")]
 fn cache_write_smt_entails(
     cache_dir: &std::path::Path,
     state_key: u64,
@@ -405,14 +403,12 @@ fn cache_write_smt_entails(
     durable_atomic_write(cache_dir, &rel, v.to_string().as_bytes());
 }
 
-#[cfg(feature = "smt")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SmtVarKind {
     Int,
     Nat,
 }
 
-#[cfg(feature = "smt")]
 fn smt_sanitize_name(s: &str) -> String {
     let mut out = String::new();
     for ch in s.chars() {
@@ -437,7 +433,6 @@ fn smt_sanitize_name(s: &str) -> String {
     out
 }
 
-#[cfg(feature = "smt")]
 fn smt_extract_decl_kind(hyp_text: &str) -> Option<(String, SmtVarKind)> {
     // Very small recognizer for declarations like:
     // - `n : ℕ`
@@ -460,7 +455,6 @@ fn smt_extract_decl_kind(hyp_text: &str) -> Option<(String, SmtVarKind)> {
     Some((smt_sanitize_name(name), kind))
 }
 
-#[cfg(feature = "smt")]
 #[derive(Debug, Clone)]
 struct LinearExpr {
     // var -> coefficient
@@ -468,7 +462,6 @@ struct LinearExpr {
     c0: i64,
 }
 
-#[cfg(feature = "smt")]
 fn parse_linear_expr_int(s: &str) -> Option<LinearExpr> {
     // Extremely small parser: supports sums/differences of identifiers and integer literals.
     // Rejects anything with obvious non-LIA operators (*,/ ,^,·, etc).
@@ -530,7 +523,6 @@ fn parse_linear_expr_int(s: &str) -> Option<LinearExpr> {
     Some(LinearExpr { coeffs, c0 })
 }
 
-#[cfg(feature = "smt")]
 fn linear_expr_to_smt_sexp(e: &LinearExpr) -> smtkit::sexp::Sexp {
     use smtkit::smt2::t;
     let mut terms: Vec<smtkit::sexp::Sexp> = Vec::new();
@@ -559,14 +551,12 @@ fn linear_expr_to_smt_sexp(e: &LinearExpr) -> smtkit::sexp::Sexp {
     }
 }
 
-#[cfg(feature = "smt")]
 #[derive(Debug, Clone)]
 struct ParsedRelConstraint {
     sexp: smtkit::sexp::Sexp,
     vars: std::collections::BTreeSet<String>,
 }
 
-#[cfg(feature = "smt")]
 fn parse_rel_constraint_int(s: &str) -> Option<ParsedRelConstraint> {
     // Find a single top-level relation and parse both sides as linear integer expressions.
     // Supports ASCII and unicode relations: <=, ≥, ≤, >=, <, >, =.
@@ -594,7 +584,6 @@ fn parse_rel_constraint_int(s: &str) -> Option<ParsedRelConstraint> {
     Some(ParsedRelConstraint { sexp, vars })
 }
 
-#[cfg(feature = "smt")]
 fn smt_entails_from_pp_dump(
     pp_dump: &serde_json::Value,
     timeout_ms: u64,
@@ -711,7 +700,6 @@ fn smt_entails_from_pp_dump(
     }
 }
 
-#[cfg(feature = "smt")]
 fn smt_entails_from_hyps_target(
     hyps_texts: &[String],
     target: &str,
@@ -1924,21 +1912,8 @@ fn main() -> Result<(), String> {
             #[cfg(not(feature = "planner"))]
             let _llm_planner_timeout_s = arg_u64(rest, "--llm-planner-timeout-s").unwrap_or(10);
             let smt_precheck = arg_flag(rest, "--smt-precheck");
-            // Only used when compiled with `--features smt`.
-            #[cfg(feature = "smt")]
             let smt_timeout_ms = arg_u64(rest, "--smt-timeout-ms").unwrap_or(1500);
-            #[cfg(not(feature = "smt"))]
-            let smt_timeout_ms = {
-                let _ = arg_u64(rest, "--smt-timeout-ms").unwrap_or(1500);
-                0u64
-            };
-            #[cfg(feature = "smt")]
             let smt_seed = arg_u64(rest, "--smt-seed").unwrap_or(0);
-            #[cfg(not(feature = "smt"))]
-            let smt_seed = {
-                let _ = arg_u64(rest, "--smt-seed").unwrap_or(0);
-                0u64
-            };
             let llm_timeout_s = arg_u64(rest, "--llm-timeout-s").unwrap_or(60);
             let goal_dump = arg_flag(rest, "--goal-dump");
             let escalate_llm = arg_flag(rest, "--escalate-llm");
@@ -1957,10 +1932,6 @@ fn main() -> Result<(), String> {
 
             if write && write_to.is_some() {
                 return Err("use only one of --write or --write-to".to_string());
-            }
-            #[cfg(not(feature = "smt"))]
-            if smt_precheck {
-                return Err("--smt-precheck requires building with cargo feature `smt`".to_string());
             }
 
             if beam == 0 {
@@ -2563,21 +2534,11 @@ fn main() -> Result<(), String> {
             #[cfg(feature = "planner")]
             let mut prof_planner_ms: u64 = 0;
 
-            #[cfg(feature = "smt")]
             let mut smt_entails_cache: std::collections::HashMap<(u64, u64), bool> =
                 std::collections::HashMap::new(); // ((state_key, goal_sig) -> entails)
-            #[cfg(feature = "smt")]
             let mut smt_cache_hits: u64 = 0;
-            #[cfg(feature = "smt")]
             let mut smt_cache_misses: u64 = 0;
-            #[cfg(feature = "smt")]
             let mut prof_smt_ms: u64 = 0;
-            #[cfg(not(feature = "smt"))]
-            let smt_cache_hits: u64 = 0;
-            #[cfg(not(feature = "smt"))]
-            let smt_cache_misses: u64 = 0;
-            #[cfg(not(feature = "smt"))]
-            let _prof_smt_ms: u64 = 0;
 
             // Baseline verify (for first-error line; also returned in output).
             let (baseline_raw_v, baseline_summary, baseline_ms, baseline_skipped) =
@@ -3451,7 +3412,6 @@ Constraints:
                                         );
 
                                         // SMT precheck: if hyps entail target (LIA-only), take this hole immediately.
-                                        #[cfg(feature = "smt")]
                                         if smt_precheck {
                                             if let Some(pp0) = pp {
                                                 let goal_sig = hash_text(&target);
@@ -3602,7 +3562,6 @@ Constraints:
                                     }
 
                                     // SMT precheck (same logic as above, but after the no-cache path).
-                                    #[cfg(feature = "smt")]
                                     if smt_precheck {
                                         if let Some(pp0) = pp {
                                             let goal_sig = hash_text(&target);
@@ -3679,53 +3638,46 @@ Constraints:
                                 // Optional SMT hint: if the target is implied by (some) integer constraints in the local context,
                                 // treat this hole as very easy (it likely succumbs to `omega`/`linarith`/`simp`).
                                 let score = {
-                                    #[cfg(feature = "smt")]
-                                    {
-                                        let mut score = score0;
-                                        if smt_precheck && state_key != UNKNOWN_STATE_KEY {
-                                            let th = hash_text(&parent.text);
-                                            let k = (th, parent.text.len(), s0.line);
-                                            let target = goal_dump_cache
-                                                .get(&k)
-                                                .map(|(_, _, _, t)| t.clone())
-                                                .unwrap_or_default();
-                                            if !target.is_empty() {
-                                                let goal_sig = hash_text(&target);
-                                                let ck = (state_key, goal_sig);
-                                                let mut cached =
-                                                    smt_entails_cache.get(&ck).copied();
-                                                if cached.is_none() {
-                                                    if let Some(cd) = cache_dir.as_ref() {
-                                                        if let Some(ent) = cache_read_smt_entails(
-                                                            cd, state_key, goal_sig,
-                                                        ) {
-                                                            cached = Some(ent);
-                                                            smt_entails_cache.insert(ck, ent);
-                                                            smt_cache_hits += 1;
-                                                        }
+                                    let mut score = score0;
+                                    if smt_precheck && state_key != UNKNOWN_STATE_KEY {
+                                        let th = hash_text(&parent.text);
+                                        let k = (th, parent.text.len(), s0.line);
+                                        let target = goal_dump_cache
+                                            .get(&k)
+                                            .map(|(_, _, _, t)| t.clone())
+                                            .unwrap_or_default();
+                                        if !target.is_empty() {
+                                            let goal_sig = hash_text(&target);
+                                            let ck = (state_key, goal_sig);
+                                            let mut cached = smt_entails_cache.get(&ck).copied();
+                                            if cached.is_none() {
+                                                if let Some(cd) = cache_dir.as_ref() {
+                                                    if let Some(ent) =
+                                                        cache_read_smt_entails(cd, state_key, goal_sig)
+                                                    {
+                                                        cached = Some(ent);
+                                                        smt_entails_cache.insert(ck, ent);
+                                                        smt_cache_hits += 1;
                                                     }
                                                 }
-                                                if cached.is_none() {
-                                                    // No extra Lean calls. If we have cached hypothesis text for this hole,
-                                                    // we can still run SMT without Lean (best-effort LIA).
-                                                    smt_cache_misses += 1;
-                                                    let hyps_texts = if let Some(xs) =
-                                                        goal_dump_hyps_cache.get(&k).cloned()
-                                                    {
+                                            }
+                                            if cached.is_none() {
+                                                // No extra Lean calls. If we have cached hypothesis text for this hole,
+                                                // we can still run SMT without Lean (best-effort LIA).
+                                                smt_cache_misses += 1;
+                                                let hyps_texts =
+                                                    if let Some(xs) = goal_dump_hyps_cache.get(&k).cloned() {
                                                         goal_dump_hyps_cache_hits += 1;
                                                         xs
                                                     } else if let Some(cd) = cache_dir.as_ref() {
-                                                        if let Some(xs) =
-                                                            cache_read_goal_dump_hyps_texts(
-                                                                cd,
-                                                                th,
-                                                                parent.text.len(),
-                                                                s0.line,
-                                                            )
-                                                        {
+                                                        if let Some(xs) = cache_read_goal_dump_hyps_texts(
+                                                            cd,
+                                                            th,
+                                                            parent.text.len(),
+                                                            s0.line,
+                                                        ) {
                                                             goal_dump_hyps_cache_hits += 1;
-                                                            goal_dump_hyps_cache
-                                                                .insert(k, xs.clone());
+                                                            goal_dump_hyps_cache.insert(k, xs.clone());
                                                             xs
                                                         } else {
                                                             goal_dump_hyps_cache_misses += 1;
@@ -3735,40 +3687,32 @@ Constraints:
                                                         goal_dump_hyps_cache_misses += 1;
                                                         Vec::new()
                                                     };
-                                                    if !hyps_texts.is_empty() {
-                                                        let t0 = std::time::Instant::now();
-                                                        let ent = smt_entails_from_hyps_target(
-                                                            &hyps_texts,
-                                                            &target,
-                                                            smt_timeout_ms,
-                                                            smt_seed,
-                                                        )
-                                                        .unwrap_or(None);
-                                                        prof_smt_ms = prof_smt_ms.saturating_add(
-                                                            t0.elapsed().as_millis() as u64,
-                                                        );
-                                                        if let Some(ent) = ent {
-                                                            smt_entails_cache.insert(ck, ent);
-                                                            if let Some(cd) = cache_dir.as_ref() {
-                                                                cache_write_smt_entails(
-                                                                    cd, state_key, goal_sig, ent,
-                                                                );
-                                                            }
-                                                            cached = Some(ent);
+                                                if !hyps_texts.is_empty() {
+                                                    let t0 = std::time::Instant::now();
+                                                    let ent = smt_entails_from_hyps_target(
+                                                        &hyps_texts,
+                                                        &target,
+                                                        smt_timeout_ms,
+                                                        smt_seed,
+                                                    )
+                                                    .unwrap_or(None);
+                                                    prof_smt_ms = prof_smt_ms
+                                                        .saturating_add(t0.elapsed().as_millis() as u64);
+                                                    if let Some(ent) = ent {
+                                                        smt_entails_cache.insert(ck, ent);
+                                                        if let Some(cd) = cache_dir.as_ref() {
+                                                            cache_write_smt_entails(cd, state_key, goal_sig, ent);
                                                         }
+                                                        cached = Some(ent);
                                                     }
                                                 }
-                                                if cached == Some(true) {
-                                                    score = score.saturating_sub(10_000);
-                                                }
+                                            }
+                                            if cached == Some(true) {
+                                                score = score.saturating_sub(10_000);
                                             }
                                         }
-                                        score
                                     }
-                                    #[cfg(not(feature = "smt"))]
-                                    {
-                                        score0
-                                    }
+                                    score
                                 };
                                 if best.as_ref().map(|(b, _)| score < *b).unwrap_or(true) {
                                     best = Some((score, s0));
@@ -4240,7 +4184,6 @@ Constraints:
                     // Optional SMT entailment signal for this hole (cache-only; no Lean calls here).
                     // This is used to re-rank candidates: if the goal is implied by a linear arithmetic fragment,
                     // prioritize arithmetic tactics; if not implied, de-prioritize them.
-                    #[cfg(feature = "smt")]
                     let (smt_entails_opt, smt_hint_json): (
                         Option<bool>,
                         Option<serde_json::Value>,
@@ -4371,10 +4314,6 @@ Constraints:
                     } else {
                         (None, None)
                     };
-                    #[cfg(not(feature = "smt"))]
-                    let smt_entails_opt: Option<bool> = None;
-                    #[cfg(not(feature = "smt"))]
-                    let smt_hint_json: Option<serde_json::Value> = None;
 
                     // If the goal looks “wide” or “context heavy”, we should prefer low-branching
                     // candidates even more aggressively.
@@ -5748,11 +5687,8 @@ Constraints:
                     (prof_planner_ms, planner_cache_hits, planner_cache_misses);
                 #[cfg(not(feature = "planner"))]
                 let (planner_ms_u64, planner_hits_u64, planner_misses_u64) = (0u64, 0u64, 0u64);
-                #[cfg(feature = "smt")]
                 let (smt_ms_u64, smt_hits_u64, smt_misses_u64) =
                     (prof_smt_ms, smt_cache_hits, smt_cache_misses);
-                #[cfg(not(feature = "smt"))]
-                let (smt_ms_u64, smt_hits_u64, smt_misses_u64) = (0u64, 0u64, 0u64);
                 let accounted = prof_verify_baseline_ms
                     .saturating_add(prof_verify_nodes_ms)
                     .saturating_add(prof_goal_dump_ms)

@@ -25,11 +25,10 @@ url = { version = "2.5.4", optional = true }
 smtkit = { path = "../../smtkit" }
 
 [features]
-# Default should include SMT prechecks in normal builds.
-default = ["smt"]
+# Keep defaults minimal; SMT is always available in the CLI.
+default = []
 lean-embed = ["dep:proofpatch-lean-embed", "proofpatch-lean-embed/enabled"]
 lsp = ["dep:lsp-types", "dep:url"]
 planner = []
-smt = []
 axi-agent = []
 
