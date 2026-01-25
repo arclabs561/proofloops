@@ -30,6 +30,10 @@ pub struct ResearchPreset {
     pub llm_summary: bool,
     #[serde(default = "default_llm_timeout_s")]
     pub llm_timeout_s: u64,
+    /// Which structured summary schema to request from the LLM.
+    /// Examples: "formalization_v1", "formalization_v2".
+    #[serde(default)]
+    pub llm_summary_kind: Option<String>,
 }
 
 fn default_max_results() -> usize {

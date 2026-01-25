@@ -69,6 +69,63 @@ struct ResearchTop {
     pub urls: Vec<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+struct ResearchSummaryV2 {
+    pub top: Vec<ResearchTop>,
+    /// Mathematical keywords (paper/theory side).
+    #[schemars(required)]
+    #[serde(default)]
+    pub math_keywords: Vec<String>,
+    /// Mathlib identifiers (Lean side), suitable for `#check`/`#find?` seeds.
+    #[schemars(required)]
+    #[serde(default)]
+    pub mathlib_idents: Vec<String>,
+    /// Search strings (not code) to try in Lean or grep (e.g. "GramSchmidt norm_sq").
+    #[schemars(required)]
+    #[serde(default)]
+    pub search_queries: Vec<String>,
+    #[schemars(required)]
+    #[serde(default)]
+    pub proof_shape: Vec<String>,
+    #[schemars(required)]
+    #[serde(default)]
+    pub pitfalls: Vec<String>,
+}
+
+fn research_summary_kind_default() -> &'static str {
+    "formalization_v1"
+}
+
+fn normalize_summary_kind(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+fn research_summary_system_prompt(kind: &str) -> String {
+    let kind = normalize_summary_kind(kind);
+    match kind.as_str() {
+        "formalization_v2" => [
+            "You are a research assistant for Lean/mathlib formalization.",
+            "You will be given a small list of arXiv papers (title/abstract).",
+            "CRITICAL:",
+            "- Return STRICT JSON only (no markdown, no fences).",
+            "- Do NOT invent Lean theorem statements or pseudo-code like `theorem foo : ...`.",
+            "- Prefer mathlib identifiers that actually exist (or are plausible) and search queries we can run.",
+        ]
+        .join("\n"),
+        _ => [
+            "You are a research assistant for Lean/mathlib formalization.",
+            "Given a small list of arXiv papers (title/abstract), extract what helps formalization.",
+            "CRITICAL: do NOT invent Lean theorem statements or pseudo-code like `theorem foo : ...`.",
+            "Instead, output mathlib-searchable keywords and concrete proof-shape notes.",
+            "Return STRICT JSON (no markdown) with keys exactly:",
+            r#"{"top":[{"title":"...","why":"...","urls":["..."]}],"math_keywords":["..."],"mathlib_search":["..."],"proof_shape":["..."],"pitfalls":["..."]}"#,
+        ]
+        .join("\n"),
+    }
+}
+
 // NOTE: Advanced “agent tool-calling” mode (axi-based) is not part of the public, standalone
 // build of proofpatch-core. Keep `proofpatch` usable without any extra workspace crates.
 
@@ -7319,15 +7376,8 @@ Constraints:
                         plc::load_dotenv_smart(&cwd);
                     }
                 }
-                let system = [
-                    "You are a research assistant for Lean/mathlib formalization.",
-                    "Given a small list of arXiv papers (title/abstract), extract what helps formalization.",
-                    "CRITICAL: do NOT invent Lean theorem statements or pseudo-code like `theorem foo : ...`.",
-                    "Instead, output mathlib-searchable keywords and concrete proof-shape notes.",
-                    "Return STRICT JSON (no markdown) with keys exactly:",
-                    r#"{"top":[{"title":"...","why":"...","urls":["..."]}],"math_keywords":["..."],"mathlib_search":["..."],"proof_shape":["..."],"pitfalls":["..."]}"#,
-                ]
-                .join("\n");
+                let kind = research_summary_kind_default();
+                let system = research_summary_system_prompt(kind);
                 let user = serde_json::to_string(&json!({"query": query, "papers": papers}))
                     .unwrap_or_else(|_| "{\"papers\":[]}".to_string());
                 let res = rt.block_on(plc::llm::chat_completion_structured::<ResearchSummary>(
@@ -7345,6 +7395,7 @@ Constraints:
                             "model_source": r.model_source,
                             "model_env": r.model_env,
                             "mode": r.mode,
+                            "kind": kind,
                             "content": serde_json::to_string(&r.value).unwrap_or_default(),
                             "content_struct": v,
                             "raw": r.raw
@@ -7467,39 +7518,48 @@ Constraints:
             });
 
             if preset.llm_summary {
-                let system = [
-                    "You are a research assistant for Lean/mathlib formalization.",
-                    "Given a small list of arXiv papers (title/abstract), extract what helps formalization.",
-                    "CRITICAL: do NOT invent Lean theorem statements or pseudo-code like `theorem foo : ...`.",
-                    "Instead, output mathlib-searchable keywords and concrete proof-shape notes.",
-                    "Return STRICT JSON (no markdown) with keys exactly:",
-                    r#"{"top":[{"title":"...","why":"...","urls":["..."]}],"math_keywords":["..."],"mathlib_search":["..."],"proof_shape":["..."],"pitfalls":["..."]}"#,
-                ]
-                .join("\n");
+                let kind = preset
+                    .llm_summary_kind
+                    .as_deref()
+                    .unwrap_or(research_summary_kind_default());
+                let system = research_summary_system_prompt(kind);
                 let user = serde_json::to_string(&json!({
                     "preset": preset_name,
                     "query": out["arxiv"]["query"],
                     "papers": out["arxiv"]["papers"],
                 }))
                 .unwrap_or_else(|_| "{\"papers\":[]}".to_string());
-                let res = rt.block_on(plc::llm::chat_completion_structured::<ResearchSummary>(
-                    &system,
-                    &user,
-                    StdDuration::from_secs(preset.llm_timeout_s),
-                ));
+                let res = match normalize_summary_kind(kind).as_str() {
+                    "formalization_v2" => rt.block_on(plc::llm::chat_completion_structured::<ResearchSummaryV2>(
+                        &system,
+                        &user,
+                        StdDuration::from_secs(preset.llm_timeout_s),
+                    )).map(|r| {
+                        // Erase the type into JSON for downstream consumption.
+                        let v = serde_json::to_value(&r.value).unwrap_or(serde_json::Value::Null);
+                        (r.provider, r.model, r.model_source, r.model_env, r.mode, v, r.raw)
+                    }),
+                    _ => rt.block_on(plc::llm::chat_completion_structured::<ResearchSummary>(
+                        &system,
+                        &user,
+                        StdDuration::from_secs(preset.llm_timeout_s),
+                    )).map(|r| {
+                        let v = serde_json::to_value(&r.value).unwrap_or(serde_json::Value::Null);
+                        (r.provider, r.model, r.model_source, r.model_env, r.mode, v, r.raw)
+                    }),
+                };
                 match res {
-                    Ok(r) => {
-                        let v = serde_json::to_value(&r.value)
-                            .unwrap_or_else(|_| serde_json::Value::Null);
+                    Ok((provider, model, model_source, model_env, mode, v, raw)) => {
                         out["arxiv"]["llm_summary"] = json!({
-                            "provider": r.provider,
-                            "model": r.model,
-                            "model_source": r.model_source,
-                            "model_env": r.model_env,
-                            "mode": r.mode,
-                            "content": serde_json::to_string(&r.value).unwrap_or_default(),
+                            "provider": provider,
+                            "model": model,
+                            "model_source": model_source,
+                            "model_env": model_env,
+                            "mode": mode,
+                            "kind": kind,
+                            "content": v.to_string(),
                             "content_struct": v,
-                            "raw": r.raw
+                            "raw": raw
                         });
                     }
                     Err(e) => {
