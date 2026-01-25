@@ -39,6 +39,113 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     out
 }
 
+fn cap_string(s: &str, max_chars: usize) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    truncate_str(s, max_chars)
+}
+
+fn cap_string_list(xs: &mut Vec<String>, max_items: usize, max_chars: usize) {
+    // Trim, drop empties, dedupe (preserve first occurrence), then cap.
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for x in xs.drain(..) {
+        let x = cap_string(&x, max_chars);
+        if x.is_empty() {
+            continue;
+        }
+        if seen.insert(x.clone()) {
+            out.push(x);
+        }
+        if out.len() >= max_items {
+            break;
+        }
+    }
+    *xs = out;
+}
+
+fn cap_urls(urls: &mut Vec<String>, max_items: usize, max_chars: usize) {
+    cap_string_list(urls, max_items, max_chars);
+    urls.retain(|u| u.starts_with("http"));
+}
+
+fn cap_research_top(top: &mut Vec<ResearchTop>, max_top: usize, max_chars: usize) {
+    if top.len() > max_top {
+        top.truncate(max_top);
+    }
+    for t in top.iter_mut() {
+        t.title = cap_string(&t.title, max_chars);
+        t.why = cap_string(&t.why, max_chars * 2);
+        cap_urls(&mut t.urls, 3, max_chars);
+    }
+}
+
+fn cap_summary_v1(mut s: ResearchSummary, preset: &plc::config::ResearchPreset) -> ResearchSummary {
+    cap_research_top(&mut s.top, preset.llm_max_top, preset.llm_max_str_chars);
+    cap_string_list(
+        &mut s.math_keywords,
+        preset.llm_max_list_items,
+        preset.llm_max_str_chars,
+    );
+    cap_string_list(
+        &mut s.mathlib_search,
+        preset.llm_max_list_items,
+        preset.llm_max_str_chars,
+    );
+    cap_string_list(
+        &mut s.proof_shape,
+        preset.llm_max_list_items,
+        preset.llm_max_str_chars * 2,
+    );
+    cap_string_list(
+        &mut s.pitfalls,
+        preset.llm_max_list_items,
+        preset.llm_max_str_chars * 2,
+    );
+    s
+}
+
+fn cap_summary_v2(
+    mut s: ResearchSummaryV2,
+    preset: &plc::config::ResearchPreset,
+) -> ResearchSummaryV2 {
+    cap_research_top(&mut s.top, preset.llm_max_top, preset.llm_max_str_chars);
+    cap_string_list(
+        &mut s.math_keywords,
+        preset.llm_max_list_items,
+        preset.llm_max_str_chars,
+    );
+    cap_string_list(
+        &mut s.mathlib_idents,
+        preset.llm_max_list_items,
+        preset.llm_max_str_chars,
+    );
+    // Very light sanity filter: Lean-ish identifiers only.
+    s.mathlib_idents.retain(|id| {
+        !id.is_empty()
+            && id.len() <= preset.llm_max_str_chars
+            && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'' ))
+    });
+    cap_string_list(
+        &mut s.search_queries,
+        preset.llm_max_list_items,
+        preset.llm_max_str_chars,
+    );
+    cap_string_list(
+        &mut s.proof_shape,
+        preset.llm_max_list_items,
+        preset.llm_max_str_chars * 2,
+    );
+    cap_string_list(
+        &mut s.pitfalls,
+        preset.llm_max_list_items,
+        preset.llm_max_str_chars * 2,
+    );
+    s
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -7535,8 +7642,9 @@ Constraints:
                         &user,
                         StdDuration::from_secs(preset.llm_timeout_s),
                     )).map(|r| {
+                        let capped = cap_summary_v2(r.value, &preset);
                         // Erase the type into JSON for downstream consumption.
-                        let v = serde_json::to_value(&r.value).unwrap_or(serde_json::Value::Null);
+                        let v = serde_json::to_value(&capped).unwrap_or(serde_json::Value::Null);
                         (r.provider, r.model, r.model_source, r.model_env, r.mode, v, r.raw)
                     }),
                     _ => rt.block_on(plc::llm::chat_completion_structured::<ResearchSummary>(
@@ -7544,7 +7652,8 @@ Constraints:
                         &user,
                         StdDuration::from_secs(preset.llm_timeout_s),
                     )).map(|r| {
-                        let v = serde_json::to_value(&r.value).unwrap_or(serde_json::Value::Null);
+                        let capped = cap_summary_v1(r.value, &preset);
+                        let v = serde_json::to_value(&capped).unwrap_or(serde_json::Value::Null);
                         (r.provider, r.model, r.model_source, r.model_env, r.mode, v, r.raw)
                     }),
                 };

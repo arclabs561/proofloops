@@ -34,6 +34,15 @@ pub struct ResearchPreset {
     /// Examples: "formalization_v1", "formalization_v2".
     #[serde(default)]
     pub llm_summary_kind: Option<String>,
+    /// Cap: number of items in `top`.
+    #[serde(default = "default_llm_max_top")]
+    pub llm_max_top: usize,
+    /// Cap: number of items in each string list (keywords/idents/queries/etc).
+    #[serde(default = "default_llm_max_list_items")]
+    pub llm_max_list_items: usize,
+    /// Cap: max characters per emitted string item (Unicode scalar values).
+    #[serde(default = "default_llm_max_str_chars")]
+    pub llm_max_str_chars: usize,
 }
 
 fn default_max_results() -> usize {
@@ -46,6 +55,18 @@ fn default_timeout_ms() -> u64 {
 
 fn default_llm_timeout_s() -> u64 {
     20
+}
+
+fn default_llm_max_top() -> usize {
+    3
+}
+
+fn default_llm_max_list_items() -> usize {
+    12
+}
+
+fn default_llm_max_str_chars() -> usize {
+    160
 }
 
 pub fn config_path(repo_root: &Path) -> PathBuf {
