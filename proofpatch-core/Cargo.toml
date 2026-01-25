@@ -18,6 +18,7 @@ reqwest = { version = "0.13.1", features = ["json", "webpki-roots", "stream"] }
 sha2 = "0.10.9"
 hex = "0.4.3"
 schemars = { version = "1.2.0", features = ["derive"] }
+toml = "0.8"
 proofpatch-lean-embed = { path = "../proofpatch-lean-embed", optional = true }
 similar = "2"
 lsp-types = { version = "0.97.0", optional = true }

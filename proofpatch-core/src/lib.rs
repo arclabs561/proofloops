@@ -32,6 +32,7 @@ use tokio::process::Command;
 
 pub mod json_extract;
 pub mod arxiv;
+pub mod config;
 pub mod llm;
 #[cfg(feature = "lsp")]
 mod lsp_client;
@@ -1700,8 +1701,8 @@ pub fn build_rubberduck_prompt(
         "goal": "Collect a reliable statement and a Lean mapping plan.",
         "steps": [
             {
-                "tool": "proofpatch arxiv-search",
-                "args": { "query": q, "max_results": 8, "llm_summary": true }
+                "tool": "proofpatch research-auto",
+                "args": { "repo": "<repo_root>", "preset": "<preset_name>" }
             },
             {
                 "tool": "web_search",
@@ -1805,7 +1806,7 @@ pub fn build_rubberduck_prompt_from_excerpt(
     let plan = serde_json::json!({
         "goal": "Collect a reliable statement and a Lean mapping plan.",
         "steps": [
-            { "tool": "proofpatch arxiv-search", "args": { "query": q, "max_results": 8, "llm_summary": true } },
+            { "tool": "proofpatch research-auto", "args": { "repo": "<repo_root>", "preset": "<preset_name>" } },
             { "tool": "web_search", "args": { "query": web_q, "max_results": 5 } }
         ],
         "extract": {
