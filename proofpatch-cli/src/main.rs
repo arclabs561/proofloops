@@ -2,6 +2,7 @@
 
 use proofpatch_core as plc;
 use serde_json::json;
+use schemars::JsonSchema;
 use similar::TextDiff;
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
@@ -36,6 +37,36 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars).collect();
     out.push_str("…");
     out
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+struct ResearchSummary {
+    pub top: Vec<ResearchTop>,
+    #[schemars(required)]
+    #[serde(default)]
+    pub math_keywords: Vec<String>,
+    #[schemars(required)]
+    #[serde(default)]
+    pub mathlib_search: Vec<String>,
+    #[schemars(required)]
+    #[serde(default)]
+    pub proof_shape: Vec<String>,
+    #[schemars(required)]
+    #[serde(default)]
+    pub pitfalls: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+struct ResearchTop {
+    pub title: String,
+    pub why: String,
+    #[schemars(required)]
+    #[serde(default)]
+    pub urls: Vec<String>,
 }
 
 // NOTE: Advanced “agent tool-calling” mode (axi-based) is not part of the public, standalone
@@ -7266,9 +7297,12 @@ Constraints:
                     "tool": "arxiv",
                     "papers": papers.iter().map(|p| json!({
                         "title": p.title,
+                        // Use a canonical `url` key so downstream ingestion reliably captures snippets.
+                        "url": p.link,
                         "link": p.link,
                         "pdf_url": p.pdf_url,
                         "abstract": p.abstract_text,
+                        "snippet": truncate_str(&p.abstract_text, 400),
                         "authors": p.authors,
                         "published": p.published,
                         "updated": p.updated,
@@ -7287,29 +7321,32 @@ Constraints:
                 }
                 let system = [
                     "You are a research assistant for Lean/mathlib formalization.",
-                    "Given a small list of arXiv papers (title/abstract), select the 3 most relevant and:",
-                    "- explain why they matter for the user's goal (brief),",
-                    "- extract 3-6 concrete lemma targets / proof-shape insights to mirror in Lean.",
-                    "Return STRICT JSON (no markdown) with keys:",
-                    r#"{"top":[{"title":"...","why":"..."}],"lemma_targets":["..."],"notes":["..."]}"#,
+                    "Given a small list of arXiv papers (title/abstract), extract what helps formalization.",
+                    "CRITICAL: do NOT invent Lean theorem statements or pseudo-code like `theorem foo : ...`.",
+                    "Instead, output mathlib-searchable keywords and concrete proof-shape notes.",
+                    "Return STRICT JSON (no markdown) with keys exactly:",
+                    r#"{"top":[{"title":"...","why":"...","urls":["..."]}],"math_keywords":["..."],"mathlib_search":["..."],"proof_shape":["..."],"pitfalls":["..."]}"#,
                 ]
                 .join("\n");
                 let user = serde_json::to_string(&json!({"query": query, "papers": papers}))
                     .unwrap_or_else(|_| "{\"papers\":[]}".to_string());
-                let res = rt.block_on(plc::llm::chat_completion(
+                let res = rt.block_on(plc::llm::chat_completion_structured::<ResearchSummary>(
                     &system,
                     &user,
                     StdDuration::from_secs(llm_timeout_s),
                 ));
                 match res {
                     Ok(r) => {
+                        let v = serde_json::to_value(&r.value)
+                            .unwrap_or_else(|_| serde_json::Value::Null);
                         out["llm_summary"] = json!({
                             "provider": r.provider,
                             "model": r.model,
                             "model_source": r.model_source,
                             "model_env": r.model_env,
-                            "content": r.content,
-                            "content_struct": extract_json_from_text(&r.content),
+                            "mode": r.mode,
+                            "content": serde_json::to_string(&r.value).unwrap_or_default(),
+                            "content_struct": v,
                             "raw": r.raw
                         });
                     }
@@ -7416,9 +7453,11 @@ Constraints:
                         "tool": "arxiv",
                         "papers": papers.iter().map(|p| json!({
                             "title": p.title,
+                            "url": p.link,
                             "link": p.link,
                             "pdf_url": p.pdf_url,
                             "abstract": p.abstract_text,
+                            "snippet": truncate_str(&p.abstract_text, 400),
                             "authors": p.authors,
                             "published": p.published,
                             "updated": p.updated,
@@ -7430,11 +7469,11 @@ Constraints:
             if preset.llm_summary {
                 let system = [
                     "You are a research assistant for Lean/mathlib formalization.",
-                    "Given a small list of arXiv papers (title/abstract), select the 3 most relevant and:",
-                    "- explain why they matter for the user's goal (brief),",
-                    "- extract 3-6 concrete lemma targets / proof-shape insights to mirror in Lean.",
-                    "Return STRICT JSON (no markdown) with keys:",
-                    r#"{"top":[{"title":"...","why":"..."}],"lemma_targets":["..."],"notes":["..."]}"#,
+                    "Given a small list of arXiv papers (title/abstract), extract what helps formalization.",
+                    "CRITICAL: do NOT invent Lean theorem statements or pseudo-code like `theorem foo : ...`.",
+                    "Instead, output mathlib-searchable keywords and concrete proof-shape notes.",
+                    "Return STRICT JSON (no markdown) with keys exactly:",
+                    r#"{"top":[{"title":"...","why":"...","urls":["..."]}],"math_keywords":["..."],"mathlib_search":["..."],"proof_shape":["..."],"pitfalls":["..."]}"#,
                 ]
                 .join("\n");
                 let user = serde_json::to_string(&json!({
@@ -7443,20 +7482,23 @@ Constraints:
                     "papers": out["arxiv"]["papers"],
                 }))
                 .unwrap_or_else(|_| "{\"papers\":[]}".to_string());
-                let res = rt.block_on(plc::llm::chat_completion(
+                let res = rt.block_on(plc::llm::chat_completion_structured::<ResearchSummary>(
                     &system,
                     &user,
                     StdDuration::from_secs(preset.llm_timeout_s),
                 ));
                 match res {
                     Ok(r) => {
+                        let v = serde_json::to_value(&r.value)
+                            .unwrap_or_else(|_| serde_json::Value::Null);
                         out["arxiv"]["llm_summary"] = json!({
                             "provider": r.provider,
                             "model": r.model,
                             "model_source": r.model_source,
                             "model_env": r.model_env,
-                            "content": r.content,
-                            "content_struct": extract_json_from_text(&r.content),
+                            "mode": r.mode,
+                            "content": serde_json::to_string(&r.value).unwrap_or_default(),
+                            "content_struct": v,
                             "raw": r.raw
                         });
                     }

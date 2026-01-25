@@ -216,7 +216,7 @@ fn should_ignore_url(url: &str) -> bool {
 fn collect_research_sources(
     v: &serde_json::Value,
     out: &mut Vec<ResearchSource>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashMap<String, usize>,
     raw_urls: &mut usize,
     current_origin: Option<&str>,
 ) {
@@ -256,17 +256,36 @@ fn collect_research_sources(
                 *raw_urls += 1;
                 let canonical = canonicalize_url(url);
                 let key = canonical.as_deref().unwrap_or(url).to_string();
-                if seen.insert(key) {
-                    let title = pick_string_field(obj, &["title", "name"]).map(|s| s.to_string());
-                    let snippet = pick_string_field(
-                        obj,
-                        &["snippet", "summary", "content", "text", "abstract"],
-                    )
-                    .map(|s| s.to_string());
-                    let origin =
-                        pick_string_field(obj, &["origin", "source", "server", "tool", "toolName"])
-                            .map(|s| s.to_string())
-                            .or_else(|| origin_here.clone());
+                let title = pick_string_field(obj, &["title", "name"]).map(|s| s.to_string());
+                let snippet =
+                    pick_string_field(obj, &["snippet", "summary", "content", "text", "abstract"])
+                        .map(|s| s.to_string());
+                let origin =
+                    pick_string_field(obj, &["origin", "source", "server", "tool", "toolName"])
+                        .map(|s| s.to_string())
+                        .or_else(|| origin_here.clone());
+
+                // Dedupe, but "enrich" earlier hits: a URL might appear first in an LLM
+                // summary without snippet text, then later as a full paper record with abstract.
+                if let Some(&idx) = seen.get(&key) {
+                    if let Some(s) = snippet {
+                        if out[idx].snippet.as_deref().unwrap_or("").trim().is_empty() {
+                            out[idx].snippet = Some(s);
+                        }
+                    }
+                    if let Some(t) = title {
+                        if out[idx].title.as_deref().unwrap_or("").trim().is_empty() {
+                            out[idx].title = Some(t);
+                        }
+                    }
+                    if let Some(o) = origin {
+                        if out[idx].origin.as_deref().unwrap_or("").trim().is_empty() {
+                            out[idx].origin = Some(o);
+                        }
+                    }
+                } else {
+                    let idx = out.len();
+                    seen.insert(key, idx);
                     out.push(ResearchSource {
                         url: url.to_string(),
                         canonical_url: canonical,
@@ -294,7 +313,7 @@ fn collect_research_sources(
 
 pub fn ingest_research_json(v: &serde_json::Value) -> ResearchNotes {
     let mut sources = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     let mut raw_urls = 0usize;
     collect_research_sources(v, &mut sources, &mut seen, &mut raw_urls, None);
     ResearchNotes {

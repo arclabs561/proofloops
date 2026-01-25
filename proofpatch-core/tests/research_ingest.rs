@@ -72,3 +72,29 @@ fn ingest_propagates_origin_and_canonicalizes_arxiv_pdf() {
     );
     assert_eq!(arxiv_abs.origin.as_deref(), Some("arxiv"));
 }
+
+#[test]
+fn ingest_enriches_duplicate_urls_with_later_snippet() {
+    // Same URL appears twice:
+    // - first occurrence has no snippet (common when URLs show up in an LLM summary)
+    // - later occurrence includes `abstract` / `snippet`
+    //
+    // We should keep one source, and prefer the richer fields.
+    let v = serde_json::json!({
+        "llm_summary": {
+            "top": [
+                { "title": "Paper", "urls": ["https://example.com/p"] }
+            ]
+        },
+        "papers": [
+            { "title": "Paper Better Title", "url": "https://example.com/p", "abstract": "this is the abstract" }
+        ]
+    });
+
+    let notes = ingest_research_json(&v);
+    assert_eq!(notes.deduped_urls, 1);
+    let s = &notes.sources[0];
+    assert_eq!(s.url, "https://example.com/p");
+    assert_eq!(s.title.as_deref(), Some("Paper Better Title"));
+    assert_eq!(s.snippet.as_deref(), Some("this is the abstract"));
+}

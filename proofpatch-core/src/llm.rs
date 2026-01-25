@@ -1,6 +1,24 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredChatResult<T> {
+    pub provider: String,
+    pub model: String,
+    pub model_source: String,
+    pub model_env: String,
+    /// Parsed, schema-validated-ish value (tool-calling or fallback JSON extraction).
+    pub value: T,
+    /// How we got `value`.
+    /// - "tool_call": extracted from `message.tool_calls[*].function.arguments`
+    /// - "content_json": parsed from `message.content` as JSON
+    /// - "content_extract": extracted JSON blob from `message.content`
+    pub mode: String,
+    /// Raw provider response (OpenAI-compatible envelope), with injected provider/model metadata.
+    pub raw: Value,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResult {
@@ -365,6 +383,7 @@ pub async fn chat_completion(
 pub async fn chat_completion_raw(
     messages: &[serde_json::Value],
     tools: Option<&serde_json::Value>,
+    tool_choice: Option<&serde_json::Value>,
     timeout: Duration,
 ) -> Result<serde_json::Value, String> {
     let (provider, model, model_source) = select_provider(Duration::from_secs(3)).await?;
@@ -411,7 +430,11 @@ pub async fn chat_completion_raw(
     });
     if let Some(t) = tools {
         payload["tools"] = t.clone();
-        payload["tool_choice"] = serde_json::json!("auto");
+        if let Some(tc) = tool_choice {
+            payload["tool_choice"] = tc.clone();
+        } else {
+            payload["tool_choice"] = serde_json::json!("auto");
+        }
     }
 
     let url = format!("{}/chat/completions", provider.base_url);
@@ -457,6 +480,205 @@ pub async fn chat_completion_raw(
         );
     }
     Ok(raw)
+}
+
+fn tool_schema_for<T: schemars::JsonSchema>() -> Result<serde_json::Value, String> {
+    let schema = schemars::schema_for!(T);
+    serde_json::to_value(&schema).map_err(|e| format!("json schema encode failed: {e}"))
+}
+
+fn extract_tool_call_arguments<'a>(
+    raw: &'a serde_json::Value,
+    tool_name: &str,
+) -> Option<Cow<'a, str>> {
+    // OpenAI-style:
+    // choices[0].message.tool_calls[0].function = { name, arguments: "<json string>" }
+    let tc = raw
+        .get("choices")?
+        .as_array()?
+        .get(0)?
+        .get("message")?
+        .get("tool_calls")?
+        .as_array()?
+        .iter()
+        .find_map(|x| {
+            let func = x.get("function")?.as_object()?;
+            let name = func.get("name")?.as_str()?;
+            if name != tool_name {
+                return None;
+            }
+            let args = func.get("arguments")?.as_str()?;
+            Some(Cow::Borrowed(args))
+        });
+    tc
+}
+
+fn extract_message_content<'a>(raw: &'a serde_json::Value) -> Option<&'a str> {
+    raw.get("choices")?
+        .as_array()?
+        .get(0)?
+        .get("message")?
+        .get("content")?
+        .as_str()
+}
+
+/// Structured output helper: prefer tool-calling with a JSON Schema, fall back to content parsing.
+///
+/// This is designed to be robust across OpenAI-compatible providers:
+/// - Some support tools/function-calling; we force a single tool.
+/// - Some ignore tools; we fall back to `message.content` JSON extraction.
+pub async fn chat_completion_structured<T>(
+    system: &str,
+    user: &str,
+    timeout: Duration,
+) -> Result<StructuredChatResult<T>, String>
+where
+    T: schemars::JsonSchema + serde::de::DeserializeOwned,
+{
+    let tool_name = "emit";
+    let schema = tool_schema_for::<T>()?;
+    let tools = serde_json::json!([{
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": "Return a single JSON object exactly matching the provided schema.",
+            "parameters": schema
+        }
+    }]);
+    let tool_choice = serde_json::json!({
+        "type": "function",
+        "function": { "name": tool_name }
+    });
+
+    let messages = [
+        serde_json::json!({ "role": "system", "content": system }),
+        serde_json::json!({ "role": "user", "content": user }),
+    ];
+
+    // Try the structured path first.
+    let raw = match chat_completion_raw(&messages, Some(&tools), Some(&tool_choice), timeout).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // Fallback: older/simple providers might not support tool calling at all.
+            let done = chat_completion(system, user, timeout).await?;
+            let content = done.content;
+            let mode;
+            let value: T = if let Ok(v) = serde_json::from_str::<T>(&content) {
+                mode = "content_json".to_string();
+                v
+            } else if let Some(vv) = crate::json_extract::extract_first_json_value(&content) {
+                mode = "content_extract".to_string();
+                serde_json::from_value(vv).map_err(|e| format!("structured json decode: {e}"))?
+            } else {
+                return Err(format!("structured tool-calling failed ({e}); content parse also failed"));
+            };
+            return Ok(StructuredChatResult {
+                provider: done.provider,
+                model: done.model,
+                model_source: done.model_source,
+                model_env: done.model_env,
+                value,
+                mode,
+                raw: done.raw,
+            });
+        }
+    };
+
+    // Tool-call extraction.
+    if let Some(args) = extract_tool_call_arguments(&raw, tool_name) {
+        let v_json: serde_json::Value =
+            serde_json::from_str(&args).map_err(|e| format!("tool args json parse failed: {e}"))?;
+        let value: T =
+            serde_json::from_value(v_json).map_err(|e| format!("tool args decode failed: {e}"))?;
+        return Ok(StructuredChatResult {
+            provider: raw
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            model: raw
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            model_source: raw
+                .get("model_source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            model_env: raw
+                .get("model_env")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            value,
+            mode: "tool_call".to_string(),
+            raw,
+        });
+    }
+
+    // Fallback to content parse if provider ignored tools.
+    if let Some(content) = extract_message_content(&raw) {
+        if let Ok(v) = serde_json::from_str::<T>(content) {
+            return Ok(StructuredChatResult {
+                provider: raw
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                model: raw
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                model_source: raw
+                    .get("model_source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                model_env: raw
+                    .get("model_env")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                value: v,
+                mode: "content_json".to_string(),
+                raw,
+            });
+        }
+        if let Some(vv) = crate::json_extract::extract_first_json_value(content) {
+            let v: T =
+                serde_json::from_value(vv).map_err(|e| format!("structured json decode: {e}"))?;
+            return Ok(StructuredChatResult {
+                provider: raw
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                model: raw
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                model_source: raw
+                    .get("model_source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                model_env: raw
+                    .get("model_env")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                value: v,
+                mode: "content_extract".to_string(),
+                raw,
+            });
+        }
+    }
+
+    Err("structured completion: no tool_call arguments and no parseable content".to_string())
 }
 
 #[cfg(test)]
