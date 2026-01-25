@@ -82,7 +82,10 @@ fn cap_research_top(top: &mut Vec<ResearchTop>, max_top: usize, max_chars: usize
     }
 }
 
-fn cap_summary_v1(mut s: ResearchSummary, preset: &plc::config::ResearchPreset) -> ResearchSummary {
+fn cap_summary_v1(
+    mut s: ResearchSummary,
+    preset: &plc::config::ResearchPresetResolved,
+) -> ResearchSummary {
     cap_research_top(&mut s.top, preset.llm_max_top, preset.llm_max_str_chars);
     cap_string_list(
         &mut s.math_keywords,
@@ -109,7 +112,7 @@ fn cap_summary_v1(mut s: ResearchSummary, preset: &plc::config::ResearchPreset) 
 
 fn cap_summary_v2(
     mut s: ResearchSummaryV2,
-    preset: &plc::config::ResearchPreset,
+    preset: &plc::config::ResearchPresetResolved,
 ) -> ResearchSummaryV2 {
     cap_research_top(&mut s.top, preset.llm_max_top, preset.llm_max_str_chars);
     cap_string_list(
@@ -7556,9 +7559,7 @@ Constraints:
                 .ok_or_else(|| format!("missing config: {}", plc::config::config_path(&repo_root).display()))?;
             let preset = cfg
                 .research
-                .presets
-                .get(&preset_name)
-                .cloned()
+                .resolve_preset(&preset_name)
                 .ok_or_else(|| {
                     let mut names: Vec<String> = cfg.research.presets.keys().cloned().collect();
                     names.sort();
