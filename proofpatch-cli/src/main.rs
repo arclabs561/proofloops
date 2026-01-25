@@ -824,6 +824,7 @@ fn usage() -> String {
         "  lint-style  --repo <path> [--github] --module <Root> [--module <Root> ...]",
         "  report      --repo <path> --files <relpath>... [--timeout-s N] [--max-sorries N] [--context-lines N] [--include-raw-verify] [--output-html <path>]",
         "  arxiv-search --query <text> [--max-results N] [--timeout-ms N] [--must-include <tok> ...] [--llm-summary] [--llm-timeout-s N] [--quiet] [--output-json <path>]",
+        "  research-auto --repo <path> --preset <name> [--quiet] [--output-json <path>]",
         "  research-ingest --input <path> [--output-json <path>]",
         "  research-attach --report-json <path> --research-notes <path> [--top-k N] [--output-json <path>]",
         "  context-pack --repo <path> --file <relpath> [--decl <name> | --line N] [--context-lines N] [--nearby-lines N] [--max-nearby N] [--max-imports N]",
@@ -7329,6 +7330,154 @@ Constraints:
                     papers.len(),
                     truncate_str(&query, 120),
                     serde_json::to_string(&titles).unwrap_or_else(|_| "[]".to_string())
+                );
+            }
+
+            if let Some(p) = output_json {
+                write_json(&p, &out)?;
+                println!("{}", json!({"ok": true, "written": p.display().to_string()}).to_string());
+            } else {
+                println!("{}", out.to_string());
+            }
+            Ok(())
+        }
+
+        "research-auto" => {
+            let repo_root = arg_value(rest, "--repo")
+                .ok_or_else(|| "missing --repo".to_string())
+                .map(PathBuf::from)?;
+            let preset_name =
+                arg_value(rest, "--preset").ok_or_else(|| "missing --preset".to_string())?;
+            let quiet = arg_flag(rest, "--quiet");
+            let output_json = arg_value(rest, "--output-json").map(PathBuf::from);
+
+            let repo_root =
+                plc::find_lean_repo_root(&repo_root).map_err(|e| format!("repo_root: {e}"))?;
+
+            // Ensure keys are visible from either <repo>/.env or dev/.env.
+            plc::load_dotenv_smart(&repo_root);
+
+            let cfg = plc::config::load_from_repo_root(&repo_root)?
+                .ok_or_else(|| format!("missing config: {}", plc::config::config_path(&repo_root).display()))?;
+            let preset = cfg
+                .research
+                .presets
+                .get(&preset_name)
+                .cloned()
+                .ok_or_else(|| {
+                    let mut names: Vec<String> = cfg.research.presets.keys().cloned().collect();
+                    names.sort();
+                    format!(
+                        "unknown preset: {} (available: {})",
+                        preset_name,
+                        names.join(", ")
+                    )
+                })?;
+
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+
+            let mut papers = rt.block_on(plc::arxiv::arxiv_search(
+                &preset.query,
+                preset.max_results,
+                StdDuration::from_millis(preset.timeout_ms),
+            ))?;
+
+            if !preset.must_include_any.is_empty() {
+                let must_l: Vec<String> = preset
+                    .must_include_any
+                    .iter()
+                    .map(|s| s.to_lowercase())
+                    .collect();
+                papers = papers
+                    .into_iter()
+                    .filter(|p| {
+                        let hay = format!("{}\n{}", p.title, p.abstract_text).to_lowercase();
+                        must_l.iter().any(|tok| hay.contains(tok))
+                    })
+                    .collect();
+            }
+
+            let mut out = json!({
+                "ok": true,
+                "kind": "research_auto",
+                "repo_root": repo_root.display().to_string(),
+                "config_path": plc::config::config_path(&repo_root).display().to_string(),
+                "preset": preset_name,
+                "settings": preset,
+                "arxiv": {
+                    "ok": true,
+                    "kind": "arxiv_search",
+                    "query": preset.query,
+                    "max_results": preset.max_results,
+                    "filter": { "must_include_any": preset.must_include_any },
+                    "papers": papers,
+                    "research": {
+                        "tool": "arxiv",
+                        "papers": papers.iter().map(|p| json!({
+                            "title": p.title,
+                            "link": p.link,
+                            "pdf_url": p.pdf_url,
+                            "abstract": p.abstract_text,
+                            "authors": p.authors,
+                            "published": p.published,
+                            "updated": p.updated,
+                        })).collect::<Vec<_>>()
+                    }
+                }
+            });
+
+            if preset.llm_summary {
+                let system = [
+                    "You are a research assistant for Lean/mathlib formalization.",
+                    "Given a small list of arXiv papers (title/abstract), select the 3 most relevant and:",
+                    "- explain why they matter for the user's goal (brief),",
+                    "- extract 3-6 concrete lemma targets / proof-shape insights to mirror in Lean.",
+                    "Return STRICT JSON (no markdown) with keys:",
+                    r#"{"top":[{"title":"...","why":"..."}],"lemma_targets":["..."],"notes":["..."]}"#,
+                ]
+                .join("\n");
+                let user = serde_json::to_string(&json!({
+                    "preset": preset_name,
+                    "query": out["arxiv"]["query"],
+                    "papers": out["arxiv"]["papers"],
+                }))
+                .unwrap_or_else(|_| "{\"papers\":[]}".to_string());
+                let res = rt.block_on(plc::llm::chat_completion(
+                    &system,
+                    &user,
+                    StdDuration::from_secs(preset.llm_timeout_s),
+                ));
+                match res {
+                    Ok(r) => {
+                        out["arxiv"]["llm_summary"] = json!({
+                            "provider": r.provider,
+                            "model": r.model,
+                            "model_source": r.model_source,
+                            "model_env": r.model_env,
+                            "content": r.content,
+                            "content_struct": extract_json_from_text(&r.content),
+                            "raw": r.raw
+                        });
+                    }
+                    Err(e) => {
+                        out["arxiv"]["llm_summary"] = json!({"ok": false, "error": e});
+                    }
+                }
+            }
+
+            // Emit a ready-to-consume note bundle for `research-attach`.
+            let notes = plc::ingest_research_json(&out);
+            out["research_notes"] = serde_json::to_value(notes)
+                .map_err(|e| format!("failed to serialize research notes: {e}"))?;
+
+            if !quiet {
+                let n = out["research_notes"]["deduped_urls"].as_u64().unwrap_or(0);
+                eprintln!(
+                    "research-auto: preset={} urls={} repo={}",
+                    preset_name,
+                    n,
+                    repo_root.display()
                 );
             }
 
