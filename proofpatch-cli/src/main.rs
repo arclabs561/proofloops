@@ -4344,7 +4344,7 @@ Constraints:
 
                     // Optional: if deterministic tactics stalled, opportunistically ask the LLM
                     // for more candidates for this exact region.
-                    let candidates_here = if escalate_llm
+                    let mut candidates_here = if escalate_llm
                         && candidates_mode != "llm"
                         && is_made_no_progress(parent_first_error)
                     {
@@ -4557,6 +4557,23 @@ Constraints:
                     } else {
                         (None, None)
                     };
+
+                    // If SMT says the local LIA fragment entails the target, inject a few
+                    // deterministic arithmetic tactics at the front. This makes the SMT signal
+                    // *actionable* rather than only a ranking hint.
+                    if smt_entails_opt == Some(true) {
+                        // Candidates are proof-term replacements inside an existing `by` block,
+                        // so these are tactics, not `by ...`.
+                        let mut inject = vec![
+                            "omega".to_string(),
+                            "linarith".to_string(),
+                            "nlinarith".to_string(),
+                            "simp; omega".to_string(),
+                        ];
+                        // Prepend and then sanitize/dedupe/bound later.
+                        inject.extend(candidates_here.into_iter());
+                        candidates_here = sanitize_candidates(inject);
+                    }
 
                     // If the goal looks “wide” or “context heavy”, we should prefer low-branching
                     // candidates even more aggressively.
