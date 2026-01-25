@@ -34,6 +34,7 @@ pub mod json_extract;
 pub mod arxiv;
 pub mod config;
 pub mod llm;
+pub mod smt_lia;
 #[cfg(feature = "lsp")]
 mod lsp_client;
 #[cfg(feature = "planner")]

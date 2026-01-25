@@ -45,6 +45,14 @@ use schemars::JsonSchema;
 #[cfg(feature = "stdio")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "stdio")]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+struct UnifiedArgs {
+    action: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
 fn default_proofpatch_root() -> PathBuf {
     // `.../proofpatch/mcp-server` → `.../proofpatch`
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -239,6 +247,52 @@ impl Tool for ProofpatchPromptTool {
         let repo_root = resolve_lean_repo_root(repo_root, Some(&file))?;
         let payload = plc::build_proof_prompt(&repo_root, &file, &lemma)?;
         serde_json::to_value(payload).map_err(|e| format!("failed to serialize payload: {}", e))
+    }
+}
+
+/// Single-entrypoint tool to simplify the MCP surface.
+///
+/// Callers pass `{ "action": "...", "arguments": { ... } }` and we dispatch to the underlying
+/// tool implementations. This keeps the tool list small while preserving capability.
+struct ProofpatchTool;
+
+#[async_trait]
+impl Tool for ProofpatchTool {
+    fn description(&self) -> &str {
+        "Unified entrypoint for proofpatch (dispatches to sub-actions)."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "One of: triage_file, tree_search_nearest, context_pack, verify_summary, locate_sorries, patch_nearest, patch_region"
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "Arguments for the chosen action (same shape as the underlying tool).",
+                    "default": {}
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn call(&self, args: &Value) -> Result<Value, String> {
+        let action = extract_string(args, "action")?.trim().to_lowercase();
+        let sub = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        match action.as_str() {
+            "triage_file" => ProofpatchTriageFileTool.call(&sub).await,
+            "tree_search_nearest" => ProofpatchTreeSearchNearestTool.call(&sub).await,
+            "context_pack" => ProofpatchContextPackTool.call(&sub).await,
+            "verify_summary" => ProofpatchVerifySummaryTool.call(&sub).await,
+            "locate_sorries" => ProofpatchLocateSorriesTool.call(&sub).await,
+            "patch_nearest" => ProofpatchPatchNearestTool.call(&sub).await,
+            "patch_region" => ProofpatchPatchRegionTool.call(&sub).await,
+            other => Err(format!("unknown action: {other}")),
+        }
     }
 }
 
@@ -710,6 +764,21 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                     "default": false,
                     "description": "If true, run a goal-dump pass on the nearest sorry and include it in output."
                 },
+                "smt_precheck": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "If true, run a best-effort SMT (QF_LIA) entailment check on hyps ⇒ target and prioritize arithmetic tactics when it succeeds."
+                },
+                "smt_timeout_ms": {
+                    "type": "integer",
+                    "default": 1500,
+                    "description": "SMT timeout in milliseconds (best-effort)."
+                },
+                "smt_seed": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "SMT solver random seed."
+                },
                 "llm_timeout_s": {
                     "type": "integer",
                     "default": 60,
@@ -778,6 +847,12 @@ impl Tool for ProofpatchTreeSearchNearestTool {
             .get("include_goal_dump")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let smt_precheck = args
+            .get("smt_precheck")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let smt_timeout_ms = extract_u64_opt(args, "smt_timeout_ms")?.unwrap_or(1500);
+        let smt_seed = extract_u64_opt(args, "smt_seed")?.unwrap_or(0);
         let llm_timeout_s = extract_u64_opt(args, "llm_timeout_s")?.unwrap_or(60);
         let allow_sorry_candidates = args
             .get("allow_sorry_candidates")
@@ -839,6 +914,16 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                 goal_dump_v = Some(gd);
             }
         }
+
+        let smt_entails: Option<bool> = if smt_precheck {
+            goal_dump_v
+                .as_ref()
+                .and_then(|gd| gd.get("pp_dump"))
+                .and_then(|pp| plc::smt_lia::entails_from_pp_dump(pp, smt_timeout_ms, smt_seed).ok())
+                .flatten()
+        } else {
+            None
+        };
 
         let mut candidates = if let Some(ref xs) = candidates_override {
             xs.clone()
@@ -956,6 +1041,21 @@ impl Tool for ProofpatchTreeSearchNearestTool {
             }
         }
         candidates = sanitize_candidates(candidates);
+        if smt_entails == Some(true) {
+            // Re-rank: bring arithmetic tactics to the front.
+            let mut arith = Vec::new();
+            let mut rest = Vec::new();
+            for c in candidates.into_iter() {
+                let lc = c.to_lowercase();
+                if lc.contains("omega") || lc.contains("linarith") || lc.contains("nlinarith") {
+                    arith.push(c);
+                } else {
+                    rest.push(c);
+                }
+            }
+            arith.extend(rest);
+            candidates = sanitize_candidates(arith);
+        }
         if !allow_sorry_candidates {
             candidates.retain(|c| {
                 let lc = c.to_lowercase();
@@ -1195,10 +1295,14 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                 "candidates_mode": candidates_mode,
                 "candidates_count": candidates.len(),
                 "allow_sorry_candidates": allow_sorry_candidates,
-                "include_trace": include_trace
+                "include_trace": include_trace,
+                "smt_precheck": smt_precheck,
+                "smt_timeout_ms": smt_timeout_ms,
+                "smt_seed": smt_seed
             },
             "baseline_verify": { "summary": baseline_summary },
             "goal_dump": goal_dump_v,
+            "smt": { "entailed": smt_entails },
             "best": {
                 "id": best.id,
                 "parent": best.parent,
@@ -2313,6 +2417,42 @@ impl ProofpatchStdioMcp {
 }
 
 #[cfg(feature = "stdio")]
+#[derive(Clone)]
+struct ProofpatchStdioMcpMinimal {
+    tool_router: RmcpToolRouter<Self>,
+}
+
+#[cfg(feature = "stdio")]
+impl ProofpatchStdioMcpMinimal {
+    fn new() -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+        }
+    }
+}
+
+#[cfg(feature = "stdio")]
+#[tool_router]
+impl ProofpatchStdioMcpMinimal {
+    #[tool(description = "Unified proofpatch entrypoint (dispatches to sub-actions)")]
+    async fn proofpatch(
+        &self,
+        params: Parameters<UnifiedArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = ProofpatchTool;
+        let v = serde_json::json!({
+            "action": params.0.action,
+            "arguments": params.0.arguments,
+        });
+        let out = tool
+            .call(&v)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+    }
+}
+
+#[cfg(feature = "stdio")]
 #[tool_router]
 impl ProofpatchStdioMcp {
     #[tool(description = "Triage a file: verify_summary + locate_sorries")]
@@ -2906,6 +3046,28 @@ impl rmcp::ServerHandler for ProofpatchStdioMcp {
     }
 }
 
+#[cfg(feature = "stdio")]
+#[tool_handler]
+impl rmcp::ServerHandler for ProofpatchStdioMcpMinimal {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            server_info: Implementation {
+                name: "proofpatch-mcp".to_string(),
+                title: Some("proofpatch-mcp".to_string()),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                icons: None,
+                website_url: None,
+            },
+            instructions: Some(
+                "Tools for Lean proof triage/patching loops (proofpatch). Minimal tool surface."
+                    .to_string(),
+            ),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            ..Default::default()
+        }
+    }
+}
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Don’t emit logs to stdout if this ever becomes stdio-based.
     tracing_subscriber::fmt()
@@ -2940,16 +3102,33 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if arg1.as_deref() == Some("mcp-stdio") {
         #[cfg(feature = "stdio")]
         {
-            let service = ProofpatchStdioMcp::new();
-            let running = service
-                .serve(stdio())
-                .await
-                .map_err(|e| format!("failed to start stdio MCP server: {e:?}"))?;
-            running
-                .waiting()
-                .await
-                .map_err(|e| format!("stdio MCP server task join failed: {e:?}"))?;
-            return Ok(());
+            let toolset = std::env::var("PROOFPATCH_MCP_TOOLSET")
+                .unwrap_or_else(|_| "minimal".to_string())
+                .trim()
+                .to_lowercase();
+            if toolset == "minimal" || toolset.is_empty() {
+                let service = ProofpatchStdioMcpMinimal::new();
+                let running = service
+                    .serve(stdio())
+                    .await
+                    .map_err(|e| format!("failed to start stdio MCP server: {e:?}"))?;
+                running
+                    .waiting()
+                    .await
+                    .map_err(|e| format!("stdio MCP server task join failed: {e:?}"))?;
+                return Ok(());
+            } else {
+                let service = ProofpatchStdioMcp::new();
+                let running = service
+                    .serve(stdio())
+                    .await
+                    .map_err(|e| format!("failed to start stdio MCP server: {e:?}"))?;
+                running
+                    .waiting()
+                    .await
+                    .map_err(|e| format!("stdio MCP server task join failed: {e:?}"))?;
+                return Ok(());
+            }
         }
         #[cfg(not(feature = "stdio"))]
         {
@@ -2970,10 +3149,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(180);
     let config = ServerConfig::new().with_tool_timeout(StdDuration::from_secs(tool_timeout_s));
 
-    // Tool surface: default to a small "minimal" set for agent ergonomics. Opt into `full`
-    // for the complete tool surface.
+    // Tool surface: default to a single-entrypoint tool for agent ergonomics.
+    // Opt into `full` for the legacy expanded surface.
     //
-    // - minimal (default): verify/triage/patch + tree-search
+    // - minimal (default): `proofpatch` (one tool that dispatches)
     // - full: everything (legacy)
     let toolset = std::env::var("PROOFPATCH_MCP_TOOLSET")
         .unwrap_or_else(|_| "minimal".to_string())
@@ -2981,16 +3160,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .to_lowercase();
 
     let server = match toolset.as_str() {
-        "minimal" | "" => McpServer::with_config(config)
-            .tool("proofpatch_verify_summary", ProofpatchVerifySummaryTool)?
-            .tool("proofpatch_locate_sorries", ProofpatchLocateSorriesTool)?
-            .tool("proofpatch_triage_file", ProofpatchTriageFileTool)?
-            .tool("proofpatch_patch_region", ProofpatchPatchRegionTool)?
-            .tool("proofpatch_patch_nearest", ProofpatchPatchNearestTool)?
-            .tool(
-                "proofpatch_tree_search_nearest",
-                ProofpatchTreeSearchNearestTool,
-            )?,
+        "minimal" | "" => McpServer::with_config(config).tool("proofpatch", ProofpatchTool)?,
         "full" => McpServer::with_config(config)
             .tool("proofpatch_prompt", ProofpatchPromptTool)?
             .tool("proofpatch_verify", ProofpatchVerifyTool)?
