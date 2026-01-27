@@ -3424,9 +3424,9 @@ fn main() -> Result<(), String> {
             let smt_precheck = if smt_precheck_off {
                 false
             } else {
-                true || smt_precheck_on
-                    || research_preset.is_some()
-                    || candidates_mode == "lean-try"
+                // Baseline: on (best-effort + bounded). When users want it off, they must ask.
+                // `smt_precheck_on` / `research_preset` / `lean-try` still matter for *source* reporting.
+                true
             };
             let smt_precheck_source = if smt_precheck_off {
                 "explicit_off"

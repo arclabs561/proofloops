@@ -1174,10 +1174,21 @@ fn strip_redundant_named_args(line: &str) -> String {
     // keeps the shadow decl closer to “implicit inference only”.
     // First handle the extremely common exact spelling fast (avoids regex corner cases).
     let mut s = line.replace("(n := n)", "").replace("(n:=n)", "");
-    let Ok(re) = Regex::new(r"\(\s*([A-Za-z0-9_'.]+)\s*:=\s*\1\s*\)") else {
+    // Note: Rust `regex` does not support backreferences, so capture both sides and compare.
+    let Ok(re) = Regex::new(r"\(\s*([A-Za-z0-9_'.]+)\s*:=\s*([A-Za-z0-9_'.]+)\s*\)") else {
         return s;
     };
-    s = re.replace_all(&s, "").to_string();
+    s = re
+        .replace_all(&s, |caps: &regex::Captures<'_>| {
+            let lhs = caps.get(1).map(|m| m.as_str());
+            let rhs = caps.get(2).map(|m| m.as_str());
+            if lhs.is_some() && lhs == rhs {
+                String::new()
+            } else {
+                caps.get(0).map(|m| m.as_str()).unwrap_or("").to_string()
+            }
+        })
+        .to_string();
     s
 }
 

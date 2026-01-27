@@ -713,14 +713,14 @@ mod tests {
         }
     }
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
-    #[test]
-    fn provider_order_default() {
-        let _lock = env_lock().lock().unwrap();
+    #[tokio::test]
+    async fn provider_order_default() {
+        let _lock = env_lock().lock().await;
         let _g = EnvGuard::new(&["PROOFPATCH_PROVIDER_ORDER"]);
         std::env::remove_var("PROOFPATCH_PROVIDER_ORDER");
         assert_eq!(
@@ -736,7 +736,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_provider_openrouter_by_env() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock().lock().await;
         let _g = EnvGuard::new(&[
             "PROOFPATCH_PROVIDER_ORDER",
             "OPENROUTER_API_KEY",
@@ -766,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_provider_openrouter_uses_default_model_when_missing() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock().lock().await;
         let _g = EnvGuard::new(&[
             "PROOFPATCH_PROVIDER_ORDER",
             "PROOFPATCH_MODEL_DEFAULTS",
@@ -800,7 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_provider_defaults_can_be_disabled() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock().lock().await;
         let _g = EnvGuard::new(&[
             "PROOFPATCH_PROVIDER_ORDER",
             "PROOFPATCH_MODEL_DEFAULTS",
@@ -822,15 +822,13 @@ mod tests {
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("OPENAI_MODEL");
 
-        let err = select_provider(Duration::from_millis(10))
-            .await
-            .unwrap_err();
+        let err = select_provider(Duration::from_millis(10)).await.unwrap_err();
         assert!(err.contains("No usable provider found"));
     }
 
     #[tokio::test]
     async fn select_provider_openai_by_env() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock().lock().await;
         let _g = EnvGuard::new(&[
             "PROOFPATCH_PROVIDER_ORDER",
             "OPENROUTER_API_KEY",
@@ -860,7 +858,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_provider_errors_when_unconfigured() {
-        let _lock = env_lock().lock().unwrap();
+        let _lock = env_lock().lock().await;
         let _g = EnvGuard::new(&[
             "PROOFPATCH_PROVIDER_ORDER",
             "OLLAMA_MODEL",
@@ -880,9 +878,7 @@ mod tests {
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("OPENAI_MODEL");
 
-        let err = select_provider(Duration::from_millis(10))
-            .await
-            .unwrap_err();
+        let err = select_provider(Duration::from_millis(10)).await.unwrap_err();
         assert!(err.contains("No usable provider found"));
     }
 }
