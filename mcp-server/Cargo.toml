@@ -20,6 +20,7 @@ axum-mcp = { git = "https://github.com/arclabs561/axum-mcp.git", rev = "b9a64818
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+smtkit = "0.1.0"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }

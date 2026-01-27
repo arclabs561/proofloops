@@ -26,10 +26,17 @@ Some solvers support `(get-proof)` and/or UNSAT cores (typically behind `:produc
 Re-run a goal dump outside of `tree-search-nearest`:
 
 ```bash
-proofpatch smt-repro --input-json run.json --emit-smt2 repro.smt2 --emit-proof repro.sexp
+proofpatch smt repro --input-json run.json --emit-smt2 repro.smt2 --emit-proof repro.sexp
 ```
 
 `--input-json` can be either:
 - a raw `pp_dump` JSON object, or
 - a full `tree-search-nearest` JSON output (it will read `goal_dump.pp_dump`).
+
+## MCP
+
+Two equivalent ways to probe solver capabilities:
+
+- **Minimal toolset** (`PROOFPATCH_MCP_TOOLSET=minimal`): call the `proofpatch` tool with `action: "smt_probe"`.
+- **Full toolset** (`PROOFPATCH_MCP_TOOLSET=full`): call the `proofpatch_smt_probe` tool.
 

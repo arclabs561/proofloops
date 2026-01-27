@@ -27,6 +27,7 @@ use axum_mcp::{
 };
 use proofpatch_core as plc;
 use serde_json::{json, Value};
+use smtkit;
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 
@@ -275,6 +276,7 @@ impl Tool for ProofpatchTool {
             ("locate_sorries", ProofpatchLocateSorriesTool.schema()),
             ("patch_nearest", ProofpatchPatchNearestTool.schema()),
             ("patch_region", ProofpatchPatchRegionTool.schema()),
+            ("smt_probe", ProofpatchSmtProbeTool.schema()),
         ];
 
         let mut one_of: Vec<Value> = Vec::new();
@@ -321,6 +323,7 @@ impl Tool for ProofpatchTool {
                     "locate_sorries": ProofpatchLocateSorriesTool.schema(),
                     "patch_nearest": ProofpatchPatchNearestTool.schema(),
                     "patch_region": ProofpatchPatchRegionTool.schema(),
+                    "smt_probe": ProofpatchSmtProbeTool.schema(),
                 });
                 Ok(json!({
                     "ok": true,
@@ -333,7 +336,8 @@ impl Tool for ProofpatchTool {
                         "verify_summary",
                         "locate_sorries",
                         "patch_nearest",
-                        "patch_region"
+                        "patch_region",
+                        "smt_probe"
                     ],
                     "schemas": schemas
                 }))
@@ -345,8 +349,45 @@ impl Tool for ProofpatchTool {
             "locate_sorries" => ProofpatchLocateSorriesTool.call(&sub).await,
             "patch_nearest" => ProofpatchPatchNearestTool.call(&sub).await,
             "patch_region" => ProofpatchPatchRegionTool.call(&sub).await,
+            "smt_probe" => ProofpatchSmtProbeTool.call(&sub).await,
             other => Err(format!("unknown action: {other}")),
         }
+    }
+}
+
+struct ProofpatchSmtProbeTool;
+
+#[async_trait]
+impl Tool for ProofpatchSmtProbeTool {
+    fn description(&self) -> &str {
+        "Probe SMT solver availability and capabilities (via smtkit)."
+    }
+
+    fn schema(&self) -> Value {
+        // Intentionally empty: selection is controlled via `SMTKIT_SOLVER` env var.
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
+    async fn call(&self, _args: &Value) -> Result<Value, String> {
+        let (sess, used, caps) = smtkit::session::spawn_auto_with_caps()
+            .map_err(|e| format!("smt probe failed: {e}"))?;
+        let _ = sess.exit();
+        Ok(json!({
+            "ok": true,
+            "kind": "smt_probe",
+            "solver": { "used": used },
+            "caps": {
+                "check_sat_assuming": caps.check_sat_assuming,
+                "get_model": caps.get_model,
+                "get_unsat_core": caps.get_unsat_core,
+                "get_proof": caps.get_proof,
+                "named_assertions_in_core": caps.named_assertions_in_core,
+            }
+        }))
     }
 }
 
@@ -3322,6 +3363,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .tool("proofpatch_prompt", ProofpatchPromptTool)?
             .tool("proofpatch_verify", ProofpatchVerifyTool)?
             .tool("proofpatch_verify_summary", ProofpatchVerifySummaryTool)?
+            .tool("proofpatch_smt_probe", ProofpatchSmtProbeTool)?
             .tool("proofpatch_suggest", ProofpatchSuggestTool)?
             .tool("proofpatch_patch", ProofpatchPatchTool)?
             .tool("proofpatch_patch_region", ProofpatchPatchRegionTool)?
