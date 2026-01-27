@@ -6,6 +6,9 @@
  
  description = "CLI wrapper for proofpatch-core (includes advanced orchestration commands)"
  license = "MIT OR Apache-2.0"
+repository = "https://github.com/arclabs561/proofpatch"
+homepage = "https://github.com/arclabs561/proofpatch"
+readme = "../README.md"
  
  [dependencies]
  proofpatch-core = { path = "../proofpatch-core" }
