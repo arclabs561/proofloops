@@ -6,6 +6,9 @@ publish = false
 
 description = "Rust core for proofpatch (Lean excerpt/patch/verify + prompt construction)"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/arclabs561/proofpatch"
+homepage = "https://github.com/arclabs561/proofpatch"
+readme = "../README.md"
 
 [dependencies]
 regex = "1.10"

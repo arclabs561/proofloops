@@ -6,6 +6,9 @@ publish = false
 
 description = "MCP server wrapper for proofpatch (axum-mcp)"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/arclabs561/proofpatch"
+homepage = "https://github.com/arclabs561/proofpatch"
+readme = "../README.md"
 
 [[bin]]
 name = "proofpatch-mcp"
