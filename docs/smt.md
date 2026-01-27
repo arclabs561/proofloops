@@ -53,3 +53,8 @@ Two equivalent ways to run repro:
 - **Minimal toolset** (`PROOFPATCH_MCP_TOOLSET=minimal`): call the `proofpatch` tool with `action: "smt_repro"` (aliases like `smt.repro` also work).
 - **Full toolset** (`PROOFPATCH_MCP_TOOLSET=full`): call the `proofpatch_smt_repro` tool.
 
+For the **full toolset**, short aliases also exist:
+
+- `smt_probe`
+- `smt_repro`
+

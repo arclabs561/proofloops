@@ -3514,6 +3514,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .tool("proofpatch_verify_summary", ProofpatchVerifySummaryTool)?
             .tool("proofpatch_smt_probe", ProofpatchSmtProbeTool)?
             .tool("proofpatch_smt_repro", ProofpatchSmtReproTool)?
+            // Short aliases (same implementations) for SMT-focused callers.
+            .tool("smt_probe", ProofpatchSmtProbeTool)?
+            .tool("smt_repro", ProofpatchSmtReproTool)?
             .tool("proofpatch_suggest", ProofpatchSuggestTool)?
             .tool("proofpatch_patch", ProofpatchPatchTool)?
             .tool("proofpatch_patch_region", ProofpatchPatchRegionTool)?

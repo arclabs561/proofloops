@@ -1072,6 +1072,7 @@ fn usage() -> String {
         "- Output is JSON to stdout.",
         "- This CLI uses proofpatch-core, so verification runs `lake env lean` on the *real* file path.",
         "- HTML is optional; it’s intended for humans. Agents should consume the JSON table.",
+        "- Docs: see docs/usage.md and docs/smt.md in this repo.",
     ]
     .join("\n")
 }
