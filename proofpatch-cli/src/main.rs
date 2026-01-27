@@ -1043,37 +1043,30 @@ fn verify_summary_from_raw_value(raw_v: &serde_json::Value) -> serde_json::Value
 
 fn usage() -> String {
     [
-        "proofpatch — direct CLI (no MCP).",
+        "proofpatch — Lean proof debugging loop + SMT oracle.",
         "",
-        "Commands:",
-        "  triage-file --repo <path> --file <relpath> [--timeout-s N] [--max-sorries N] [--context-lines N] [--include-raw-verify] [--no-context-pack] [--no-prompts] [--output-json <path>]",
-        "  locate-sorries --repo <path> --file <relpath> [--max-sorries N] [--context-lines N] [--output-json <path>]",
-        "  lean-embed-smoke  (requires cargo feature `lean-embed`)",
-        "  verify-summary --repo <path> --file <relpath> [--timeout-s N] [--include-raw-verify] [--output-json <path>]",
-        "  goal-dump-nearest --repo <path> --file <relpath> [--timeout-s N] [--focus-line N | --focus-decl <name>] [--pp-dump-only] [--allow-sorry-free] [--bundle-dir <path>] [--output-json <path>]",
-        "  goal-analyze --input-json <path|-> [--output-json <path>]",
-        "  goal-try --capsule-dir <path> [--timeout-s N] [--top-k N] [--rounds N] [--beam N] [--with-try-this] [--write-best] [--output-json <path>]",
-        "  agent-step  --repo <path> --file <relpath> [--timeout-s N] [--write] [--output-json <path>]",
-        "  prompt      --repo <path> --file <relpath> --lemma <name> [--output-json <path>]",
-        "  rubberduck-prompt --repo <path> --file <relpath> --lemma <name> [--diagnostics-file <path>] [--output-json <path>]",
-        "  patch       --repo <path> --file <relpath> --lemma <name> --replacement-file <path> [--timeout-s N] [--write] [--include-raw-verify] [--output-json <path>]",
-        "  patch-region --repo <path> --file <relpath> --start-line N --end-line N --replacement-file <path> [--timeout-s N] [--write] [--include-raw-verify] [--output-json <path>]",
-        "  patch-nearest --repo <path> --file <relpath> --replacement-file <path> [--timeout-s N] [--write] [--max-sorries N] [--context-lines N] [--include-raw-verify] [--output-json <path>]",
-        "  tree-search-nearest --repo <path> --file <relpath> [--timeout-s N] [--total-timeout-s N] [--log-level 0|1|2] [--events-jsonl <path>] [--events-keep N] [--events-all-keep N] [--beam N] [--max-nodes N] [--depth N] [--candidates det|auto|lean|lean-try|llm] [--focus-line N | --focus-decl <name> [--focus-decl-strict] [--focus-decl-hard]] [--lean-oracle-per-node] [--lean-oracle-max-calls N] [--rollout-k N] [--dedup-goal-expansions] [--goal-first-k N] [--goal-meta-penalty N] [--depth-bonus N] [--fill-mode safe|strict|hybrid] [--max-candidates-per-node N] [--verify-k N] [--cache-dir <path> | --no-cache] [--profile] [--summary-level 0|1|2|3] [--report-md <path>] [--auto-artifacts] [--llm-summary] [--llm-summary-timeout-s N] [--llm-planner] [--llm-planner-timeout-s N] [--smt-precheck|--no-smt-precheck] [--smt-aggressive] [--smt-solver auto|z3|cvc5|<cmdline>] [--smt-timeout-ms N] [--smt-seed N] [--smt-depth N] [--smt-explain] [--no-smt-explain] [--smt-explain-max-hyps N] [--smt-unsat-core] [--smt-unsat-core-max N] [--smt-support] [--smt-support-max N] [--smt-proof] [--smt-proof-max-chars N] [--smt-proof-dump] [--smt-proof-dump-dir <path>] [--smt-proof-dump-max-chars N] [--smt-dump] [--smt-dump-max N] [--smt-dump-dir <path>] [--smt-repro-dir <path>] [--goal-dump] [--llm-timeout-s N] [--escalate-llm] [--allow-sorry-candidates] [--include-trace] [--pick best|best-ok|best-progress] [--quiet] [--research-notes-file <path>] [--research-preset <name>] [--research-top-k N] [--include-diff] [--diff-context N] [--output-diff <path>] [--write | --write-to <path>] [--include-raw-verify] [--output-json <path>]",
-        "  smt-repro --input-json <path|-> [--timeout-ms N] [--seed N] [--depth N] [--emit-smt2 <path>] [--emit-proof <path>] [--proof-max-chars N] [--bundle-dir <path>] [--output-json <path>]",
-        "  suggest     --repo <path> --file <relpath> --lemma <name> [--timeout-s N] [--output-json <path>]",
-        "  loop        --repo <path> --file <relpath> --lemma <name> [--max-iters N] [--timeout-s N] [--output-json <path>]",
-        "  review-prompt --repo <path> [--scope auto|staged|worktree] [--max-total-bytes N] [--per-file-bytes N] [--transcript-bytes N] [--cache-version STR] [--cache-model STR] [--output-json <path>]",
-        "  review-diff --repo <path> [--scope auto|staged|worktree] [--prompt-only] [--require-key] [--timeout-s N] [--no-verify|--verify-timeout-s N|--verify-max-files N] [--max-total-bytes N] [--per-file-bytes N] [--transcript-bytes N] [--cache-version STR] [--cache-model STR] [--output-json <path>]",
-        "  llm-chat [--repo <path>] [--system <text> | --system-file <path>] [--user <text> | --user-file <path>] [--tools agent] [--max-tool-iters N] [--timeout-s N] [--require-key] [--output-json <path>]",
-        "  lint-style  --repo <path> [--github] --module <Root> [--module <Root> ...]",
-        "  report      --repo <path> --files <relpath>... [--timeout-s N] [--max-sorries N] [--context-lines N] [--include-raw-verify] [--output-html <path>]",
-                "  arxiv-search --query <text> [--max-results N] [--timeout-ms N] [--must-include <tok> ...] [--must-include-all <tok> ...] [--llm-summary] [--llm-timeout-s N] [--quiet] [--output-json <path>]",
-        "  research-auto --repo <path> --preset <name> [--quiet] [--output-json <path>]",
-        "  research-ingest --input <path> [--output-json <path>]",
-        "  research-attach --report-json <path> --research-notes <path> [--top-k N] [--output-json <path>]",
-        "  context-pack --repo <path> --file <relpath> [--decl <name> | --line N] [--context-lines N] [--nearby-lines N] [--max-nearby N] [--max-imports N] [--output-json <path>]",
-        "  scratch-lemma --repo <path> --file <relpath|module> --name <decl_name> [--kind theorem|lemma] [--out <relpath>]",
+        "Core (Lean loop):",
+        "  triage-file          --repo <path> --file <relpath> ...",
+        "  verify-summary       --repo <path> --file <relpath> ...",
+        "  locate-sorries       --repo <path> --file <relpath> ...",
+        "  context-pack         --repo <path> --file <relpath> ...",
+        "  patch|patch-region|patch-nearest   --repo <path> --file <relpath> ...",
+        "  scratch-lemma        --repo <path> --file <relpath|module> --name <decl_name> ...",
+        "",
+        "SMT oracle (via smtkit):",
+        "  smt-probe            [--output-json <path>]",
+        "  smt-repro            --input-json <path|-> ...",
+        "  tree-search-nearest  --repo <path> --file <relpath> ... (includes SMT knobs)",
+        "",
+        "Optional (LLM/research/review):",
+        "  suggest | loop",
+        "  arxiv-search | research-auto | research-ingest | research-attach",
+        "  review-prompt | review-diff | llm-chat",
+        "",
+        "Other:",
+        "  goal-dump-nearest | goal-analyze | goal-try",
+        "  report | lint-style | agent-step | prompt | rubberduck-prompt",
+        "  lean-embed-smoke (requires cargo feature `lean-embed`)",
         "",
         "Notes:",
         "- Output is JSON to stdout.",
@@ -1167,6 +1160,30 @@ fn main() -> Result<(), String> {
     }
 
     match cmd {
+        "smt-probe" => {
+            let output_json = arg_value(rest, "--output-json").map(PathBuf::from);
+            let (sess, used, caps) = smtkit::session::spawn_auto_with_caps()
+                .map_err(|e| format!("smt probe failed: {e}"))?;
+            let _ = sess.exit();
+            let out = json!({
+                "ok": true,
+                "solver": { "used": used },
+                "caps": {
+                    "check_sat_assuming": caps.check_sat_assuming,
+                    "get_model": caps.get_model,
+                    "get_unsat_core": caps.get_unsat_core,
+                    "get_proof": caps.get_proof,
+                    "named_assertions_in_core": caps.named_assertions_in_core,
+                }
+            });
+            if let Some(p) = output_json {
+                fs::write(&p, out.to_string())
+                    .map_err(|e| format!("write {}: {e}", p.display()))?;
+            }
+            println!("{}", out);
+            return Ok(());
+        }
+
         "lean-embed-smoke" => {
             #[cfg(feature = "lean-embed")]
             {
