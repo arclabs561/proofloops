@@ -1420,6 +1420,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "smtkit",
  "tokio",
  "tracing-subscriber",
  "uuid",

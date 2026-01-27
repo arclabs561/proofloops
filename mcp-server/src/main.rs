@@ -277,6 +277,7 @@ impl Tool for ProofpatchTool {
             ("patch_nearest", ProofpatchPatchNearestTool.schema()),
             ("patch_region", ProofpatchPatchRegionTool.schema()),
             ("smt_probe", ProofpatchSmtProbeTool.schema()),
+            ("smt_repro", ProofpatchSmtReproTool.schema()),
         ];
 
         let mut one_of: Vec<Value> = Vec::new();
@@ -324,6 +325,7 @@ impl Tool for ProofpatchTool {
                     "patch_nearest": ProofpatchPatchNearestTool.schema(),
                     "patch_region": ProofpatchPatchRegionTool.schema(),
                     "smt_probe": ProofpatchSmtProbeTool.schema(),
+                    "smt_repro": ProofpatchSmtReproTool.schema(),
                 });
                 Ok(json!({
                     "ok": true,
@@ -337,20 +339,29 @@ impl Tool for ProofpatchTool {
                         "locate_sorries",
                         "patch_nearest",
                         "patch_region",
-                        "smt_probe"
+                        "smt_probe",
+                        "smt_repro"
                     ],
                     "schemas": schemas
                 }))
             }
-            "triage_file" => ProofpatchTriageFileTool.call(&sub).await,
-            "tree_search_nearest" => ProofpatchTreeSearchNearestTool.call(&sub).await,
-            "context_pack" => ProofpatchContextPackTool.call(&sub).await,
-            "verify_summary" => ProofpatchVerifySummaryTool.call(&sub).await,
-            "locate_sorries" => ProofpatchLocateSorriesTool.call(&sub).await,
-            "patch_nearest" => ProofpatchPatchNearestTool.call(&sub).await,
-            "patch_region" => ProofpatchPatchRegionTool.call(&sub).await,
-            "smt_probe" => ProofpatchSmtProbeTool.call(&sub).await,
-            other => Err(format!("unknown action: {other}")),
+            // Accept alias spellings like `triage-file`, `smt.probe`, etc.
+            // Canonical action names use snake_case.
+            other => {
+                let canonical = other.replace(['-', '.'], "_");
+                match canonical.as_str() {
+                    "triage_file" => ProofpatchTriageFileTool.call(&sub).await,
+                    "tree_search_nearest" => ProofpatchTreeSearchNearestTool.call(&sub).await,
+                    "context_pack" => ProofpatchContextPackTool.call(&sub).await,
+                    "verify_summary" => ProofpatchVerifySummaryTool.call(&sub).await,
+                    "locate_sorries" => ProofpatchLocateSorriesTool.call(&sub).await,
+                    "patch_nearest" => ProofpatchPatchNearestTool.call(&sub).await,
+                    "patch_region" => ProofpatchPatchRegionTool.call(&sub).await,
+                    "smt_probe" => ProofpatchSmtProbeTool.call(&sub).await,
+                    "smt_repro" => ProofpatchSmtReproTool.call(&sub).await,
+                    _ => Err(format!("unknown action: {other}")),
+                }
+            }
         }
     }
 }
@@ -386,6 +397,144 @@ impl Tool for ProofpatchSmtProbeTool {
                 "get_unsat_core": caps.get_unsat_core,
                 "get_proof": caps.get_proof,
                 "named_assertions_in_core": caps.named_assertions_in_core,
+            }
+        }))
+    }
+}
+
+struct ProofpatchSmtReproTool;
+
+#[async_trait]
+impl Tool for ProofpatchSmtReproTool {
+    fn description(&self) -> &str {
+        "Emit an SMT-LIA repro script (and optional UNSAT proof) from a pp_dump JSON object."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pp_dump": { "type": "object", "description": "A pp_dump JSON object (must contain `goals`)." },
+                "timeout_ms": { "type": "integer", "default": 5000 },
+                "seed": { "type": "integer", "default": 0 },
+                "depth": { "type": "integer", "default": 0 },
+                "proof_max_chars": { "type": "integer", "default": 200000 },
+                "emit_smt2": { "type": "string", "description": "Optional path to write repro.smt2." },
+                "emit_proof": { "type": "string", "description": "Optional path to write repro.sexp (only when proof is non-truncated)." }
+            },
+            "required": ["pp_dump"]
+        })
+    }
+
+    async fn call(&self, args: &Value) -> Result<Value, String> {
+        let pp_dump = args
+            .get("pp_dump")
+            .cloned()
+            .ok_or_else(|| "missing pp_dump".to_string())?;
+
+        let timeout_ms = extract_u64_opt(args, "timeout_ms")?
+            .unwrap_or(5_000)
+            .clamp(0, 600_000);
+        let seed = extract_u64_opt(args, "seed")?.unwrap_or(0);
+        let depth = extract_u64_opt(args, "depth")?.unwrap_or(0).clamp(0, 64) as usize;
+        let proof_max_chars = extract_u64_opt(args, "proof_max_chars")?
+            .unwrap_or(200_000)
+            .clamp(0, 5_000_000) as usize;
+
+        let emit_smt2 = extract_string_opt(args, "emit_smt2").map(PathBuf::from);
+        let emit_proof = extract_string_opt(args, "emit_proof").map(PathBuf::from);
+
+        let solver_probe = plc::smt_lia::smt_solver_probe();
+        let smt2 = plc::smt_lia::smt2_script_from_pp_dump(&pp_dump, timeout_ms, seed, depth);
+        let proof = plc::smt_lia::unsat_proof_from_pp_dump(
+            &pp_dump,
+            timeout_ms,
+            seed,
+            depth,
+            proof_max_chars,
+        );
+
+        // Optional artifacts.
+        let mut smt2_written: Option<String> = None;
+        if let (Some(path), Some(s)) = (emit_smt2.as_ref(), smt2.as_ref()) {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
+            }
+            std::fs::write(path, s.as_bytes())
+                .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+            smt2_written = Some(path.display().to_string());
+        }
+
+        let mut proof_written: Option<String> = None;
+        if let Some(path) = emit_proof.as_ref() {
+            // Only write if we have the full proof text (avoid writing a likely-invalid truncated sexp).
+            let pf_ok = proof.as_ref().ok().and_then(|x| x.as_ref()).and_then(|pf| {
+                let preview = pf.get("preview")?.as_str()?;
+                let chars = pf.get("chars")?.as_u64()? as usize;
+                let preview_chars = preview.chars().count();
+                if chars <= proof_max_chars && preview_chars == chars {
+                    Some(preview.to_string())
+                } else {
+                    None
+                }
+            });
+            if let Some(txt) = pf_ok {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
+                }
+                std::fs::write(path, txt.as_bytes())
+                    .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+                proof_written = Some(path.display().to_string());
+            }
+        }
+
+        let goals_n = pp_dump
+            .get("goals")
+            .and_then(|g| g.as_array())
+            .map(|g| g.len())
+            .unwrap_or(0);
+
+        let result_kind = if solver_probe.get("available").and_then(|v| v.as_bool()) != Some(true) {
+            "solver_unavailable"
+        } else if smt2.is_some() {
+            "ok"
+        } else {
+            "no_entailment"
+        };
+
+        let note = match result_kind {
+            "solver_unavailable" => "no SMT solver detected by probe",
+            "no_entailment" => {
+                "pp_dump parsed, but the goal does not look like a supported SMT-LIA entailment"
+            }
+            _ => "",
+        };
+
+        Ok(json!({
+            "ok": true,
+            "kind": "smt_repro",
+            "result_kind": result_kind,
+            "solver": solver_probe,
+            "params": {
+                "timeout_ms": timeout_ms,
+                "seed": seed,
+                "depth": depth,
+                "proof_max_chars": proof_max_chars,
+            },
+            "pp_dump": { "goals": goals_n },
+            "note": if note.is_empty() { serde_json::Value::Null } else { json!(note) },
+            "artifacts": {
+                "smt2_requested": emit_smt2.as_ref().map(|p| p.display().to_string()),
+                "smt2_written": smt2_written,
+                "proof_requested": emit_proof.as_ref().map(|p| p.display().to_string()),
+                "proof_written": proof_written,
+            },
+            "smt2": smt2.unwrap_or_else(|| "".to_string()),
+            "proof": match proof {
+                Ok(pf) => pf.unwrap_or(serde_json::Value::Null),
+                Err(e) => json!({"error": format!("{e}")}),
             }
         }))
     }
@@ -3364,6 +3513,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .tool("proofpatch_verify", ProofpatchVerifyTool)?
             .tool("proofpatch_verify_summary", ProofpatchVerifySummaryTool)?
             .tool("proofpatch_smt_probe", ProofpatchSmtProbeTool)?
+            .tool("proofpatch_smt_repro", ProofpatchSmtReproTool)?
             .tool("proofpatch_suggest", ProofpatchSuggestTool)?
             .tool("proofpatch_patch", ProofpatchPatchTool)?
             .tool("proofpatch_patch_region", ProofpatchPatchRegionTool)?
