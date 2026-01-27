@@ -16,6 +16,7 @@
  similar = "2"
  schemars = { version = "1.2.0", features = ["derive"] }
 smtkit = { path = "../../smtkit" }
+sha2 = "0.10"
  
  [features]
 default = []

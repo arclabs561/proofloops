@@ -30,16 +30,16 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::process::Command;
 
-pub mod json_extract;
 pub mod arxiv;
 pub mod config;
+pub mod json_extract;
 pub mod llm;
-pub mod smt_lia;
 #[cfg(feature = "lsp")]
 mod lsp_client;
 #[cfg(feature = "planner")]
 pub mod planner;
 pub mod review;
+pub mod smt_lia;
 pub mod tree_search;
 
 #[derive(Debug, Clone)]
@@ -1005,8 +1005,369 @@ fn decl_header_regex(decl_name: &str) -> Result<Regex, String> {
     // Many repos use `def`/`abbrev` for exercises and examples, not just `theorem|lemma`.
     // We keep this permissive and anchored, to avoid accidental matches.
     let decl = regex::escape(decl_name);
-    let pat = format!(r"^\s*(theorem|lemma|def|abbrev|instance)\s+{}\b", decl);
+    // Allow common prefixes:
+    // - attributes on the same line: `@[simp] lemma foo ...`
+    // - modifiers: `private`, `protected`, `noncomputable`, `unsafe`, `partial`
+    //
+    // We intentionally stay line-anchored to avoid matching mentions inside proofs/comments.
+    let pat = format!(
+        r"^\s*(?:@[^\n]*\s+)*(?:(?:private|protected|noncomputable|unsafe|partial)\s+)*\b(theorem|lemma|def|abbrev|instance)\s+{}\b",
+        decl
+    );
     Regex::new(&pat).map_err(|e| format!("invalid decl regex: {}", e))
+}
+
+fn extract_decl_signature_prefix(lines: &[&str], decl_name: &str) -> Result<Vec<String>, String> {
+    let pat = decl_header_regex(decl_name)?;
+    let start0 = lines
+        .iter()
+        .position(|ln| pat.is_match(ln))
+        .ok_or_else(|| format!("Could not find theorem/lemma/def named {}", decl_name))?;
+
+    // We accept multi-line decl signatures and cut at the first top-level `:=`.
+    //
+    // Important: `:=` can appear inside terms (named arguments like `(n := n)`), so we only treat
+    // it as a delimiter when it appears at *top level* (outside (), [], {}).
+    let stop0_excl = usize::min(lines.len(), start0 + 250);
+    let mut acc: Vec<String> = Vec::new();
+    for j0 in start0..stop0_excl {
+        let ln = lines[j0];
+        if let Some(k) = find_top_level_colon_eq(ln) {
+            // `:=` also appears inside terms, notably `let x := ...` *within a theorem statement*.
+            // In that case we must not treat it as the decl-body delimiter.
+            //
+            // Heuristic: ignore `:=` on lines whose non-whitespace prefix begins with `let`.
+            // This covers the common `let m : T := rhs` binder used in statements.
+            let t = ln.trim_start();
+            if t.starts_with("let ") || t == "let" {
+                acc.push(ln.trim_end().to_string());
+                continue;
+            }
+            // Keep everything up to and including `:=`.
+            let prefix = &ln[..k + 2];
+            acc.push(prefix.trim_end().to_string());
+            return Ok(acc);
+        }
+        acc.push(ln.trim_end().to_string());
+    }
+    Err(format!(
+        "Could not find `:=` within 250 lines of decl header for {}",
+        decl_name
+    ))
+}
+
+fn replace_decl_name_in_header_line(line: &str, old: &str, new: &str) -> String {
+    // Best-effort anchored replacement using a decl-header regex that understands `@[attr]` prefixes.
+    // We do not attempt full Lean parsing here.
+    let Ok(re) = Regex::new(
+        r"^(\s*(?:@[^\n]*\s+)*(?:(?:private|protected|noncomputable|unsafe|partial)\s+)*\b(?:theorem|lemma|def|abbrev|instance)\s+)([^\s:(]+)(.*)$",
+    ) else {
+        return line.replace(old, new);
+    };
+    if let Some(caps) = re.captures(line) {
+        let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let rest = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        if name == old {
+            return format!("{prefix}{new}{rest}");
+        }
+    }
+    line.replace(old, new)
+}
+
+fn find_top_level_colon_eq(line: &str) -> Option<usize> {
+    let mut paren: i64 = 0;
+    let mut bracket: i64 = 0;
+    let mut brace: i64 = 0;
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b'[' => bracket += 1,
+            b']' => bracket -= 1,
+            b'{' => brace += 1,
+            b'}' => brace -= 1,
+            b':' => {
+                if bytes[i + 1] == b'=' && paren == 0 && bracket == 0 && brace == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn pp_dump_prelude_no_import() -> &'static str {
+    // Keep this synchronized with the `pp_dump` definition used in goal-dump helpers.
+    //
+    // Must NOT start with `import ...` because imports must remain at file start.
+    r#"
+open Lean Meta Elab Tactic
+
+namespace ProofpatchInline
+
+private def exprToString (e : Expr) : MetaM String := do
+  let fmt ← ppExpr e
+  pure fmt.pretty
+
+private def localDeclToJson (d : LocalDecl) : MetaM Lean.Json := do
+  let name := d.userName.toString
+  let tyStr ← exprToString d.type
+  return Lean.Json.mkObj [("text", Lean.Json.str s!"{name} : {tyStr}")]
+
+private def goalToJson (g : MVarId) : MetaM Lean.Json := do
+  g.withContext do
+    let fmt ← Lean.Meta.ppGoal g
+    let lctx ← getLCtx
+    let mut hyps : Array Lean.Json := #[]
+    for d in lctx do
+      if hyps.size >= 40 then
+        break
+      if d.isImplementationDetail then
+        continue
+      hyps := hyps.push (← localDeclToJson d)
+    return Lean.Json.mkObj [
+      ("pretty", Lean.Json.str fmt.pretty),
+      ("hyps", Lean.Json.arr hyps)
+    ]
+
+elab "pp_dump" : tactic => do
+  let goals ← getGoals
+  let mut goalsJson : Array Lean.Json := #[]
+  for g in goals do
+    goalsJson := goalsJson.push (← liftMetaM (goalToJson g))
+  let out := Lean.Json.mkObj [
+    ("tool", Lean.Json.str "proofpatch"),
+    ("kind", Lean.Json.str "pp_dump"),
+    ("goals", Lean.Json.arr goalsJson)
+  ]
+  logWarning m!"\n{toString out}"
+
+end ProofpatchInline
+"#
+}
+
+fn module_name_from_file_rel(file_rel: &str) -> Option<String> {
+    let rel = file_rel.trim();
+    if rel.is_empty() {
+        return None;
+    }
+    // Skip dot-directories like `.generated/…` (not usually part of the Lake module graph).
+    if rel.split('/').any(|seg| seg.starts_with('.')) {
+        return None;
+    }
+    let rel = rel.strip_suffix(".lean").unwrap_or(rel);
+    if rel.is_empty() {
+        return None;
+    }
+    Some(rel.replace('/', "."))
+}
+
+fn strip_redundant_named_args(line: &str) -> String {
+    // Best-effort: rewrite `(x := x)` into nothing (it is usually redundant).
+    //
+    // This avoids brittleness when binder names are not stable across imports/elaboration, and it
+    // keeps the shadow decl closer to “implicit inference only”.
+    // First handle the extremely common exact spelling fast (avoids regex corner cases).
+    let mut s = line.replace("(n := n)", "").replace("(n:=n)", "");
+    let Ok(re) = Regex::new(r"\(\s*([A-Za-z0-9_'.]+)\s*:=\s*\1\s*\)") else {
+        return s;
+    };
+    s = re.replace_all(&s, "").to_string();
+    s
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LeanCtxFrame<'a> {
+    Namespace(&'a str),
+    Section(Option<&'a str>),
+}
+
+fn collect_shadow_context_prefix<'a>(lines: &[&'a str], decl_start0: usize) -> (Vec<String>, Vec<String>) {
+    // Goal: replay lightweight context that affects elaboration of a decl header (common in mathlib):
+    // - `section`/`namespace` blocks
+    // - `variable(s)` binders that are implicit params in decls
+    // - `open` and `set_option` that influence parsing/elaboration
+    //
+    // Keep it conservative: don't replay earlier theorems/defs.
+    let namespace_re = Regex::new(r"^\s*namespace\s+([^\s]+)\s*$").ok();
+    let section_re = Regex::new(r"^\s*section(?:\s+([^\s]+))?\s*$").ok();
+    let end_re = Regex::new(r"^\s*end(?:\s+([^\s]+))?\s*$").ok();
+
+    let keep_re = Regex::new(
+        r"(?x)^\s*(
+            namespace\s+\S+ |
+            section(\s+\S+)? |
+            end(\s+\S+)? |
+            variable(s)?\b |
+            universe(s)?\b |
+            open(\s+scoped)?\b |
+            set_option\b |
+            attribute\b |
+            notation\b |
+            local\s+notation\b |
+            syntax\b |
+            macro\b |
+            infix(l|r)?\b |
+            prefix\b |
+            postfix\b
+        )",
+    )
+    .ok();
+
+    let mut replay: Vec<String> = Vec::new();
+    let mut stack: Vec<LeanCtxFrame<'a>> = Vec::new();
+
+    for ln in lines.iter().take(decl_start0) {
+        let t = ln.trim_end();
+        if t.trim().is_empty() {
+            continue;
+        }
+        if t.trim_start().starts_with("--") {
+            continue;
+        }
+        if t.trim_start().starts_with("import ") {
+            // Imports are handled separately and must remain at file start.
+            continue;
+        }
+
+        if let (Some(re), Some(caps)) = (namespace_re.as_ref(), namespace_re.as_ref().and_then(|re| re.captures(t))) {
+            // (The `re` binding avoids clippy complaining about repeated lookups.)
+            let _ = re; // silence unused in older rustc/clippy combos
+            if let Some(ns) = caps.get(1).map(|m| m.as_str()) {
+                stack.push(LeanCtxFrame::Namespace(ns));
+            }
+        } else if let Some(re) = section_re.as_ref() {
+            if let Some(caps) = re.captures(t) {
+                let name = caps.get(1).map(|m| m.as_str());
+                stack.push(LeanCtxFrame::Section(name));
+            }
+        } else if let Some(re) = end_re.as_ref() {
+            if let Some(caps) = re.captures(t) {
+                let name = caps.get(1).map(|m| m.as_str());
+                // Best-effort pop: if named, pop the nearest matching namespace/section.
+                if let Some(nm) = name {
+                    if let Some(pos) = stack.iter().rposition(|f| match f {
+                        LeanCtxFrame::Namespace(x) => *x == nm,
+                        LeanCtxFrame::Section(Some(x)) => *x == nm,
+                        LeanCtxFrame::Section(None) => false,
+                    }) {
+                        stack.truncate(pos);
+                    } else {
+                        stack.pop();
+                    }
+                } else {
+                    stack.pop();
+                }
+            }
+        }
+
+        let keep = keep_re
+            .as_ref()
+            .map(|re| re.is_match(t))
+            .unwrap_or(false);
+        if keep {
+            replay.push(t.to_string());
+        }
+    }
+
+    // Close any still-open contexts after the shadow decl, so the generated file parses.
+    let mut closers: Vec<String> = Vec::new();
+    for f in stack.iter().rev() {
+        match f {
+            LeanCtxFrame::Namespace(ns) => closers.push(format!("end {ns}")),
+            LeanCtxFrame::Section(Some(n)) => closers.push(format!("end {n}")),
+            LeanCtxFrame::Section(None) => closers.push("end".to_string()),
+        }
+    }
+    (replay, closers)
+}
+
+fn synthesize_pp_dump_shadow_decl_from_text(
+    file_rel: &str,
+    decl_name: &str,
+    txt: &str,
+) -> Result<String, String> {
+    let lines: Vec<&str> = txt.lines().collect();
+
+    let imports = collect_imports(&lines, 120);
+    let mut sig = extract_decl_signature_prefix(&lines, decl_name)?;
+    if sig.is_empty() {
+        return Err("empty decl signature".to_string());
+    }
+
+    let pat = decl_header_regex(decl_name)?;
+    let start0 = lines
+        .iter()
+        .position(|ln| pat.is_match(ln))
+        .ok_or_else(|| format!("Could not find theorem/lemma/def named {}", decl_name))?;
+
+    let (ctx_prefix, ctx_closers) = collect_shadow_context_prefix(&lines, start0);
+
+    let shadow_name = format!("{}_proofpatch_shadow", decl_name);
+    sig[0] = replace_decl_name_in_header_line(&sig[0], decl_name, &shadow_name);
+    for ln in sig.iter_mut() {
+        *ln = strip_redundant_named_args(ln).trim_end().to_string();
+    }
+
+    // Build a standalone Lean file that replays the signature but uses `pp_dump; sorry` as the body.
+    let mut out = String::new();
+    out.push_str("-- generated by proofpatch (shadow decl for pp_dump)\n");
+    out.push_str("import Lean\n");
+    if let Some(m) = module_name_from_file_rel(file_rel) {
+        out.push_str(&format!("import {m}\n"));
+    }
+    for imp in imports {
+        out.push_str(&imp);
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(pp_dump_prelude_no_import().trim_matches('\n'));
+    out.push('\n');
+    out.push('\n');
+
+    if !ctx_prefix.is_empty() {
+        for ln in ctx_prefix {
+            out.push_str(&ln);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    for ln in sig {
+        out.push_str(&ln);
+        out.push('\n');
+    }
+    out.push_str(" by\n  pp_dump\n  sorry\n\n");
+
+    let has_closers = !ctx_closers.is_empty();
+    for ln in &ctx_closers {
+        out.push_str(ln);
+        out.push('\n');
+    }
+    if has_closers {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+pub fn synthesize_pp_dump_shadow_decl(
+    repo_root: &Path,
+    file_rel: &str,
+    decl_name: &str,
+) -> Result<String, String> {
+    let repo_root = find_lean_repo_root(repo_root)?;
+    let p = repo_root.join(file_rel);
+    if !p.exists() {
+        return Err(format!("File not found: {}", p.display()));
+    }
+    let txt = std::fs::read_to_string(&p)
+        .map_err(|e| format!("failed to read {}: {}", p.display(), e))?;
+    synthesize_pp_dump_shadow_decl_from_text(file_rel, decl_name, &txt)
 }
 
 pub fn extract_decl_block(text: &str, decl_name: &str) -> Result<String, String> {
@@ -1021,7 +1382,7 @@ pub fn extract_decl_block(text: &str, decl_name: &str) -> Result<String, String>
     // Try to find `:=` line to anchor the end of the signature; then include some tail context.
     let mut end = None;
     for j in start..usize::min(lines.len(), start + 250) {
-        if lines[j].contains(":=") {
+        if find_top_level_colon_eq(lines[j]).is_some() {
             end = Some(j);
             break;
         }
@@ -1158,6 +1519,107 @@ pub fn patch_first_sorry_in_decl(
         before,
         after,
     })
+}
+
+#[cfg(test)]
+mod shadow_decl_tests {
+    use super::*;
+
+    #[test]
+    fn shadow_decl_replays_section_variables() {
+        let txt = r#"
+import Mathlib
+
+section
+variable (α : Type) [Group α]
+open scoped BigOperators
+
+namespace Foo
+
+theorem bar : True := by
+  trivial
+
+end Foo
+end
+"#;
+        let out = synthesize_pp_dump_shadow_decl_from_text("Foo/Bar.lean", "bar", txt)
+            .expect("synthesize should succeed");
+        assert!(out.contains("section"), "expected section in shadow context");
+        assert!(
+            out.contains("variable (α : Type) [Group α]"),
+            "expected section variables replayed"
+        );
+        assert!(
+            out.contains("open scoped BigOperators"),
+            "expected `open scoped` replayed"
+        );
+        assert!(
+            out.contains("namespace Foo"),
+            "expected namespace replayed"
+        );
+        assert!(
+            out.contains("theorem bar_proofpatch_shadow"),
+            "expected shadow decl name"
+        );
+        // Ensure the generated file is syntactically closable.
+        assert!(
+            out.contains("\nend Foo\n") || out.contains("\nend Foo\n\n"),
+            "expected namespace closure"
+        );
+    }
+
+    #[test]
+    fn nearest_decl_header_in_text_finds_decl_above_focus_line() {
+        let txt = r#"
+import Mathlib
+
+/- this block comment mentions: theorem nope : True := by -/
+
+namespace Foo
+
+theorem bar : True := by
+  trivial
+
+theorem baz : True := by
+  trivial
+
+end Foo
+"#;
+        // Focus inside `baz` body → should resolve to `baz`.
+        let d1 = nearest_decl_header_in_text(txt, 12, 200).expect("decl");
+        assert_eq!(d1.name, "baz");
+        assert_eq!(d1.kind, "theorem");
+
+        // Focus between theorems → should resolve to `bar` (nearest above).
+        let d2 = nearest_decl_header_in_text(txt, 9, 200).expect("decl");
+        assert_eq!(d2.name, "bar");
+    }
+
+    #[test]
+    fn shadow_decl_signature_does_not_cut_at_let_binder_colon_eq() {
+        let txt = r#"
+import Mathlib
+
+namespace Foo
+
+theorem withLet (n : Nat) :
+    let m : Nat := n + 1
+    True := by
+  trivial
+
+end Foo
+"#;
+        let out = synthesize_pp_dump_shadow_decl_from_text("Foo/Bar.lean", "withLet", txt)
+            .expect("synthesize should succeed");
+        // We should preserve the let binder line *including its RHS*, not truncate it to `let m : Nat :=`.
+        assert!(
+            out.contains("let m : Nat := n + 1"),
+            "expected let binder RHS preserved"
+        );
+        // And the generated body should be a pp_dump + sorry.
+        assert!(out.contains("pp_dump"));
+        assert!(out.contains("sorry"));
+    }
 }
 
 pub fn patch_first_sorry_in_region(
@@ -2006,8 +2468,98 @@ pub struct ContextPack {
 fn any_decl_header_regex() -> Result<Regex, String> {
     // Lean identifiers can include `.`, `_`, `'`, unicode, etc.
     // We capture the next token up to whitespace/colon/paren as a best-effort name.
-    Regex::new(r"^\s*(theorem|lemma|def|abbrev|instance)\s+([^\s:(]+)")
+    Regex::new(
+        r"^\s*(?:@[^\n]*\s+)*(?:(?:private|protected|noncomputable|unsafe|partial)\s+)*\b(theorem|lemma|def|abbrev|instance)\s+([^\s:(]+)",
+    )
         .map_err(|e| format!("invalid decl-header regex: {}", e))
+}
+
+/// Best-effort: find the nearest declaration header at/above `focus_line_1`.
+///
+/// This is intentionally shallow (regex-based) and only meant to support UX flows like
+/// `goal-dump-nearest --allow-sorry-free --focus-line ...`, where we need a decl name to
+/// synthesize a shadow declaration.
+pub fn nearest_decl_header_in_text(
+    text: &str,
+    focus_line_1: usize,
+    max_scan_lines: usize,
+) -> Option<NearbyDecl> {
+    let max_scan_lines = max_scan_lines.max(1).min(20_000);
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let focus0 = focus_line_1.saturating_sub(1).min(lines.len() - 1);
+
+    let decl_pat = any_decl_header_regex().ok()?;
+
+    // Best-effort block comment masking (`/- ... -/`, nested). This is not a full Lean lexer;
+    // it is only intended to avoid obvious false positives.
+    let mut in_block: Vec<bool> = vec![false; lines.len()];
+    let mut depth: usize = 0;
+    for (idx, ln) in lines.iter().enumerate() {
+        let bs = ln.as_bytes();
+        let mut i = 0usize;
+        let mut stop = bs.len();
+        // Ignore anything after a line comment marker when not already in a block comment.
+        if depth == 0 {
+            while i + 1 < bs.len() {
+                if bs[i] == b'-' && bs[i + 1] == b'-' {
+                    stop = i;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        i = 0;
+        while i + 1 < stop {
+            if bs[i] == b'/' && bs[i + 1] == b'-' {
+                depth += 1;
+                i += 2;
+                continue;
+            }
+            if bs[i] == b'-' && bs[i + 1] == b'/' {
+                depth = depth.saturating_sub(1);
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        // Mark this line as "in block comment" if it was inside a block at any point.
+        // We approximate this by recording whether depth was non-zero during the scan.
+        // (This is conservative and fine for our purposes.)
+        in_block[idx] = depth > 0;
+    }
+
+    let mut steps = 0usize;
+    let mut i0 = focus0;
+    loop {
+        let ln = lines[i0];
+        let t = ln.trim_start();
+        if !t.is_empty()
+            && !t.starts_with("--")
+            && !in_block[i0]
+            && decl_pat.captures(ln).is_some()
+        {
+            let cap = decl_pat.captures(ln)?;
+            let kind = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+            let name = cap.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+            if !kind.is_empty() && !name.is_empty() {
+                return Some(NearbyDecl {
+                    line: i0 + 1,
+                    kind,
+                    name,
+                    header: ln.to_string(),
+                });
+            }
+        }
+        steps += 1;
+        if steps >= max_scan_lines || i0 == 0 {
+            break;
+        }
+        i0 -= 1;
+    }
+    None
 }
 
 fn extract_decl_span(lines: &[&str], decl_name: &str) -> Result<(usize, usize, String), String> {
@@ -2020,7 +2572,7 @@ fn extract_decl_span(lines: &[&str], decl_name: &str) -> Result<(usize, usize, S
     // Try to find `:=` line to anchor the end of the signature; then include some tail context.
     let mut sig_end0 = None;
     for j0 in start0..usize::min(lines.len(), start0 + 250) {
-        if lines[j0].contains(":=") {
+        if find_top_level_colon_eq(lines[j0]).is_some() {
             sig_end0 = Some(j0);
             break;
         }
@@ -2283,7 +2835,7 @@ pub async fn verify_lean_text(
     ];
     let lean_cmd_vec = vec!["lean".to_string(), tmp_path_buf.display().to_string()];
 
-    let (mut ok, mut timeout, mut returncode, mut stdout, mut stderr, cmd_vec) = match backend
+    let (mut ok, mut timeout, mut returncode, mut stdout, mut stderr, mut cmd_vec) = match backend
         .as_str()
     {
         #[cfg(feature = "lsp")]
@@ -2312,7 +2864,7 @@ pub async fn verify_lean_text(
                     if needs_process_stdout && force_process_oracle && !has_oracle_like_output {
                         // LSP didn't surface the oracle-style output we need; fall back to process verifier.
                         match run_lean_with_env(&repo_root, &lean_args, timeout_s).await {
-                            Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
+                            Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec.clone()),
                             Err(_) => {
                                 // Fall back to `lake env lean` so we still capture stdout/stderr.
                                 let mut cmd = Command::new(&lake);
@@ -2343,7 +2895,7 @@ pub async fn verify_lean_text(
                                         (ok, false, returncode, stdout, stderr)
                                     }
                                 };
-                                (r.0, r.1, r.2, r.3, r.4, lake_cmd_vec)
+                                (r.0, r.1, r.2, r.3, r.4, lake_cmd_vec.clone())
                             }
                         }
                     } else {
@@ -2409,17 +2961,17 @@ pub async fn verify_lean_text(
                     (ok, false, returncode, stdout, stderr)
                 }
             };
-            (r.0, r.1, r.2, r.3, r.4, lake_cmd_vec)
+            (r.0, r.1, r.2, r.3, r.4, lake_cmd_vec.clone())
         }
         "lean" => match run_lean_with_env(&repo_root, &lean_args, timeout_s).await {
-            Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
+            Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec.clone()),
             Err(e) => (
                 false,
                 false,
                 None,
                 String::new(),
                 format!("lean-env backend failed: {e}"),
-                lean_cmd_vec,
+                lean_cmd_vec.clone(),
             ),
         },
         _ => {
@@ -2450,7 +3002,7 @@ pub async fn verify_lean_text(
                     )
                 } else {
                     match run_lean_with_env(&repo_root, &lean_args, timeout_s).await {
-                        Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
+                        Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec.clone()),
                         Err(_) => {
                             let mut cmd = Command::new(&lake);
                             cmd.arg("env")
@@ -2480,7 +3032,7 @@ pub async fn verify_lean_text(
                                     (ok, false, returncode, stdout, stderr)
                                 }
                             };
-                            (r.0, r.1, r.2, r.3, r.4, lake_cmd_vec)
+                            (r.0, r.1, r.2, r.3, r.4, lake_cmd_vec.clone())
                         }
                     }
                 }
@@ -2488,7 +3040,7 @@ pub async fn verify_lean_text(
             #[cfg(not(feature = "lsp"))]
             {
                 match run_lean_with_env(&repo_root, &lean_args, timeout_s).await {
-                    Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec),
+                    Ok(r) => (r.0, r.1, r.2, r.3, r.4, lean_cmd_vec.clone()),
                     Err(_) => {
                         let mut cmd = Command::new(&lake);
                         cmd.arg("env")
@@ -2516,12 +3068,58 @@ pub async fn verify_lean_text(
                                 (ok, false, returncode, stdout, stderr)
                             }
                         };
-                        (r.0, r.1, r.2, r.3, r.4, lake_cmd_vec)
+                        (r.0, r.1, r.2, r.3, r.4, lake_cmd_vec.clone())
                     }
                 }
             }
         }
     };
+
+    // If lean-env failed to resolve project modules, retry once with `lake env lean`.
+    //
+    // This happens when `lake env env` returns an environment that is *almost* correct but still
+    // doesn't resolve `import Foo.Bar` for the repo (common symptom: "unknown module prefix").
+    // In that case, `lake env lean` tends to be more reliable.
+    if !ok && !timeout && cmd_vec == lean_cmd_vec {
+        let merged = format!("{stdout}\n{stderr}");
+        if merged.contains("error: unknown module prefix")
+            || merged.contains("unknown module prefix")
+            || merged.contains("unknown module")
+        {
+            let mut cmd = Command::new(&lake);
+            cmd.arg("env")
+                .arg("lean")
+                .arg(&tmp_path_buf)
+                .current_dir(&repo_root);
+            maybe_extend_lean_path_for_lake_env(&mut cmd);
+            let out = tokio::time::timeout(timeout_s, cmd.output())
+                .await
+                .map_err(|_| "timeout".to_string());
+            let r = match out {
+                Err(_) => (false, true, None, String::new(), String::new()),
+                Ok(Err(e)) => (
+                    false,
+                    false,
+                    None,
+                    String::new(),
+                    format!("failed to execute: {}", e),
+                ),
+                Ok(Ok(output)) => {
+                    let ok = output.status.success();
+                    let returncode = output.status.code();
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    (ok, false, returncode, stdout, stderr)
+                }
+            };
+            ok = r.0;
+            timeout = r.1;
+            returncode = r.2;
+            stdout = r.3;
+            stderr = r.4;
+            cmd_vec = lake_cmd_vec.clone();
+        }
+    }
 
     // If we hit a missing-olean error, do a one-time `lake build` and retry once.
     if !ok
@@ -2976,19 +3574,121 @@ fn extract_json_object_by_brace_balance(s: &str) -> Vec<serde_json::Value> {
     out
 }
 
+/// Best-effort extraction of a `pp_dump` JSON object from Lean stdout/stderr.
+///
+/// `pp_dump` is logged via `logWarning` by our injected helper tactic, so it usually appears in the
+/// merged stdout+stderr stream as a standalone JSON object (sometimes prefixed by `warning:`).
+///
+/// Returns the **first** `{"tool":"proofpatch","kind":"pp_dump",...}` object found.
+pub fn extract_pp_dump_from_lean_output(merged_stdout_stderr: &str) -> Option<serde_json::Value> {
+    for obj in extract_json_object_by_brace_balance(merged_stdout_stderr) {
+        let is_pp = obj.get("tool").and_then(|v| v.as_str()) == Some("proofpatch")
+            && obj.get("kind").and_then(|v| v.as_str()) == Some("pp_dump");
+        if is_pp {
+            return Some(obj);
+        }
+    }
+    None
+}
+
 /// Derive a small candidate list from a pretty-printed goal.
 ///
 /// This is intentionally heuristic and bounded; callers can always supply their own candidates.
 pub fn derive_candidates_from_goal_pretty(goal_pretty: &str) -> Vec<String> {
+    derive_candidates_from_goal_pretty_with_hint_rules(goal_pretty, &[])
+}
+
+fn is_lean_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '\''
+}
+
+fn replace_lean_ident(text: &str, from: &str, to: &str) -> String {
+    if from.is_empty() || from == to {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut it = text.chars().peekable();
+    while let Some(ch) = it.next() {
+        if is_lean_ident_char(ch) {
+            let mut ident = String::new();
+            ident.push(ch);
+            while let Some(&ch2) = it.peek() {
+                if is_lean_ident_char(ch2) {
+                    ident.push(ch2);
+                    let _ = it.next();
+                } else {
+                    break;
+                }
+            }
+            if ident == from {
+                out.push_str(to);
+            } else {
+                out.push_str(&ident);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn extract_mod_eq_lhs_ident(goal_pretty: &str, modulus: &str) -> Option<String> {
+    // Best-effort: find a line like `... <ident> % 8 = ...` and extract `<ident>`.
+    //
+    // We keep this intentionally shallow: it is only used to make repo-owned hint packs
+    // less brittle (avoid requiring binder names like `n`).
+    let patterns = [
+        format!("% {modulus} ="),
+        format!("%{modulus} ="),
+        format!("% {modulus}="),
+        format!("%{modulus}="),
+    ];
+    for ln in goal_pretty.lines() {
+        let Some((idx, _pat)) = patterns.iter().find_map(|p| ln.find(p).map(|i| (i, p))) else {
+            continue;
+        };
+        let prefix = ln[..idx].trim_end();
+        // Walk backwards: skip whitespace/punctuation, then read the last identifier.
+        let mut ident_rev = String::new();
+        let mut started = false;
+        for ch in prefix.chars().rev() {
+            if !started {
+                if is_lean_ident_char(ch) {
+                    started = true;
+                    ident_rev.push(ch);
+                } else {
+                    continue;
+                }
+            } else if is_lean_ident_char(ch) {
+                ident_rev.push(ch);
+            } else {
+                break;
+            }
+        }
+        if !ident_rev.is_empty() {
+            return Some(ident_rev.chars().rev().collect());
+        }
+    }
+    None
+}
+
+pub fn derive_candidates_from_goal_pretty_with_hint_rules(
+    goal_pretty: &str,
+    hint_rules: &[crate::config::HintRule],
+) -> Vec<String> {
     let g = goal_pretty;
     let mut out: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.to_string();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    };
 
-    // Always include a few cheap tries.
-    out.push("by\n  simp".to_string());
-    out.push("by\n  assumption".to_string());
-    out.push("by\n  aesop".to_string());
-    out.push("by\n  aesop?".to_string());
-    out.push("by\n  simp_all".to_string());
+    // Note: we intentionally avoid emitting candidates that rely on suggestion tactics
+    // (`exact?`, `apply?`) from this low-level heuristic function. Those can be powerful, but
+    // they are not deterministic and they require mathlib to be configured with the relevant
+    // tactics. (The CLI has a dedicated oracle path for suggestion tactics.)
 
     // Goal-shape heuristics.
     let has_ineq = g.contains("≤") || g.contains("≥") || g.contains("<") || g.contains(">");
@@ -2997,23 +3697,79 @@ pub fn derive_candidates_from_goal_pretty(goal_pretty: &str) -> Vec<String> {
     let has_nat = g.contains("Nat") || g.contains("ℕ");
     let has_int = g.contains("Int") || g.contains("ℤ");
     let has_real = g.contains("Real") || g.contains("ℝ");
+    let has_mod = g.contains("%");
+    let _has_odd_goal = g.lines().any(|ln| ln.trim_start().starts_with("⊢ Odd "));
+    let has_zmod_small = g.contains("ZMod 4") || g.contains("ZMod 8");
+
+    // Note: domain-shaped "I know this lemma pattern" heuristics belong in repo-owned hint packs
+    // (`proofpatch.toml`), not in proofpatch core. Keep core generic.
+
+    // Baseline "try me" tactics (tree-search `lean-try` relies on this list).
+    push("by\n  simp");
+    push("by\n  simp_all");
+    push("by\n  assumption");
+    push("by\n  aesop");
+    push("by\n  aesop?");
+    if g.contains("⊢ ∀") || g.contains("→") {
+        push("by\n  intro");
+    }
+    if g.contains("∧") {
+        push("by\n  constructor");
+    }
+
+    // `omega` is particularly strong for modular arithmetic and case splits on small enums.
+    if has_nat && has_mod {
+        push("by\n  omega");
+    }
 
     if has_ineq && (has_nat || has_int) {
-        out.push("by\n  omega".to_string());
+        push("by\n  omega");
     }
     if has_ineq && (has_real || has_mul || has_pow) {
-        out.push("by\n  nlinarith".to_string());
-        out.push("by\n  linarith".to_string());
+        push("by\n  nlinarith");
+        push("by\n  linarith");
     }
     if has_pow || has_mul {
-        out.push("by\n  ring_nf".to_string());
-        out.push("by\n  norm_num".to_string());
+        push("by\n  ring_nf");
+        push("by\n  norm_num");
+    }
+
+    // Finite-ring facts are often decidable by brute force (and mathlib uses this routinely).
+    if has_zmod_small && g.contains("≠") {
+        push("by\n  decide");
+    }
+
+    // Apply configurable hint rules (repo-owned `proofpatch.toml` packs).
+    //
+    // This is the primary mechanism for repo-specific accelerants while keeping proofpatch itself
+    // target-repo agnostic.
+    let mod8_lhs = extract_mod_eq_lhs_ident(g, "8");
+    for r in hint_rules {
+        let all_ok = r.when_contains_all.iter().all(|tok| g.contains(tok));
+        let any_ok =
+            r.when_contains_any.is_empty() || r.when_contains_any.iter().any(|tok| g.contains(tok));
+        if all_ok && any_ok {
+            for c in &r.candidates {
+                let t = c.trim();
+                if !t.is_empty() {
+                    // Make repo-owned rules less brittle by rewriting the common `n` binder
+                    // if the goal/context surface clearly refers to a different variable.
+                    let t2 = match mod8_lhs.as_deref() {
+                        Some(v) if v != "n" && (t.contains("n %") || t.contains("Odd n")) => {
+                            replace_lean_ident(t, "n", v)
+                        }
+                        _ => t.to_string(),
+                    };
+                    push(&t2);
+                }
+            }
+        }
     }
 
     // Many mathlib goals require classical instances for automation.
-    out.push("by\n  classical\n  simp".to_string());
-    out.push("by\n  classical\n  assumption".to_string());
-    out.push("by\n  classical\n  aesop".to_string());
+    push("by\n  classical\n  simp");
+    push("by\n  classical\n  assumption");
+    push("by\n  classical\n  aesop");
 
     // Deduplicate while preserving order.
     let mut seen = std::collections::HashSet::new();
@@ -3027,6 +3783,14 @@ pub fn derive_candidates_from_goal_pretty(goal_pretty: &str) -> Vec<String> {
 /// This is intentionally heuristic and bounded. It should never assume a specific backend
 /// representation (we only use strings).
 pub fn derive_candidates_from_goal_context(hyps_texts: &[String], target: &str) -> Vec<String> {
+    derive_candidates_from_goal_context_with_hint_rules(hyps_texts, target, &[])
+}
+
+pub fn derive_candidates_from_goal_context_with_hint_rules(
+    hyps_texts: &[String],
+    target: &str,
+    hint_rules: &[crate::config::HintRule],
+) -> Vec<String> {
     // Build a compact “goal pretty” surface that includes the target plus a few hypotheses.
     // This lets `derive_candidates_from_goal_pretty` pick up on Nat/Int/Real heuristics.
     let mut s = String::new();
@@ -3042,7 +3806,135 @@ pub fn derive_candidates_from_goal_context(hyps_texts: &[String], target: &str) 
         s.push_str(t);
         s.push('\n');
     }
-    derive_candidates_from_goal_pretty(&s)
+    derive_candidates_from_goal_pretty_with_hint_rules(&s, hint_rules)
+}
+
+/// Cheap goal analysis for tactic routing (best-effort).
+///
+/// This is meant to speed up proof development by:
+/// - classifying goals into a few common “buckets”,
+/// - producing a ranked list of deterministic tactics to try first,
+/// - and indicating when SMT-LIA is likely applicable.
+///
+/// It is intentionally shallow: no Lean elaboration, no heavy parsing.
+pub fn analyze_pp_dump(pp_dump: &serde_json::Value) -> serde_json::Value {
+    let goals = pp_dump
+        .get("goals")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let goal0 = goals.get(0).cloned().unwrap_or(serde_json::Value::Null);
+    let pretty = goal0
+        .get("pretty")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let hyps_texts: Vec<String> = goal0
+        .get("hyps")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|h| {
+                    h.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let has_finset = pretty.contains("Finset") || pretty.contains("∑") || pretty.contains("card");
+    let has_eq = pretty.contains(" = ");
+    let has_ineq = pretty.contains("≤")
+        || pretty.contains("≥")
+        || pretty.contains("<")
+        || pretty.contains(">");
+    let has_pow = pretty.contains("^");
+    let has_mul = pretty.contains("*");
+    let has_add = pretty.contains("+");
+    let has_nat = pretty.contains("Nat") || pretty.contains("ℕ");
+    let has_int = pretty.contains("Int") || pretty.contains("ℤ");
+    let has_rat = pretty.contains("Rat") || pretty.contains("ℚ");
+    let has_real = pretty.contains("Real") || pretty.contains("ℝ");
+    let has_matrix = pretty.contains("Matrix") || pretty.contains("dot") || pretty.contains("gso");
+
+    // “SMT-ish” here means: linear-ish arithmetic over Int/Nat with inequalities, and not obviously
+    // dominated by Finset/matrix structure. This is deliberately conservative.
+    let smt_lia_likely = has_ineq && (has_int || has_nat) && !has_finset && !has_matrix;
+
+    // Build a ranked tactic list: cheap → targeted → heavier automation.
+    let mut tactics: Vec<String> = Vec::new();
+    tactics.push("by\n  simp".to_string());
+    tactics.push("by\n  simp_all".to_string());
+    tactics.push("by\n  aesop".to_string());
+    tactics.push("by\n  aesop?".to_string());
+    tactics.push("by\n  assumption".to_string());
+    tactics.push("by\n  intro".to_string());
+
+    if has_finset {
+        tactics.push("by\n  classical\n  simp".to_string());
+        tactics.push("by\n  classical\n  simp [Finset.mul_sum, Finset.sum_mul]".to_string());
+    }
+    if has_eq && (has_mul || has_add || has_pow) && (has_int || has_rat || has_real) {
+        tactics.push("by\n  ring_nf".to_string());
+        tactics.push("by\n  ring".to_string());
+        tactics.push("by\n  nlinarith".to_string());
+    }
+    if has_ineq && (has_real || has_rat) {
+        tactics.push("by\n  nlinarith".to_string());
+        tactics.push("by\n  linarith".to_string());
+    }
+    if has_ineq && (has_nat || has_int) {
+        tactics.push("by\n  omega".to_string());
+        tactics.push("by\n  nlinarith".to_string());
+    }
+
+    // Always include the “classical” versions at the end.
+    tactics.push("by\n  classical\n  simp".to_string());
+    tactics.push("by\n  classical\n  aesop".to_string());
+
+    // Dedup + cap.
+    let mut seen = std::collections::HashSet::new();
+    tactics.retain(|s| seen.insert(s.clone()));
+    tactics.truncate(16);
+
+    let kind = if smt_lia_likely {
+        "arith_lia_candidate"
+    } else if has_finset {
+        "finset_combinatorics"
+    } else if has_matrix {
+        "linear_algebra_structural"
+    } else if has_eq && (has_mul || has_pow || has_add) {
+        "algebraic_simp_ring"
+    } else if has_ineq {
+        "inequality"
+    } else {
+        "unknown"
+    };
+
+    serde_json::json!({
+        "ok": true,
+        "kind": kind,
+        "signals": {
+            "finset": has_finset,
+            "eq": has_eq,
+            "ineq": has_ineq,
+            "pow": has_pow,
+            "mul": has_mul,
+            "nat": has_nat,
+            "int": has_int,
+            "rat": has_rat,
+            "real": has_real,
+            "matrix": has_matrix,
+        },
+        "smt_lia_likely": smt_lia_likely,
+        "tactics": tactics,
+        "goal": {
+            "pretty": pretty,
+            "hyps_count": hyps_texts.len(),
+            "goals_count": goals.len(),
+        }
+    })
 }
 
 /// Create and verify a temporary "goal dump" variant of a file near the primary `sorry`.
@@ -3091,42 +3983,50 @@ pub async fn goal_dump_nearest(
     )?;
 
     // Insert helper tactic definition after the import block (imports must be at file start).
+    //
+    // This must be robust across Lean toolchains. Keep it tiny and rely only on `import Lean`.
     let prelude = r#"
+import Lean
+
 open Lean Meta Elab Tactic
 
 namespace ProofpatchInline
 
-elab "pp_dump" : tactic => do
-  let goals ← getGoals
-  let mut goalsJson : Array Json := #[]
-  let mut i : Nat := 0
-  for g in goals do
-    let fmt ← liftMetaM (Lean.Meta.ppGoal g)
-    -- Version-robust “local context”: parse it from `ppGoal` output.
-    -- This avoids depending on Lean Meta APIs that may differ across toolchains.
-    let mut hyps : Array Json := #[]
-    for ln in fmt.pretty.splitOn "\n" do
+private def exprToString (e : Expr) : MetaM String := do
+  let fmt ← ppExpr e
+  pure fmt.pretty
+
+private def localDeclToJson (d : LocalDecl) : MetaM Lean.Json := do
+  let name := d.userName.toString
+  let tyStr ← exprToString d.type
+  return Lean.Json.mkObj [("text", Lean.Json.str s!"{name} : {tyStr}")]
+
+private def goalToJson (g : MVarId) : MetaM Lean.Json := do
+  g.withContext do
+    let fmt ← Lean.Meta.ppGoal g
+    let lctx ← getLCtx
+    let mut hyps : Array Lean.Json := #[]
+    for d in lctx do
       if hyps.size >= 40 then
         break
-      let t := ln.trimAscii.toString
-      if t.isEmpty then
+      if d.isImplementationDetail then
         continue
-      if t.startsWith "⊢" then
-        break
-      hyps := hyps.push (Json.mkObj [("text", Json.str t)])
-    goalsJson := goalsJson.push (Json.mkObj [
-      ("id", Json.num i),
-      ("pretty", Json.str fmt.pretty),
-      ("hyps", Json.arr hyps)
-    ])
-    i := i + 1
-  let out := Json.mkObj [
-    ("tool", Json.str "proofpatch"),
-    ("kind", Json.str "pp_dump"),
-    ("goals", Json.arr goalsJson)
+      hyps := hyps.push (← localDeclToJson d)
+    return Lean.Json.mkObj [
+      ("pretty", Lean.Json.str fmt.pretty),
+      ("hyps", Lean.Json.arr hyps)
+    ]
+
+elab "pp_dump" : tactic => do
+  let goals ← getGoals
+  let mut goalsJson : Array Lean.Json := #[]
+  for g in goals do
+    goalsJson := goalsJson.push (← liftMetaM (goalToJson g))
+  let out := Lean.Json.mkObj [
+    ("tool", Lean.Json.str "proofpatch"),
+    ("kind", Lean.Json.str "pp_dump"),
+    ("goals", Lean.Json.arr goalsJson)
   ]
-  -- Use a warning channel so the message is visible in non-interactive `lean` runs.
-  -- Prefix with a newline so the JSON starts at column 0 on its own line, making it easy to parse.
   logWarning m!"\n{toString out}"
 
 end ProofpatchInline
@@ -3189,7 +4089,11 @@ end ProofpatchInline
     }))
 }
 
-fn extract_try_this_suggestions(text: &str) -> Vec<String> {
+/// Best-effort parsing for mathlib-style suggestion tactics (`simp?`, `aesop?`, `exact?`, `apply?`).
+///
+/// Returns a bounded, deduplicated list of suggested tactic scripts, with any leading `"[tag]"`
+/// prefix removed.
+pub fn extract_try_this_suggestions(text: &str) -> Vec<String> {
     // mathlib suggestion tactics often emit either:
     //   "Try this: <tactic script>"
     // or:
@@ -3213,15 +4117,45 @@ fn extract_try_this_suggestions(text: &str) -> Vec<String> {
                     j += 1;
                 }
                 if j < lines.len() {
-                    let mut cand = lines[j].trim().to_string();
-                    // Strip leading "[tag]" prefix.
-                    if cand.starts_with('[') {
-                        if let Some(k) = cand.find(']') {
-                            cand = cand[k + 1..].trim().to_string();
+                    // Capture a (possibly multi-line) suggestion block.
+                    //
+                    // Typical shapes:
+                    // - `Try this:` then one indented line
+                    // - `Try this:` then multiple indented lines (e.g. `refine ...` with bullets `·`)
+                    //
+                    // We keep it conservative: take the first non-empty line, then keep consuming
+                    // subsequent lines while they stay indented. Stop at the first empty line.
+                    let first_raw = lines[j];
+                    let mut cand_lines: Vec<String> = Vec::new();
+                    let first_trim = first_raw.trim();
+                    if !first_trim.is_empty() {
+                        let mut line = first_trim.to_string();
+                        // Strip leading "[tag]" prefix.
+                        if line.starts_with('[') {
+                            if let Some(k) = line.find(']') {
+                                line = line[k + 1..].trim().to_string();
+                            }
+                        }
+                        if !line.is_empty() {
+                            cand_lines.push(line);
+                            let mut k = j + 1;
+                            while k < lines.len() {
+                                let raw = lines[k];
+                                if raw.trim().is_empty() {
+                                    break;
+                                }
+                                // Only keep "continuation" lines that are indented in the original output.
+                                let cont = raw.starts_with(' ') || raw.starts_with('\t');
+                                if !cont {
+                                    break;
+                                }
+                                cand_lines.push(raw.trim().to_string());
+                                k += 1;
+                            }
                         }
                     }
-                    if !cand.is_empty() {
-                        out.push(cand);
+                    if !cand_lines.is_empty() {
+                        out.push(cand_lines.join("\n"));
                     }
                 }
             }
@@ -3406,41 +4340,48 @@ pub async fn lean_suggest_in_text_at(
     try_tactics.truncate(max_passes);
 
     let prelude = r#"
+import Lean
+
 open Lean Meta Elab Tactic
 
 namespace ProofpatchInline
 
-elab "pp_dump" : tactic => do
-  let goals ← getGoals
-  let mut goalsJson : Array Json := #[]
-  let mut i : Nat := 0
-  for g in goals do
-    let fmt ← liftMetaM (Lean.Meta.ppGoal g)
-    -- Version-robust “local context”: parse it from `ppGoal` output.
-    -- This avoids depending on Lean Meta APIs that may differ across toolchains.
-    let mut hyps : Array Json := #[]
-    for ln in fmt.pretty.splitOn "\n" do
+private def exprToString (e : Expr) : MetaM String := do
+  let fmt ← ppExpr e
+  pure fmt.pretty
+
+private def localDeclToJson (d : LocalDecl) : MetaM Lean.Json := do
+  let name := d.userName.toString
+  let tyStr ← exprToString d.type
+  return Lean.Json.mkObj [("text", Lean.Json.str s!"{name} : {tyStr}")]
+
+private def goalToJson (g : MVarId) : MetaM Lean.Json := do
+  g.withContext do
+    let fmt ← Lean.Meta.ppGoal g
+    let lctx ← getLCtx
+    let mut hyps : Array Lean.Json := #[]
+    for d in lctx do
       if hyps.size >= 40 then
         break
-      let t := ln.trimAscii.toString
-      if t.isEmpty then
+      if d.isImplementationDetail then
         continue
-      if t.startsWith "⊢" then
-        break
-      hyps := hyps.push (Json.mkObj [("text", Json.str t)])
-    goalsJson := goalsJson.push (Json.mkObj [
-      ("id", Json.num i),
-      ("pretty", Json.str fmt.pretty),
-      ("hyps", Json.arr hyps)
-    ])
-    i := i + 1
-  let out := Json.mkObj [
-    ("tool", Json.str "proofpatch"),
-    ("kind", Json.str "pp_dump"),
-    ("goals", Json.arr goalsJson)
+      hyps := hyps.push (← localDeclToJson d)
+    return Lean.Json.mkObj [
+      ("pretty", Lean.Json.str fmt.pretty),
+      ("hyps", Lean.Json.arr hyps)
+    ]
+
+elab "pp_dump" : tactic => do
+  let goals ← getGoals
+  let mut goalsJson : Array Lean.Json := #[]
+  for g in goals do
+    goalsJson := goalsJson.push (← liftMetaM (goalToJson g))
+  let out := Lean.Json.mkObj [
+    ("tool", Lean.Json.str "proofpatch"),
+    ("kind", Lean.Json.str "pp_dump"),
+    ("goals", Lean.Json.arr goalsJson)
   ]
-  -- Use a warning channel so the message is visible in non-interactive `lean` runs.
-  logWarning m!"{toString out}"
+  logWarning m!"\n{toString out}"
 
 end ProofpatchInline
 "#;
@@ -3619,40 +4560,48 @@ pub async fn goal_dump_in_text_at(
     )?;
 
     let prelude = r#"
+import Lean
+
 open Lean Meta Elab Tactic
 
 namespace ProofpatchInline
 
-elab "pp_dump" : tactic => do
-  let goals ← getGoals
-  let mut goalsJson : Array Json := #[]
-  let mut i : Nat := 0
-  for g in goals do
-    let fmt ← liftMetaM (Lean.Meta.ppGoal g)
-    -- Version-robust “local context”: parse it from `ppGoal` output.
-    let mut hyps : Array Json := #[]
-    for ln in fmt.pretty.splitOn "\n" do
+private def exprToString (e : Expr) : MetaM String := do
+  let fmt ← ppExpr e
+  pure fmt.pretty
+
+private def localDeclToJson (d : LocalDecl) : MetaM Lean.Json := do
+  let name := d.userName.toString
+  let tyStr ← exprToString d.type
+  return Lean.Json.mkObj [("text", Lean.Json.str s!"{name} : {tyStr}")]
+
+private def goalToJson (g : MVarId) : MetaM Lean.Json := do
+  g.withContext do
+    let fmt ← Lean.Meta.ppGoal g
+    let lctx ← getLCtx
+    let mut hyps : Array Lean.Json := #[]
+    for d in lctx do
       if hyps.size >= 40 then
         break
-      let t := ln.trimAscii.toString
-      if t.isEmpty then
+      if d.isImplementationDetail then
         continue
-      if t.startsWith "⊢" then
-        break
-      hyps := hyps.push (Json.mkObj [("text", Json.str t)])
-    goalsJson := goalsJson.push (Json.mkObj [
-      ("id", Json.num i),
-      ("pretty", Json.str fmt.pretty),
-      ("hyps", Json.arr hyps)
-    ])
-    i := i + 1
-  let out := Json.mkObj [
-    ("tool", Json.str "proofpatch"),
-    ("kind", Json.str "pp_dump"),
-    ("goals", Json.arr goalsJson)
+      hyps := hyps.push (← localDeclToJson d)
+    return Lean.Json.mkObj [
+      ("pretty", Lean.Json.str fmt.pretty),
+      ("hyps", Lean.Json.arr hyps)
+    ]
+
+elab "pp_dump" : tactic => do
+  let goals ← getGoals
+  let mut goalsJson : Array Lean.Json := #[]
+  for g in goals do
+    goalsJson := goalsJson.push (← liftMetaM (goalToJson g))
+  let out := Lean.Json.mkObj [
+    ("tool", Lean.Json.str "proofpatch"),
+    ("kind", Lean.Json.str "pp_dump"),
+    ("goals", Lean.Json.arr goalsJson)
   ]
-  -- Use a warning channel so the message is visible in non-interactive `lean` runs.
-  logWarning m!"{toString out}"
+  logWarning m!"\n{toString out}"
 
 end ProofpatchInline
 "#;
@@ -3684,5 +4633,68 @@ end ProofpatchInline
         "verify": { "raw": raw_v },
         "pp_dump": pp_dump.unwrap_or(serde_json::Value::Null),
         "oracle_mode": "dump_only",
+    }))
+}
+
+pub async fn goal_dump_shadow_decl(
+    repo_root: &Path,
+    file_rel: &str,
+    decl_name: &str,
+    timeout_s: Duration,
+) -> Result<serde_json::Value, String> {
+    let repo_root = find_lean_repo_root(repo_root)?;
+    load_dotenv_smart(&repo_root);
+
+    let shadow = synthesize_pp_dump_shadow_decl(&repo_root, file_rel, decl_name)?;
+    // `synthesize_pp_dump_shadow_decl` already embeds the `pp_dump` tactic prelude, so don't inject
+    // another copy here (duplicate private defs will hard-error).
+    let verify = verify_lean_text(&repo_root, &shadow, timeout_s).await?;
+    let raw_v = serde_json::to_value(&verify)
+        .map_err(|e| format!("failed to serialize verify result: {e}"))?;
+
+    let summary = {
+        let v = serde_json::to_value(&verify).map_err(|e| format!("json: {e}"))?;
+        let stdout = v.get("stdout").and_then(|x| x.as_str()).unwrap_or("");
+        let stderr = v.get("stderr").and_then(|x| x.as_str()).unwrap_or("");
+        let first_error_loc =
+            parse_first_error_loc(stdout, stderr).and_then(|loc| serde_json::to_value(loc).ok());
+        let errors = stdout.matches(": error:").count()
+            + stdout.matches(": error(").count()
+            + stderr.matches(": error:").count()
+            + stderr.matches(": error(").count();
+        let warnings = stdout.matches(": warning:").count()
+            + stdout.matches(": warning(").count()
+            + stderr.matches(": warning:").count()
+            + stderr.matches(": warning(").count();
+        serde_json::json!({
+            "ok": v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false),
+            "timeout": v.get("timeout").and_then(|x| x.as_bool()).unwrap_or(false),
+            "returncode": v.get("returncode").cloned().unwrap_or(serde_json::Value::Null),
+            "counts": { "errors": errors, "warnings": warnings },
+            "first_error": stdout
+                .lines()
+                .find(|l| l.contains(": error:") || l.contains(": error("))
+                .or_else(|| stderr.lines().find(|l| l.contains(": error:") || l.contains(": error("))),
+            "first_error_loc": first_error_loc,
+        })
+    };
+
+    let mut pp_dump: Option<serde_json::Value> = None;
+    let merged = format!("{}\n{}", verify.stdout, verify.stderr);
+    for obj in extract_json_object_by_brace_balance(&merged) {
+        let is_pp = obj.get("tool").and_then(|v| v.as_str()) == Some("proofpatch")
+            && obj.get("kind").and_then(|v| v.as_str()) == Some("pp_dump");
+        if is_pp {
+            pp_dump = Some(obj);
+            break;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "repo_root": repo_root.display().to_string(),
+        "file": file_rel,
+        "decl": decl_name,
+        "verify": { "summary": summary, "raw": raw_v },
+        "pp_dump": pp_dump.unwrap_or(serde_json::Value::Null),
     }))
 }

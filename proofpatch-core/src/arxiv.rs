@@ -119,8 +119,12 @@ pub async fn arxiv_search(
     timeout: Duration,
 ) -> Result<Vec<ArxivPaper>, String> {
     let max_results = max_results.clamp(1, 50);
+    // arXiv strongly prefers clients identify themselves. Also, `export.arxiv.org` can rate-limit;
+    // we keep a tiny bounded retry/backoff loop for 429/transport failures.
+    let ua = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     let client = reqwest::Client::builder()
         .timeout(timeout)
+        .user_agent(ua)
         .build()
         .map_err(|e| format!("reqwest client: {e}"))?;
     let mut url = reqwest::Url::parse("https://export.arxiv.org/api/query")
@@ -129,15 +133,60 @@ pub async fn arxiv_search(
         .append_pair("search_query", &format!("all:{query}"))
         .append_pair("start", "0")
         .append_pair("max_results", &max_results.to_string());
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("arxiv fetch: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("arxiv fetch status: {}", resp.status()));
-    }
-    let xml = resp.text().await.map_err(|e| format!("arxiv text: {e}"))?;
-    Ok(parse_arxiv_atom(&xml, max_results))
-}
 
+    let max_retries = std::env::var("PROOFPATCH_ARXIV_MAX_RETRIES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(2)
+        .min(6);
+
+    let mut last_err: Option<String> = None;
+    for attempt in 0..=max_retries {
+        let resp_res = client.get(url.clone()).send().await;
+        match resp_res {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    let xml = resp.text().await.map_err(|e| format!("arxiv text: {e}"))?;
+                    return Ok(parse_arxiv_atom(&xml, max_results));
+                }
+                // Rate limit / transient: bounded backoff, then retry.
+                if status.as_u16() == 429 || status.is_server_error() {
+                    let retry_after_s = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(0);
+                    last_err = Some(format!("arxiv fetch status: {}", status));
+                    if attempt < max_retries {
+                        let base = match attempt {
+                            0 => 1u64,
+                            1 => 2u64,
+                            2 => 4u64,
+                            _ => 6u64,
+                        };
+                        let sleep_s = base.max(retry_after_s).min(8);
+                        tokio::time::sleep(Duration::from_secs(sleep_s)).await;
+                        continue;
+                    }
+                }
+                return Err(format!("arxiv fetch status: {}", status));
+            }
+            Err(e) => {
+                last_err = Some(format!("arxiv fetch: {e}"));
+                if attempt < max_retries {
+                    let sleep_s = match attempt {
+                        0 => 1u64,
+                        1 => 2u64,
+                        2 => 4u64,
+                        _ => 6u64,
+                    };
+                    tokio::time::sleep(Duration::from_secs(sleep_s.min(8))).await;
+                    continue;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "arxiv fetch: unknown error".to_string()))
+}

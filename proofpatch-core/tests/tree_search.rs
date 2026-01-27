@@ -1,4 +1,5 @@
 use proofpatch_core::tree_search as ts;
+use proofpatch_core::{config, derive_candidates_from_goal_pretty_with_hint_rules};
 
 #[test]
 fn sanitize_candidates_dedupes_and_bounds() {
@@ -72,4 +73,53 @@ Foo.lean:1:2: error: boom
     let b = ts::extract_initial_goal_block(s).expect("expected block");
     assert!(b.contains("Initial goal:"));
     assert!(b.contains("⊢ True"));
+}
+
+#[test]
+fn replace_in_region_once_only_rewrites_inside_region() {
+    let src = "theorem t : True := by\n  exact?\n\n-- another exact?\n";
+    let out = ts::replace_in_region_once(src, 1, 2, "exact?", "exact True.intro")
+        .expect("expected replacement");
+    assert!(out.contains("exact True.intro"));
+    assert!(out.contains("-- another exact?"));
+}
+
+#[test]
+fn replace_in_region_once_supports_multiline_new_text() {
+    let src = "theorem t : True := by\n  exact?\n";
+    let new_block = "refine True.intro\n  trivial";
+    let out =
+        ts::replace_in_region_once(src, 1, 2, "exact?", new_block).expect("expected replacement");
+    assert!(out.contains("refine True.intro"));
+    assert!(out.contains("trivial"));
+}
+
+#[test]
+fn replace_in_region_first_rewrites_first_occurrence_only() {
+    let src = "theorem t : True := by\n  exact?\n  exact?\n";
+    let out = ts::replace_in_region_first(src, 1, 3, "exact?", "exact True.intro")
+        .expect("expected replacement");
+    // First one replaced, second remains.
+    assert!(out.contains("exact True.intro"));
+    assert_eq!(out.matches("exact?").count(), 1);
+}
+
+#[test]
+fn hint_rules_can_rewrite_mod8_binder_name() {
+    let goal_pretty = r#"
+  n1 : Nat
+  h : m % 8 = 3
+  ⊢ Odd m
+"#;
+    let rules = vec![config::HintRule {
+        when_contains_all: vec!["⊢ Odd".to_string(), "% 8 =".to_string()],
+        when_contains_any: vec![],
+        candidates: vec![
+            "by\n  have h2 : n % 2 = 1 := by omega\n  exact Nat.odd_iff.2 h2".to_string(),
+        ],
+    }];
+    let out = derive_candidates_from_goal_pretty_with_hint_rules(goal_pretty, &rules);
+    assert!(out.iter().any(|c| c.contains("have h2 : m % 2 = 1")));
+    // Ensure we didn't keep the brittle binder.
+    assert!(!out.iter().any(|c| c.contains("have h2 : n % 2 = 1")));
 }

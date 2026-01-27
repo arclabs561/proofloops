@@ -1,9 +1,10 @@
 #![recursion_limit = "256"]
 
 use proofpatch_core as plc;
-use serde_json::json;
 use schemars::JsonSchema;
+use serde_json::json;
 use similar::TextDiff;
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 use std::{fs, io};
@@ -129,7 +130,9 @@ fn cap_summary_v2(
     s.mathlib_idents.retain(|id| {
         !id.is_empty()
             && id.len() <= preset.llm_max_str_chars
-            && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'' ))
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))
     });
     cap_string_list(
         &mut s.search_queries,
@@ -371,6 +374,37 @@ fn arg_flag(args: &[String], key: &str) -> bool {
     args.iter().any(|a| a == key)
 }
 
+fn load_hint_rules(
+    repo_root: &std::path::Path,
+    research_preset: Option<&str>,
+) -> Vec<plc::config::HintRule> {
+    let Ok(Some(cfg)) = plc::config::load_from_repo_root(repo_root) else {
+        return Vec::new();
+    };
+
+    // Start from repo defaults (proofpatch remains repo-agnostic; the repo opts in).
+    let mut enabled: Vec<String> = cfg.hints.defaults.enabled_packs.clone();
+
+    // If a research preset provides explicit packs, treat it as an override.
+    if let Some(preset_name) = research_preset {
+        if let Some(preset) = cfg.research.resolve_preset(preset_name) {
+            if let Some(ts) = preset.tree_search {
+                if let Some(packs) = ts.hint_packs {
+                    enabled = packs;
+                }
+            }
+        }
+    }
+
+    let mut rules: Vec<plc::config::HintRule> = Vec::new();
+    for name in enabled {
+        if let Some(pack) = cfg.hints.packs.get(&name) {
+            rules.extend(pack.rules.clone());
+        }
+    }
+    rules
+}
+
 fn env_truthy(name: &str, default_on: bool) -> bool {
     let v = std::env::var(name).ok().unwrap_or_default();
     let v = v.trim().to_lowercase();
@@ -395,6 +429,13 @@ fn write_json(path: &std::path::Path, value: &serde_json::Value) -> Result<(), S
     io::Write::write_all(&mut f, s.as_bytes())
         .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
     Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
 }
 
 fn read_json(path: &std::path::Path) -> Option<serde_json::Value> {
@@ -422,6 +463,148 @@ fn durable_atomic_write(cache_root: &std::path::Path, rel: &str, data: &[u8]) {
             let _ = std::fs::write(p, data);
         }
     }
+}
+
+fn hyp_name_from_text_line(s: &str) -> Option<String> {
+    let (lhs, _) = s.split_once(':')?;
+    let nm = lhs.trim().split_whitespace().next()?.trim();
+    if nm.is_empty() {
+        return None;
+    }
+    if nm
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphabetic() || c == '_')
+        .unwrap_or(false)
+        && nm.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        Some(nm.to_string())
+    } else {
+        None
+    }
+}
+
+fn smt_support_lean_hints(
+    core: &serde_json::Value,
+    ctx_hyp_names: &std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    let items = core.get("core_items")?.as_array()?;
+    let mut srcs: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for it in items {
+        let name = it.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if name == "neg_target" {
+            continue;
+        }
+        let is_ident = name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        // Only include hypothesis names that actually exist in the Lean local context.
+        if is_ident && ctx_hyp_names.contains(name) {
+            names.push(name.to_string());
+        }
+        let src = it.get("src")?.as_str()?.trim();
+        if !src.is_empty() {
+            srcs.push(src.to_string());
+        }
+    }
+    srcs.sort();
+    srcs.dedup();
+    srcs.truncate(12);
+    names.sort();
+    names.dedup();
+
+    let mut comment = String::new();
+    if !srcs.is_empty() {
+        comment.push_str("  -- SMT support set:\n");
+        for s in &srcs {
+            comment.push_str(&format!("  --   * {s}\n"));
+        }
+    } else {
+        comment.push_str("  -- SMT support set: (unavailable)\n");
+    }
+    let bracketed = if names.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", names.join(", "))
+    };
+
+    // “Support-guided proof search”: emit a small, bounded portfolio of tactic scripts.
+    // The caller will verify and pick what works.
+    let mut out: Vec<String> = Vec::new();
+    out.push(format!(
+        "by\n  -- proofpatch:smt_support\n{comment}  try (norm_cast; done)\n  try (linarith{bracketed}; done)\n  try (nlinarith{bracketed}; done)\n  try (omega; done)"
+    ));
+    out.push(format!(
+        "by\n  -- proofpatch:smt_support\n{comment}  try (simp; norm_cast; done)\n  try (simp; linarith{bracketed}; done)\n  try (simp; nlinarith{bracketed}; done)\n  try (simp; omega; done)"
+    ));
+    out.push(format!(
+        "by\n  -- proofpatch:smt_support\n{comment}  try (omega; done)\n  try (linarith{bracketed}; done)\n  try (nlinarith{bracketed}; done)\n  try (norm_cast; done)"
+    ));
+    out.push(format!(
+        "by\n  -- proofpatch:smt_support\n{comment}  try (nlinarith{bracketed}; done)\n  try (linarith{bracketed}; done)\n  try (omega; done)"
+    ));
+    out.push(format!(
+        "by\n  -- proofpatch:smt_support\n{comment}  try (linarith{bracketed}; done)\n  try (omega; done)\n  try (nlinarith{bracketed}; done)"
+    ));
+    Some(out)
+}
+
+fn smt_dump_root(
+    repo_root: &std::path::Path,
+    smt_dump_dir_opt: &Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let Some(p) = smt_dump_dir_opt.as_ref() {
+        if p.is_absolute() {
+            p.clone()
+        } else {
+            repo_root.join(p)
+        }
+    } else {
+        repo_root.join(".generated").join("proofpatch-smt2")
+    }
+}
+
+fn smt_proof_dump_root(
+    repo_root: &std::path::Path,
+    smt_proof_dump_dir_opt: &Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let Some(p) = smt_proof_dump_dir_opt.as_ref() {
+        if p.is_absolute() {
+            p.clone()
+        } else {
+            repo_root.join(p)
+        }
+    } else {
+        repo_root.join(".generated").join("proofpatch-smtproof")
+    }
+}
+
+fn maybe_write_smt2_dump(
+    root: &std::path::Path,
+    state_key: u64,
+    goal_sig: u64,
+    depth: usize,
+    script: &str,
+) -> String {
+    let rel = format!("smt2/{state_key}_{goal_sig}_d{depth}.smt2");
+    durable_atomic_write(root, &rel, script.as_bytes());
+    root.join(rel).display().to_string()
+}
+
+fn maybe_write_smt_proof_dump(
+    root: &std::path::Path,
+    state_key: u64,
+    goal_sig: u64,
+    depth: usize,
+    proof_text: &str,
+) -> String {
+    let rel = format!("proof/{state_key}_{goal_sig}_d{depth}.sexp");
+    durable_atomic_write(root, &rel, proof_text.as_bytes());
+    root.join(rel).display().to_string()
 }
 
 fn cache_read_eval(
@@ -591,11 +774,20 @@ fn cache_read_smt_entails(
     cache_dir: &std::path::Path,
     state_key: u64,
     goal_sig: u64,
+    depth: usize,
 ) -> Option<bool> {
-    let p = cache_dir
-        .join("smt")
-        .join(format!("{state_key}_{goal_sig}.json"));
-    let v = read_json(&p)?;
+    let dir = cache_dir.join("smt");
+    let p_new = dir.join(format!("{state_key}_{goal_sig}_d{depth}.json"));
+    let v = read_json(&p_new).or_else(|| {
+        // Back-compat: old cache key did not include depth. Only accept it for depth=0
+        // since other depths have different semantics.
+        if depth == 0 {
+            let p_old = dir.join(format!("{state_key}_{goal_sig}.json"));
+            read_json(&p_old)
+        } else {
+            None
+        }
+    })?;
     v.get("entails").and_then(|x| x.as_bool())
 }
 
@@ -603,320 +795,131 @@ fn cache_write_smt_entails(
     cache_dir: &std::path::Path,
     state_key: u64,
     goal_sig: u64,
+    depth: usize,
     entails: bool,
 ) {
-    let rel = format!("smt/{state_key}_{goal_sig}.json");
-    let v = json!({ "state_key": state_key, "goal_sig": goal_sig, "entails": entails });
+    let rel = format!("smt/{state_key}_{goal_sig}_d{depth}.json");
+    let v =
+        json!({ "state_key": state_key, "goal_sig": goal_sig, "depth": depth, "entails": entails });
     durable_atomic_write(cache_dir, &rel, v.to_string().as_bytes());
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SmtVarKind {
-    Int,
-    Nat,
-}
+// SMT/LIA parsing and entailment live in `proofpatch-core::smt_lia` (shared by CLI + MCP).
 
-fn smt_sanitize_name(s: &str) -> String {
-    let mut out = String::new();
-    for ch in s.chars() {
-        if ch.is_alphanumeric() || ch == '_' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        out = "x".to_string();
-    }
-    // SMT-LIB symbols cannot start with a digit unless quoted; keep it simple.
-    if out
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false)
-    {
-        out.insert(0, '_');
-    }
-    out
-}
-
-fn smt_extract_decl_kind(hyp_text: &str) -> Option<(String, SmtVarKind)> {
-    // Very small recognizer for declarations like:
-    // - `n : ℕ`
-    // - `k : Nat`
-    // - `m : ℤ`
-    // - `x : Int`
-    let (name, ty) = hyp_text.split_once(':')?;
-    let name = name.trim();
-    let ty = ty.trim();
-    if name.is_empty() || ty.is_empty() {
-        return None;
-    }
-    let kind = if ty.contains('ℕ') || ty.contains("Nat") {
-        SmtVarKind::Nat
-    } else if ty.contains('ℤ') || ty.contains("Int") {
-        SmtVarKind::Int
-    } else {
-        return None;
-    };
-    Some((smt_sanitize_name(name), kind))
-}
-
-#[derive(Debug, Clone)]
-struct LinearExpr {
-    // var -> coefficient
-    coeffs: std::collections::BTreeMap<String, i64>,
-    c0: i64,
-}
-
-fn parse_linear_expr_int(s: &str) -> Option<LinearExpr> {
-    // Extremely small parser: supports sums/differences of identifiers and integer literals.
-    // Rejects anything with obvious non-LIA operators (*,/ ,^,·, etc).
-    let bad = ['*', '/', '^', '·', '↑', '∑', '∏'];
-    if s.chars().any(|c| bad.contains(&c)) {
-        return None;
-    }
-    let mut coeffs: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    let mut c0: i64 = 0;
-    let mut i = 0usize;
-    let chars: Vec<char> = s.chars().collect();
-    let mut sign: i64 = 1;
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch.is_whitespace() {
-            i += 1;
-            continue;
-        }
-        if ch == '+' {
-            sign = 1;
-            i += 1;
-            continue;
-        }
-        if ch == '-' {
-            sign = -1;
-            i += 1;
-            continue;
-        }
-        // integer literal
-        if ch.is_ascii_digit() {
-            let mut j = i + 1;
-            while j < chars.len() && chars[j].is_ascii_digit() {
-                j += 1;
-            }
-            let lit: String = chars[i..j].iter().collect();
-            let v: i64 = lit.parse().ok()?;
-            c0 = c0.saturating_add(sign.saturating_mul(v));
-            i = j;
-            continue;
-        }
-        // identifier (unicode alnum + '_' + '.' treated as part; we sanitize later)
-        if ch.is_alphanumeric() || ch == '_' || ch == '.' {
-            let mut j = i + 1;
-            while j < chars.len()
-                && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '.')
-            {
-                j += 1;
-            }
-            let raw: String = chars[i..j].iter().collect();
-            let name = smt_sanitize_name(&raw);
-            *coeffs.entry(name).or_insert(0) =
-                coeffs.get(&name).copied().unwrap_or(0).saturating_add(sign);
-            i = j;
-            continue;
-        }
-        // Unknown token.
-        return None;
-    }
-    Some(LinearExpr { coeffs, c0 })
-}
-
-fn linear_expr_to_smt_sexp(e: &LinearExpr) -> smtkit::sexp::Sexp {
-    use smtkit::smt2::t;
-    let mut terms: Vec<smtkit::sexp::Sexp> = Vec::new();
-    if e.c0 != 0 {
-        terms.push(t::int_lit(e.c0));
-    }
-    for (v, c) in e.coeffs.iter() {
-        if *c == 0 {
-            continue;
-        }
-        let sym = t::sym(v.clone());
-        if *c == 1 {
-            terms.push(sym);
-        } else if *c == -1 {
-            terms.push(t::app("-", vec![sym]));
-        } else {
-            terms.push(t::app("*", vec![t::int_lit(*c), sym]));
-        }
-    }
-    if terms.is_empty() {
-        t::int_lit(0)
-    } else if terms.len() == 1 {
-        terms[0].clone()
-    } else {
-        t::add(terms)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ParsedRelConstraint {
-    sexp: smtkit::sexp::Sexp,
-    vars: std::collections::BTreeSet<String>,
-}
-
-fn parse_rel_constraint_int(s: &str) -> Option<ParsedRelConstraint> {
-    // Find a single top-level relation and parse both sides as linear integer expressions.
-    // Supports ASCII and unicode relations: <=, ≥, ≤, >=, <, >, =.
-    let s = s.trim();
-    let ops = ["<=", "≤", ">=", "≥", "<", ">", "="];
-    let (op, idx) = ops.iter().find_map(|op| s.find(op).map(|i| (*op, i)))?;
-    let (lhs, rhs0) = s.split_at(idx);
-    let rhs = rhs0.get(op.len()..)?;
-    let lhs_e = parse_linear_expr_int(lhs.trim())?;
-    let rhs_e = parse_linear_expr_int(rhs.trim())?;
-    use smtkit::smt2::t;
-    let a = linear_expr_to_smt_sexp(&lhs_e);
-    let b = linear_expr_to_smt_sexp(&rhs_e);
-    let sexp = match op {
-        "<=" | "≤" => t::le(a, b),
-        ">=" | "≥" => t::ge(a, b),
-        "<" => t::lt(a, b),
-        ">" => t::app(">", vec![a, b]),
-        "=" => t::eq(a, b),
-        _ => return None,
-    };
-    let mut vars: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    vars.extend(lhs_e.coeffs.keys().cloned());
-    vars.extend(rhs_e.coeffs.keys().cloned());
-    Some(ParsedRelConstraint { sexp, vars })
-}
-
-fn smt_entails_from_pp_dump(
+fn smt_entails_from_pp_dump_escalating(
     pp_dump: &serde_json::Value,
     timeout_ms: u64,
     seed: u64,
-) -> Result<Option<bool>, String> {
-    use smtkit::smt2::t;
-
-    let goal = pp_dump
-        .get("goals")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .ok_or_else(|| "pp_dump missing goals[0]".to_string())?;
-
-    let pretty = goal.get("pretty").and_then(|v| v.as_str()).unwrap_or("");
-    let target = pretty
-        .lines()
-        .find_map(|ln| {
-            ln.trim_start()
-                .strip_prefix("⊢")
-                .map(|r| r.trim().to_string())
-        })
-        .unwrap_or_default();
-    if target.is_empty() {
-        return Ok(None);
-    }
-
-    // Collect variable kinds from hypothesis declaration lines.
-    //
-    // This is a deliberately *conservative* guardrail: if we cannot confidently classify
-    // all variables as Int/Nat, we return `Ok(None)` rather than risk an unsound “entailed”.
-    let mut var_kinds: std::collections::BTreeMap<String, SmtVarKind> =
-        std::collections::BTreeMap::new();
-    if let Some(hyps) = goal.get("hyps").and_then(|v| v.as_array()) {
-        for h in hyps {
-            if let Some(txt) = h.get("text").and_then(|v| v.as_str()) {
-                if let Some((name, kind)) = smt_extract_decl_kind(txt) {
-                    var_kinds.insert(name, kind);
-                }
-            }
+    depth: usize,
+    solver_norm: &str,
+    aggressive: bool,
+    reuse: &mut Option<plc::smt_lia::ReusableSmtSession>,
+    trace: &mut Vec<serde_json::Value>,
+) -> Result<(Option<bool>, u64), String> {
+    fn with_temp_env<T>(key: &str, val: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let old = std::env::var(key).ok();
+        match val {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
         }
+        let out = f();
+        match old.as_deref() {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        out
     }
-    // Only proceed if the target itself parses as an int relation.
-    let target_rel = match parse_rel_constraint_int(&target) {
-        Some(r) => r,
-        None => return Ok(None),
-    };
 
-    // Parse any hypothesis constraints we can.
-    let mut hyp_rels: Vec<ParsedRelConstraint> = Vec::new();
-    if let Some(hyps) = goal.get("hyps").and_then(|v| v.as_array()) {
-        for h in hyps {
-            if let Some(txt) = h.get("text").and_then(|v| v.as_str()) {
-                // take substring after `:`
-                let rhs = txt.split_once(':').map(|(_, r)| r.trim()).unwrap_or("");
-                if rhs.is_empty() {
-                    continue;
-                }
-                if let Some(r) = parse_rel_constraint_int(rhs) {
-                    hyp_rels.push(r);
-                }
-            }
+    fn fallback_solver_cmdlines(primary_norm: &str) -> Vec<&'static str> {
+        // Keep this small + deterministic; we don't want to “spray solvers” by default.
+        // Aggressive mode can afford a second solver try after a timeout ladder.
+        let z3 = "z3 -in -smt2";
+        let cvc5 = "cvc5 --lang smt2 --incremental";
+        match primary_norm.trim().to_lowercase().as_str() {
+            "cvc5" => vec![z3],
+            "z3" => vec![cvc5],
+            // auto/custom: prefer cvc5 as a distinct backend, then z3.
+            _ => vec![cvc5, z3],
         }
     }
 
-    // Ensure all mentioned vars have known kinds.
-    // If a variable slips through with an unknown sort, we abort. This keeps the SMT hint as a
-    // safe heuristic (it might be missing, but it shouldn't be wrong for type/sort reasons).
-    for m in target_rel
-        .vars
-        .iter()
-        .chain(hyp_rels.iter().flat_map(|r| r.vars.iter()))
-    {
-        if !var_kinds.contains_key(m) {
-            // Unknown sort; abort rather than risk unsound “entails”.
-            return Ok(None);
+    let mut attempts: u64 = 0;
+    let t1 = timeout_ms.max(1);
+    attempts += 1;
+    let res1 =
+        plc::smt_lia::entails_from_pp_dump_with_depth_reuse(pp_dump, t1, seed, depth, reuse)?;
+    if trace.len() < 64 {
+        let reuse_solver = reuse
+            .as_ref()
+            .and_then(|s| s.stats().get("solver").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        trace.push(json!({
+            "step": "base",
+            "timeout_ms": t1,
+            "solver": reuse_solver,
+            "outcome": if res1.is_some() { "decided" } else { "unknown" },
+        }));
+    }
+    if res1.is_some() || !aggressive {
+        return Ok((res1, attempts));
+    }
+
+    // Step 2: timeout ladder (same solver / reuse if possible).
+    let t2 = (t1.saturating_mul(4)).min(30_000);
+    attempts += 1;
+    let res2 =
+        plc::smt_lia::entails_from_pp_dump_with_depth_reuse(pp_dump, t2, seed, depth, reuse)?;
+    if trace.len() < 64 {
+        let reuse_solver = reuse
+            .as_ref()
+            .and_then(|s| s.stats().get("solver").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        trace.push(json!({
+            "step": "timeout_x4",
+            "timeout_ms": t2,
+            "solver": reuse_solver,
+            "outcome": if res2.is_some() { "decided" } else { "unknown" },
+        }));
+    }
+    if res2.is_some() {
+        return Ok((res2, attempts));
+    }
+
+    // Step 3: solver fallback (per-call session; do not disrupt warm reuse).
+    // This is the biggest “Yurichev-style” reliability bump: export/compare solvers.
+    for cmd in fallback_solver_cmdlines(solver_norm) {
+        attempts += 1;
+        let res = with_temp_env("SMTKIT_SOLVER", Some(cmd), || {
+            plc::smt_lia::entails_from_pp_dump_with_depth(pp_dump, t2, seed, depth)
+        })?;
+        if trace.len() < 64 {
+            trace.push(json!({
+                "step": "fallback_solver",
+                "timeout_ms": t2,
+                "solver": cmd,
+                "outcome": if res.is_some() { "decided" } else { "unknown" },
+            }));
+        }
+        if res.is_some() {
+            return Ok((res, attempts));
         }
     }
 
-    let (mut sess, _used) = match smtkit::session::spawn_auto() {
-        Ok(v) => v,
-        Err(_e) => return Ok(None), // no solver available
-    };
-    sess.set_logic("QF_LIA").map_err(|e| e.to_string())?;
-    sess.set_print_success(false).map_err(|e| e.to_string())?;
-    sess.set_produce_models(false).map_err(|e| e.to_string())?;
-    sess.set_timeout_ms(timeout_ms).map_err(|e| e.to_string())?;
-    sess.set_random_seed(seed).map_err(|e| e.to_string())?;
-
-    // Declare vars as Int. Add Nat non-negativity constraints.
-    for (name, kind) in var_kinds.iter() {
-        sess.declare_const(name, &smtkit::smt2::Sort::Int.to_smt2())
-            .map_err(|e| e.to_string())?;
-        if *kind == SmtVarKind::Nat {
-            sess.assert_sexp(&t::ge(t::sym(name.clone()), t::int_lit(0)))
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    for r in hyp_rels {
-        sess.assert_sexp(&r.sexp).map_err(|e| e.to_string())?;
-    }
-    // Check satisfiability of hyps ∧ ¬target.
-    //
-    // Interpretation:
-    // - UNSAT ⇒ hyps ⇒ target  (within our parsed LIA fragment)
-    // - SAT   ⇒ hyps ⊬ target  (found countermodel in LIA)
-    // - UNKNOWN ⇒ do not use as a signal
-    sess.assert_sexp(&t::not(target_rel.sexp))
-        .map_err(|e| e.to_string())?;
-    let st = sess.check_sat().map_err(|e| e.to_string())?;
-    match st {
-        smtkit::session::Status::Unsat => Ok(Some(true)),
-        smtkit::session::Status::Sat => Ok(Some(false)),
-        smtkit::session::Status::Unknown => Ok(None),
-    }
+    Ok((None, attempts))
 }
 
-fn smt_entails_from_hyps_target(
+fn smt_entails_from_hyps_target_escalating(
     hyps_texts: &[String],
     target: &str,
     timeout_ms: u64,
     seed: u64,
-) -> Result<Option<bool>, String> {
+    depth: usize,
+    solver_norm: &str,
+    aggressive: bool,
+    reuse: &mut Option<plc::smt_lia::ReusableSmtSession>,
+    trace: &mut Vec<serde_json::Value>,
+) -> Result<(Option<bool>, u64), String> {
     // Build a minimal pp_dump-shaped object so we can reuse the same logic.
-    //
-    // This must stay “no extra Lean calls”: the input is cached hypothesis text + a target string.
-    // Any failure to parse/classify sorts should return `Ok(None)`.
     let mut pretty = String::new();
     for h in hyps_texts.iter().take(48) {
         pretty.push_str(h);
@@ -936,7 +939,47 @@ fn smt_entails_from_hyps_target(
             "hyps": hyps_json
         }]
     });
-    smt_entails_from_pp_dump(&pp_dump, timeout_ms, seed)
+    smt_entails_from_pp_dump_escalating(
+        &pp_dump,
+        timeout_ms,
+        seed,
+        depth,
+        solver_norm,
+        aggressive,
+        reuse,
+        trace,
+    )
+}
+
+fn smt_explain_fragment_from_hyps_target(
+    hyps_texts: &[String],
+    target: &str,
+    depth: usize,
+    max_hyps: usize,
+) -> Option<serde_json::Value> {
+    if target.trim().is_empty() {
+        return None;
+    }
+    let mut pretty = String::new();
+    for h in hyps_texts.iter().take(48) {
+        pretty.push_str(h);
+        pretty.push('\n');
+    }
+    pretty.push_str("⊢ ");
+    pretty.push_str(target);
+
+    let hyps_json: Vec<serde_json::Value> = hyps_texts
+        .iter()
+        .take(48)
+        .map(|s| json!({ "text": s }))
+        .collect();
+    let pp_dump = json!({
+        "goals": [{
+            "pretty": pretty,
+            "hyps": hyps_json
+        }]
+    });
+    plc::smt_lia::explain_fragment_from_pp_dump(&pp_dump, depth, max_hyps)
 }
 
 fn unified_diff_bounded(old: &str, new: &str, context: usize, max_chars: usize) -> (String, bool) {
@@ -1007,13 +1050,17 @@ fn usage() -> String {
         "  locate-sorries --repo <path> --file <relpath> [--max-sorries N] [--context-lines N] [--output-json <path>]",
         "  lean-embed-smoke  (requires cargo feature `lean-embed`)",
         "  verify-summary --repo <path> --file <relpath> [--timeout-s N] [--include-raw-verify] [--output-json <path>]",
+        "  goal-dump-nearest --repo <path> --file <relpath> [--timeout-s N] [--focus-line N | --focus-decl <name>] [--pp-dump-only] [--allow-sorry-free] [--bundle-dir <path>] [--output-json <path>]",
+        "  goal-analyze --input-json <path|-> [--output-json <path>]",
+        "  goal-try --capsule-dir <path> [--timeout-s N] [--top-k N] [--rounds N] [--beam N] [--with-try-this] [--write-best] [--output-json <path>]",
         "  agent-step  --repo <path> --file <relpath> [--timeout-s N] [--write] [--output-json <path>]",
         "  prompt      --repo <path> --file <relpath> --lemma <name> [--output-json <path>]",
         "  rubberduck-prompt --repo <path> --file <relpath> --lemma <name> [--diagnostics-file <path>] [--output-json <path>]",
         "  patch       --repo <path> --file <relpath> --lemma <name> --replacement-file <path> [--timeout-s N] [--write] [--include-raw-verify] [--output-json <path>]",
         "  patch-region --repo <path> --file <relpath> --start-line N --end-line N --replacement-file <path> [--timeout-s N] [--write] [--include-raw-verify] [--output-json <path>]",
         "  patch-nearest --repo <path> --file <relpath> --replacement-file <path> [--timeout-s N] [--write] [--max-sorries N] [--context-lines N] [--include-raw-verify] [--output-json <path>]",
-        "  tree-search-nearest --repo <path> --file <relpath> [--timeout-s N] [--total-timeout-s N] [--log-level 0|1|2] [--events-jsonl <path>] [--events-keep N] [--events-all-keep N] [--beam N] [--max-nodes N] [--depth N] [--candidates det|auto|lean|lean-try|llm] [--focus-line N] [--lean-oracle-per-node] [--lean-oracle-max-calls N] [--rollout-k N] [--dedup-goal-expansions] [--goal-first-k N] [--goal-meta-penalty N] [--depth-bonus N] [--fill-mode safe|strict|hybrid] [--max-candidates-per-node N] [--verify-k N] [--cache-dir <path> | --no-cache] [--profile] [--summary-level 0|1|2|3] [--report-md <path>] [--auto-artifacts] [--llm-summary] [--llm-summary-timeout-s N] [--llm-planner] [--llm-planner-timeout-s N] [--smt-precheck] [--smt-timeout-ms N] [--smt-seed N] [--goal-dump] [--llm-timeout-s N] [--escalate-llm] [--allow-sorry-candidates] [--include-trace] [--pick best|best-ok|best-progress] [--quiet] [--research-notes-file <path>] [--include-diff] [--diff-context N] [--output-diff <path>] [--write | --write-to <path>] [--include-raw-verify] [--output-json <path>]",
+        "  tree-search-nearest --repo <path> --file <relpath> [--timeout-s N] [--total-timeout-s N] [--log-level 0|1|2] [--events-jsonl <path>] [--events-keep N] [--events-all-keep N] [--beam N] [--max-nodes N] [--depth N] [--candidates det|auto|lean|lean-try|llm] [--focus-line N | --focus-decl <name> [--focus-decl-strict] [--focus-decl-hard]] [--lean-oracle-per-node] [--lean-oracle-max-calls N] [--rollout-k N] [--dedup-goal-expansions] [--goal-first-k N] [--goal-meta-penalty N] [--depth-bonus N] [--fill-mode safe|strict|hybrid] [--max-candidates-per-node N] [--verify-k N] [--cache-dir <path> | --no-cache] [--profile] [--summary-level 0|1|2|3] [--report-md <path>] [--auto-artifacts] [--llm-summary] [--llm-summary-timeout-s N] [--llm-planner] [--llm-planner-timeout-s N] [--smt-precheck|--no-smt-precheck] [--smt-aggressive] [--smt-solver auto|z3|cvc5|<cmdline>] [--smt-timeout-ms N] [--smt-seed N] [--smt-depth N] [--smt-explain] [--no-smt-explain] [--smt-explain-max-hyps N] [--smt-unsat-core] [--smt-unsat-core-max N] [--smt-support] [--smt-support-max N] [--smt-proof] [--smt-proof-max-chars N] [--smt-proof-dump] [--smt-proof-dump-dir <path>] [--smt-proof-dump-max-chars N] [--smt-dump] [--smt-dump-max N] [--smt-dump-dir <path>] [--smt-repro-dir <path>] [--goal-dump] [--llm-timeout-s N] [--escalate-llm] [--allow-sorry-candidates] [--include-trace] [--pick best|best-ok|best-progress] [--quiet] [--research-notes-file <path>] [--research-preset <name>] [--research-top-k N] [--include-diff] [--diff-context N] [--output-diff <path>] [--write | --write-to <path>] [--include-raw-verify] [--output-json <path>]",
+        "  smt-repro --input-json <path|-> [--timeout-ms N] [--seed N] [--depth N] [--emit-smt2 <path>] [--emit-proof <path>] [--proof-max-chars N] [--bundle-dir <path>] [--output-json <path>]",
         "  suggest     --repo <path> --file <relpath> --lemma <name> [--timeout-s N] [--output-json <path>]",
         "  loop        --repo <path> --file <relpath> --lemma <name> [--max-iters N] [--timeout-s N] [--output-json <path>]",
         "  review-prompt --repo <path> [--scope auto|staged|worktree] [--max-total-bytes N] [--per-file-bytes N] [--transcript-bytes N] [--cache-version STR] [--cache-model STR] [--output-json <path>]",
@@ -1021,11 +1068,12 @@ fn usage() -> String {
         "  llm-chat [--repo <path>] [--system <text> | --system-file <path>] [--user <text> | --user-file <path>] [--tools agent] [--max-tool-iters N] [--timeout-s N] [--require-key] [--output-json <path>]",
         "  lint-style  --repo <path> [--github] --module <Root> [--module <Root> ...]",
         "  report      --repo <path> --files <relpath>... [--timeout-s N] [--max-sorries N] [--context-lines N] [--include-raw-verify] [--output-html <path>]",
-        "  arxiv-search --query <text> [--max-results N] [--timeout-ms N] [--must-include <tok> ...] [--llm-summary] [--llm-timeout-s N] [--quiet] [--output-json <path>]",
+                "  arxiv-search --query <text> [--max-results N] [--timeout-ms N] [--must-include <tok> ...] [--must-include-all <tok> ...] [--llm-summary] [--llm-timeout-s N] [--quiet] [--output-json <path>]",
         "  research-auto --repo <path> --preset <name> [--quiet] [--output-json <path>]",
         "  research-ingest --input <path> [--output-json <path>]",
         "  research-attach --report-json <path> --research-notes <path> [--top-k N] [--output-json <path>]",
-        "  context-pack --repo <path> --file <relpath> [--decl <name> | --line N] [--context-lines N] [--nearby-lines N] [--max-nearby N] [--max-imports N]",
+        "  context-pack --repo <path> --file <relpath> [--decl <name> | --line N] [--context-lines N] [--nearby-lines N] [--max-nearby N] [--max-imports N] [--output-json <path>]",
+        "  scratch-lemma --repo <path> --file <relpath|module> --name <decl_name> [--kind theorem|lemma] [--out <relpath>]",
         "",
         "Notes:",
         "- Output is JSON to stdout.",
@@ -1101,7 +1149,7 @@ fn apply_mechanical_fixes_for_first_error(
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
-    let rest = &args[2..];
+    let rest: &[String] = if args.len() > 2 { &args[2..] } else { &[] };
 
     if cmd.is_empty() || cmd == "--help" || cmd == "-h" || cmd == "help" {
         println!("{}", usage());
@@ -1335,6 +1383,8 @@ fn main() -> Result<(), String> {
                 let small = json!({
                     "ok": true,
                     "written": p.display().to_string(),
+                    "kind": "triage_file",
+                    "result_kind": serde_json::Value::Null,
                     "repo_root": repo_root.display().to_string(),
                     "file": file,
                     "verify_ok": summary.get("ok").cloned().unwrap_or(serde_json::Value::Null),
@@ -1343,6 +1393,993 @@ fn main() -> Result<(), String> {
                     "next_action": out.get("next_action").cloned().unwrap_or(serde_json::Value::Null),
                 });
                 println!("{}", small.to_string());
+            } else {
+                println!("{}", out.to_string());
+            }
+            Ok(())
+        }
+
+        "goal-dump-nearest" => {
+            let repo_root = arg_value(rest, "--repo")
+                .ok_or_else(|| "missing --repo".to_string())
+                .map(PathBuf::from)?;
+            let file = arg_value(rest, "--file").ok_or_else(|| "missing --file".to_string())?;
+            let timeout_s = arg_u64(rest, "--timeout-s").unwrap_or(12);
+            let focus_line = arg_u64(rest, "--focus-line").map(|x| x as usize);
+            let focus_decl = arg_value(rest, "--focus-decl");
+            let pp_dump_only = arg_flag(rest, "--pp-dump-only");
+            let allow_sorry_free = arg_flag(rest, "--allow-sorry-free");
+            let bundle_dir = arg_value(rest, "--bundle-dir").map(PathBuf::from);
+            let output_json = arg_value(rest, "--output-json").map(PathBuf::from);
+
+            let repo_root =
+                plc::find_lean_repo_root(&repo_root).map_err(|e| format!("repo_root: {e}"))?;
+            plc::load_dotenv_smart(&repo_root);
+
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+
+            if focus_line.is_some() && focus_decl.is_some() {
+                return Err("use only one of --focus-line or --focus-decl".to_string());
+            }
+
+            let dur = StdDuration::from_secs(timeout_s);
+            let abs = repo_root.join(&file);
+            if !abs.exists() {
+                return Err(format!("File not found: {}", abs.display()));
+            }
+            let original_text = std::fs::read_to_string(&abs)
+                .map_err(|e| format!("read {}: {e}", abs.display()))?;
+
+            let has_sorry = plc::locate_sorries_in_text(&original_text, 5, 1)
+                .map_err(|e| format!("locate_sorries_in_text failed: {e}"))?
+                .len()
+                > 0;
+
+            // "Sorry-free" mode: when the target text has no `sorry`/`admit`, we can still obtain a
+            // goal dump by synthesizing a shadow decl (`pp_dump; sorry`) using a decl header found
+            // near the user's focus.
+            let use_shadow_decl = allow_sorry_free && !has_sorry;
+
+            let focus_line_for_goal_dump: Option<usize> = if let Some(line1) = focus_line {
+                Some(line1)
+            } else if let Some(dn) = focus_decl.as_ref() {
+                // Use a light decl-span heuristic from `build_context_pack` to pick a focus line.
+                let pack = plc::build_context_pack(&repo_root, &file, Some(dn), None, 0, 0, 0, 80)?;
+                Some(pack.focus.start_line)
+            } else {
+                None
+            };
+
+            let focus_decl_effective: Option<String> = if use_shadow_decl {
+                if let Some(dn) = focus_decl.as_ref() {
+                    Some(dn.trim().to_string())
+                } else if let Some(line1) = focus_line_for_goal_dump {
+                    plc::nearest_decl_header_in_text(&original_text, line1, 800).map(|d| d.name)
+                } else {
+                    None
+                }
+            } else {
+                focus_decl.clone()
+            };
+
+            if use_shadow_decl && focus_decl_effective.is_none() {
+                return Err(
+                    "--allow-sorry-free requires --focus-line (near a decl) or --focus-decl"
+                        .to_string(),
+                );
+            }
+
+            let gd = if let Some(line1) = focus_line_for_goal_dump {
+                if use_shadow_decl {
+                    let dn = focus_decl_effective
+                        .as_deref()
+                        .ok_or_else(|| "internal: missing focus_decl_effective".to_string())?;
+                    rt.block_on(plc::goal_dump_shadow_decl(&repo_root, &file, dn, dur))
+                        .map_err(|e| format!("goal_dump_shadow_decl failed: {e}"))?
+                } else {
+                    rt.block_on(plc::goal_dump_in_text_at(
+                        &repo_root,
+                        &file,
+                        &original_text,
+                        dur,
+                        Some(line1),
+                        None,
+                    ))
+                    .map_err(|e| format!("goal_dump_in_text_at failed: {e}"))?
+                }
+            } else {
+                // If no focus is provided, we usually need a real `sorry`/`admit` to patch.
+                if use_shadow_decl {
+                    let dn = focus_decl_effective
+                        .as_deref()
+                        .ok_or_else(|| "internal: missing focus_decl_effective".to_string())?;
+                    rt.block_on(plc::goal_dump_shadow_decl(&repo_root, &file, dn, dur))
+                        .map_err(|e| format!("goal_dump_shadow_decl failed: {e}"))?
+                } else {
+                    rt.block_on(plc::goal_dump_nearest(&repo_root, &file, dur))
+                        .map_err(|e| format!("goal_dump_nearest failed: {e}"))?
+                }
+            };
+
+            let pp = gd
+                .get("pp_dump")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let out = if pp_dump_only {
+                pp.clone()
+            } else {
+                json!({
+                    "ok": true,
+                    "kind": "goal_dump_nearest",
+                    "repo_root": repo_root.display().to_string(),
+                    "file": file,
+                    "focus_line": focus_line_for_goal_dump,
+                    "focus_decl": focus_decl,
+                    "focus_decl_effective": focus_decl_effective,
+                    "timeout_s": timeout_s,
+                    "pp_dump": pp,
+                    "goal_dump": gd,
+                })
+            };
+
+            if let Some(dir) = bundle_dir.as_ref() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("failed to create dir {}: {e}", dir.display()))?;
+                let goal_dump_path = dir.join("goal_dump.json");
+                let pp_dump_path = dir.join("pp_dump.json");
+                let manifest_path = dir.join("manifest.json");
+                let shadow_path = dir.join("shadow.lean");
+
+                // Always write both shapes to disk (even if `--pp-dump-only` was used).
+                let full = json!({
+                    "ok": true,
+                    "kind": "goal_dump_nearest",
+                    "repo_root": repo_root.display().to_string(),
+                    "file": file,
+                    "focus_line": focus_line_for_goal_dump,
+                    "focus_decl": focus_decl,
+                    "focus_decl_effective": focus_decl_effective,
+                    "timeout_s": timeout_s,
+                    "pp_dump": pp,
+                    "goal_dump": gd,
+                });
+                write_json(&goal_dump_path, &full)?;
+                write_json(&pp_dump_path, &pp)?;
+
+                // Best-effort: include a `shadow.lean` in the capsule so `goal-try` can run.
+                // Prefer explicit focus decl, else use the selected sorry's decl name.
+                let mut shadow_written = false;
+                let dn = focus_decl_effective.clone().or_else(|| {
+                    gd.get("selected_sorry")
+                        .and_then(|s| s.get("decl_name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+                if let Some(dn) = dn.as_deref() {
+                    if let Ok(txt) = plc::synthesize_pp_dump_shadow_decl(&repo_root, &file, dn) {
+                        if std::fs::write(&shadow_path, txt.as_bytes()).is_ok() {
+                            shadow_written = true;
+                        }
+                    }
+                }
+
+                let file_bytes = original_text.as_bytes();
+                let pp_bytes = serde_json::to_vec(&pp)
+                    .map_err(|e| format!("failed to encode pp_dump for hashing: {e}"))?;
+                let goals_n = pp
+                    .get("goals")
+                    .and_then(|g| g.as_array())
+                    .map(|g| g.len())
+                    .unwrap_or(0);
+                let manifest = json!({
+                    "kind": "proofpatch_goal_capsule",
+                    "tool": { "proofpatch_cli_version": env!("CARGO_PKG_VERSION") },
+                    "target": {
+                        "repo_root": repo_root.display().to_string(),
+                        "file": file,
+                        "focus_decl": focus_decl,
+                        "focus_decl_effective": focus_decl_effective,
+                        "focus_line": focus_line_for_goal_dump,
+                    },
+                    "mode": {
+                        "allow_sorry_free": allow_sorry_free,
+                        "used_shadow_decl": use_shadow_decl,
+                    },
+                    "hashes": {
+                        "lean_file_sha256": sha256_hex(file_bytes),
+                        "pp_dump_sha256": sha256_hex(&pp_bytes),
+                    },
+                    "pp_dump": { "goals": goals_n },
+                    "paths": {
+                        "goal_dump": goal_dump_path.display().to_string(),
+                        "pp_dump": pp_dump_path.display().to_string(),
+                        "shadow_lean": if shadow_written { json!(shadow_path.display().to_string()) } else { serde_json::Value::Null },
+                    }
+                });
+                write_json(&manifest_path, &manifest)?;
+            }
+
+            if let Some(p) = output_json {
+                write_json(&p, &out)?;
+                println!(
+                    "{}",
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "goal_dump_nearest",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
+                );
+            } else {
+                println!("{}", out.to_string());
+            }
+            Ok(())
+        }
+
+        "goal-analyze" => {
+            let input_json = arg_value(rest, "--input-json")
+                .ok_or_else(|| "missing --input-json".to_string())?;
+            let output_json = arg_value(rest, "--output-json").map(PathBuf::from);
+
+            let input_label = input_json.clone();
+            let input_text = if input_json == "-" {
+                let mut s = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut s)
+                    .map_err(|e| format!("read stdin: {e}"))?;
+                s
+            } else {
+                let p = PathBuf::from(&input_json);
+                std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?
+            };
+            let v = serde_json::from_str::<serde_json::Value>(&input_text)
+                .map_err(|e| format!("json parse {input_label}: {e}"))?;
+
+            // Accept the same shapes as `smt-repro`.
+            let pp_dump = if v.get("goals").and_then(|x| x.as_array()).is_some() {
+                v.clone()
+            } else if let Some(pp) = v.get("pp_dump") {
+                pp.clone()
+            } else if let Some(pp) = v.get("goal_dump").and_then(|gd| gd.get("pp_dump")) {
+                pp.clone()
+            } else {
+                return Err(
+                    "input json must contain a `pp_dump` (or be a `tree-search-nearest` output with `goal_dump.pp_dump`)".to_string(),
+                );
+            };
+
+            let out = plc::analyze_pp_dump(&pp_dump);
+            if let Some(p) = output_json {
+                write_json(&p, &out)?;
+                println!(
+                    "{}",
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "goal_analyze",
+                        "result_kind": out.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                    })
+                    .to_string()
+                );
+            } else {
+                println!("{}", out.to_string());
+            }
+            Ok(())
+        }
+
+        "goal-try" => {
+            let capsule_dir = arg_value(rest, "--capsule-dir")
+                .ok_or_else(|| "missing --capsule-dir".to_string())
+                .map(PathBuf::from)?;
+            let timeout_s = arg_u64(rest, "--timeout-s").unwrap_or(20).clamp(1, 600);
+            let top_k = arg_u64(rest, "--top-k").unwrap_or(8).clamp(1, 32) as usize;
+            let rounds = arg_u64(rest, "--rounds").unwrap_or(2).clamp(1, 10) as usize;
+            let beam = arg_u64(rest, "--beam").unwrap_or(1).clamp(1, 8) as usize;
+            let with_try_this = arg_flag(rest, "--with-try-this");
+            let write_best = arg_flag(rest, "--write-best");
+            let output_json = arg_value(rest, "--output-json").map(PathBuf::from);
+
+            let pp_dump_path = capsule_dir.join("pp_dump.json");
+            let shadow_path = capsule_dir.join("shadow.lean");
+            let manifest_path = capsule_dir.join("manifest.json");
+            if !pp_dump_path.exists() {
+                return Err(format!(
+                    "missing pp_dump.json in capsule dir: {}",
+                    pp_dump_path.display()
+                ));
+            }
+            if !manifest_path.exists() {
+                return Err(format!(
+                    "missing manifest.json in capsule dir: {}",
+                    manifest_path.display()
+                ));
+            }
+
+            let pp_text = std::fs::read_to_string(&pp_dump_path)
+                .map_err(|e| format!("read {}: {e}", pp_dump_path.display()))?;
+            let pp_dump = serde_json::from_str::<serde_json::Value>(&pp_text)
+                .map_err(|e| format!("json parse {}: {e}", pp_dump_path.display()))?;
+
+            let manifest_text = std::fs::read_to_string(&manifest_path)
+                .map_err(|e| format!("read {}: {e}", manifest_path.display()))?;
+            let manifest = serde_json::from_str::<serde_json::Value>(&manifest_text)
+                .map_err(|e| format!("json parse {}: {e}", manifest_path.display()))?;
+            let repo_root_s = manifest
+                .get("target")
+                .and_then(|t| t.get("repo_root"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "manifest.json missing target.repo_root".to_string())?;
+            let repo_root = PathBuf::from(repo_root_s);
+            let repo_root =
+                plc::find_lean_repo_root(&repo_root).map_err(|e| format!("repo_root: {e}"))?;
+            plc::load_dotenv_smart(&repo_root);
+
+            // If the capsule is missing `shadow.lean`, try to synthesize it from goal_dump.json.
+            if !shadow_path.exists() {
+                let goal_dump_path = capsule_dir.join("goal_dump.json");
+                if goal_dump_path.exists() {
+                    let gd_text = std::fs::read_to_string(&goal_dump_path)
+                        .map_err(|e| format!("read {}: {e}", goal_dump_path.display()))?;
+                    let gd = serde_json::from_str::<serde_json::Value>(&gd_text)
+                        .map_err(|e| format!("json parse {}: {e}", goal_dump_path.display()))?;
+
+                    let file_rel = manifest
+                        .get("target")
+                        .and_then(|t| t.get("file"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "manifest.json missing target.file".to_string())?;
+                    let dn = manifest
+                        .get("target")
+                        .and_then(|t| t.get("focus_decl"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            gd.get("goal_dump")
+                                .and_then(|x| x.get("selected_sorry"))
+                                .and_then(|s| s.get("decl_name"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .or_else(|| {
+                            gd.get("selected_sorry")
+                                .and_then(|s| s.get("decl_name"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        });
+
+                    if let Some(dn) = dn.as_deref() {
+                        if let Ok(txt) =
+                            plc::synthesize_pp_dump_shadow_decl(&repo_root, file_rel, dn)
+                        {
+                            let _ = std::fs::write(&shadow_path, txt.as_bytes());
+                        }
+                    }
+                }
+            }
+            if !shadow_path.exists() {
+                return Err(format!(
+                    "missing shadow.lean in capsule dir: {}",
+                    shadow_path.display()
+                ));
+            }
+
+            let base_shadow = std::fs::read_to_string(&shadow_path)
+                .map_err(|e| format!("read {}: {e}", shadow_path.display()))?;
+
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+            // Score versions:
+            // - v1 tuple: [goals, hyps_total, first_goal_pretty_chars]  (legacy; kept for compat)
+            // - v2 tuple: [goals, total_pretty_chars, hyps_total]       (used for selection/deltas)
+            let score_from_pp_dump = |pp: &serde_json::Value| -> Option<serde_json::Value> {
+                let goals_n = pp
+                    .get("goals")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())?;
+                let mut hyps_total: usize = 0;
+                let mut total_pretty_chars: usize = 0;
+                let mut max_goal_pretty_chars: usize = 0;
+                if let Some(goals) = pp.get("goals").and_then(|v| v.as_array()) {
+                    for g in goals {
+                        hyps_total += g
+                            .get("hyps")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        if let Some(p) = g.get("pretty").and_then(|v| v.as_str()) {
+                            let n = p.chars().count();
+                            total_pretty_chars += n;
+                            max_goal_pretty_chars = max_goal_pretty_chars.max(n);
+                        }
+                    }
+                }
+                let first_pretty_chars = pp
+                    .get("goals")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|g| g.get("pretty"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0usize);
+                Some(json!({
+                    "version": 2,
+                    "tuple": [goals_n as u64, total_pretty_chars as u64, hyps_total as u64],
+                    "tuple_v1": [goals_n as u64, hyps_total as u64, first_pretty_chars as u64],
+                    "goals": goals_n,
+                    "hyps_total": hyps_total,
+                    "first_pretty_chars": first_pretty_chars,
+                    "total_pretty_chars": total_pretty_chars,
+                    "max_goal_pretty_chars": max_goal_pretty_chars,
+                }))
+            };
+
+            let tuple_from_score = |score: &serde_json::Value| -> Option<Vec<u64>> {
+                score
+                    .get("tuple")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_u64()).collect::<Vec<u64>>())
+                    .filter(|v| v.len() == 3)
+            };
+
+            let delta_from_scores =
+                |baseline: &serde_json::Value, score: &serde_json::Value| -> serde_json::Value {
+                    let Some(b) = baseline.get("tuple").and_then(|v| v.as_array()) else {
+                        return serde_json::Value::Null;
+                    };
+                    let Some(s) = score.get("tuple").and_then(|v| v.as_array()) else {
+                        return serde_json::Value::Null;
+                    };
+                    if b.len() != 3 || s.len() != 3 {
+                        return serde_json::Value::Null;
+                    }
+                    let mut d: Vec<i64> = Vec::new();
+                    for i in 0..3usize {
+                        let bi = b[i]
+                            .as_i64()
+                            .or_else(|| b[i].as_u64().map(|u| u as i64))
+                            .unwrap_or(0);
+                        let si = s[i]
+                            .as_i64()
+                            .or_else(|| s[i].as_u64().map(|u| u as i64))
+                            .unwrap_or(0);
+                        d.push(si - bi);
+                    }
+                    serde_json::Value::Array(d.into_iter().map(serde_json::Value::from).collect())
+                };
+
+            let mut rounds_out: Vec<serde_json::Value> = Vec::new();
+            let mut best_solved_overall: Option<serde_json::Value> = None;
+            let mut best_progress_overall: serde_json::Value = serde_json::Value::Null;
+            let mut best_shadow_text: Option<String> = None;
+            let mut best_written: serde_json::Value = serde_json::Value::Null;
+            let mut attempts_total: usize = 0;
+            let mut initial_baseline_score: serde_json::Value = serde_json::Value::Null;
+            // Cache expensive verifications across rounds/candidates.
+            //
+            // Keyed by (shadow_sha, kind, candidate_sha) to avoid rerunning `lake env lean` for
+            // duplicates across rounds.
+            let mut cache_solve: std::collections::HashMap<String, serde_json::Value> =
+                std::collections::HashMap::new();
+            let mut cache_progress: std::collections::HashMap<String, serde_json::Value> =
+                std::collections::HashMap::new();
+
+            // Beam search frontier: each state is a shadow text plus an optional hint score.
+            let mut frontier: Vec<(String, Option<Vec<u64>>)> = vec![(base_shadow.clone(), None)];
+
+            for round_i in 0..rounds {
+                let mut next_frontier: Vec<(String, Vec<u64>, serde_json::Value)> = Vec::new(); // (shadow, hint_tuple, best_progress_row)
+                for (state_idx, (current_shadow, state_hint)) in frontier.iter().enumerate() {
+                    let shadow_sha = sha256_hex(current_shadow.as_bytes());
+                    // Baseline pp_dump + score for the current hole.
+                    let baseline_patch = plc::patch_first_sorry_in_region(
+                        &current_shadow,
+                        1,
+                        999_999,
+                        "pp_dump\nsorry",
+                    )
+                    .map_err(|e| format!("baseline patch failed: {e}"))?;
+                    let baseline_txt = baseline_patch.text.clone();
+                    let v = rt
+                        .block_on(plc::verify_lean_text(
+                            &repo_root,
+                            &baseline_txt,
+                            StdDuration::from_secs(timeout_s),
+                        ))
+                        .map_err(|e| format!("baseline verify_lean_text failed: {e}"))?;
+                    let merged = v.stdout.clone() + "\n" + &v.stderr;
+                    let mut baseline_pp_dump = plc::extract_pp_dump_from_lean_output(&merged)
+                        .unwrap_or(serde_json::Value::Null);
+                    let mut baseline_score =
+                        score_from_pp_dump(&baseline_pp_dump).unwrap_or(serde_json::Value::Null);
+                    if round_i == 0 {
+                        initial_baseline_score = baseline_score.clone();
+                    }
+
+                    // Derive candidates from the *current* pp_dump snapshot.
+                    let analysis_src = if baseline_pp_dump.is_null() {
+                        pp_dump.clone()
+                    } else {
+                        baseline_pp_dump.clone()
+                    };
+                    let analysis = plc::analyze_pp_dump(&analysis_src);
+                    let mut tactics = analysis
+                        .get("tactics")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .take(top_k)
+                        .collect::<Vec<_>>();
+
+                    // Also augment candidates by heuristics derived from the current pretty goal state.
+                    if let Some(goal_pretty) = baseline_pp_dump
+                        .get("goals")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|g| g.get("pretty"))
+                        .and_then(|v| v.as_str())
+                    {
+                        let hint_rules = load_hint_rules(&repo_root, None);
+                        tactics.extend(plc::derive_candidates_from_goal_pretty_with_hint_rules(
+                            goal_pretty,
+                            &hint_rules,
+                        ));
+                    }
+
+                    // Optional: ask mathlib suggestion tactics for more candidates (bounded).
+                    // Use proofpatch-core's implementation so we inherit its heuristics and robustness.
+                    let mut try_this_suggestions: Vec<String> = Vec::new();
+                    if with_try_this {
+                        // The oracle needs a focus line to offer useful `Try this:` suggestions.
+                        // Use the same hole selection as our patcher (more robust than scanning).
+                        let focus_line_1 = Some(baseline_patch.line);
+                        if let Ok(v) = rt.block_on(plc::lean_suggest_in_text_at(
+                            &repo_root,
+                            "shadow.lean",
+                            &current_shadow,
+                            StdDuration::from_secs(timeout_s),
+                            /* focus_line_1 */ focus_line_1,
+                            /* first_error_line_1 */ None,
+                        )) {
+                            if let Some(arr) = v.get("suggestions").and_then(|x| x.as_array()) {
+                                try_this_suggestions = arr
+                                    .iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect();
+                            }
+                            // If our baseline pp_dump extraction failed, accept the oracle pp_dump.
+                            if baseline_pp_dump.is_null() {
+                                if let Some(pp) = v.get("pp_dump") {
+                                    if pp.is_object() {
+                                        baseline_pp_dump = pp.clone();
+                                        baseline_score = score_from_pp_dump(&baseline_pp_dump)
+                                            .unwrap_or(baseline_score);
+                                        if round_i == 0 {
+                                            initial_baseline_score = baseline_score.clone();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let try_this_count = try_this_suggestions.len();
+
+                    // Merge, dedup, bound.
+                    tactics.extend(try_this_suggestions.into_iter());
+                    {
+                        let mut seen = std::collections::HashSet::new();
+                        tactics.retain(|s| seen.insert(s.clone()));
+                        tactics.truncate(top_k.max(8).min(32));
+                    }
+
+                    // Prepare candidate pairs (base, close).
+                    let candidates: Vec<(String, String)> = tactics
+                        .iter()
+                        .filter_map(|c| {
+                            // Normalize `by\n  ...` blocks into tactic scripts robustly:
+                            // - strip the leading `by\n`
+                            // - then drop one common indentation level (`  `) from all lines
+                            // This mirrors the tree-search "tactic hole" adapter and prevents
+                            // indentation bugs when multi-line candidates are inserted into an
+                            // already-indented `by` block.
+                            let base = if let Some(rest) = c.strip_prefix("by\n") {
+                                let mut out: Vec<String> = Vec::new();
+                                for ln in rest.lines() {
+                                    out.push(ln.strip_prefix("  ").unwrap_or(ln).to_string());
+                                }
+                                out.join("\n").trim().to_string()
+                            } else if let Some(rest) = c.strip_prefix("by ") {
+                                rest.trim().to_string()
+                            } else {
+                                c.trim().to_string()
+                            };
+                            if base.is_empty() {
+                                return None;
+                            }
+                            let close = if !base.contains('\n') && !base.contains("done") {
+                                format!("{base}; done")
+                            } else {
+                                base.clone()
+                            };
+                            Some((base, close))
+                        })
+                        .collect();
+
+                    let mut results: Vec<serde_json::Value> = Vec::new();
+                    for (idx, (cand_base, cand_close)) in candidates.iter().enumerate() {
+                        let cand_close_sha = sha256_hex(cand_close.as_bytes());
+                        let cand_base_sha = sha256_hex(cand_base.as_bytes());
+
+                        // Solve attempt: close-or-fail candidate.
+                        let solve_cache_key = format!("{shadow_sha}::solve::{cand_close_sha}");
+                        let solved: bool;
+                        let solve_summary: serde_json::Value;
+                        let first_error: serde_json::Value;
+                        let mut solve_cached = false;
+                        if let Some(cached) = cache_solve.get(&solve_cache_key) {
+                            solve_cached = true;
+                            solved = cached.get("solved").and_then(|v| v.as_bool()) == Some(true);
+                            solve_summary = cached
+                                .get("summary")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            first_error = cached
+                                .get("first_error")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                        } else {
+                            let patched_solve = match plc::patch_first_sorry_in_region(
+                                &current_shadow,
+                                1,
+                                999_999,
+                                cand_close,
+                            ) {
+                                Ok(p) => p.text,
+                                Err(e) => {
+                                    results.push(json!({
+                                        "idx": idx,
+                                        "candidate": { "base": cand_base, "close": cand_close },
+                                        "ok": false,
+                                        "error": format!("patch failed: {e}"),
+                                    }));
+                                    continue;
+                                }
+                            };
+                            let verify = rt
+                                .block_on(plc::verify_lean_text(
+                                    &repo_root,
+                                    &patched_solve,
+                                    StdDuration::from_secs(timeout_s),
+                                ))
+                                .map_err(|e| format!("verify_lean_text failed: {e}"))?;
+
+                            // `lean` returns exit 0 even with `sorry` (it is a warning),
+                            // so "solved" must mean sorry-free as well as error-free.
+                            let merged = verify.stdout.clone() + "\n" + &verify.stderr;
+                            let has_sorry_warning = merged.contains("declaration uses 'sorry'")
+                                || merged.contains("declaration uses 'admit'");
+                            solved = verify.ok && !has_sorry_warning;
+                            solve_summary = json!({
+                                "ok": verify.ok,
+                                "timeout": verify.timeout,
+                                "returncode": verify.returncode,
+                                "errors": verify.stdout.matches(": error:").count()
+                                    + verify.stdout.matches(": error(").count()
+                                    + verify.stderr.matches(": error:").count()
+                                    + verify.stderr.matches(": error(").count(),
+                            });
+                            let fe = verify
+                                .stdout
+                                .lines()
+                                .find(|l| l.contains(": error:") || l.contains(": error("))
+                                .map(|s| s.to_string())
+                                .or_else(|| {
+                                    verify
+                                        .stderr
+                                        .lines()
+                                        .find(|l| l.contains(": error:") || l.contains(": error("))
+                                        .map(|s| s.to_string())
+                                });
+                            first_error = fe
+                                .map(serde_json::Value::String)
+                                .unwrap_or(serde_json::Value::Null);
+
+                            cache_solve.insert(
+                                solve_cache_key.clone(),
+                                json!({
+                                    "solved": solved,
+                                    "summary": solve_summary,
+                                    "first_error": first_error,
+                                }),
+                            );
+                        }
+
+                        // Progress attempt: run candidate, then pp_dump, then sorry.
+                        let mut progress: serde_json::Value = serde_json::Value::Null;
+                        if !solved {
+                            let progress_cache_key =
+                                format!("{shadow_sha}::progress::{cand_base_sha}");
+                            if let Some(cached) = cache_progress.get(&progress_cache_key) {
+                                progress = cached.clone();
+                            } else {
+                                let mut repl = String::new();
+                                repl.push_str(cand_base.trim());
+                                if !repl.ends_with('\n') {
+                                    repl.push('\n');
+                                }
+                                repl.push_str("pp_dump\nsorry");
+                                let patched_progress = plc::patch_first_sorry_in_region(
+                                    &current_shadow,
+                                    1,
+                                    999_999,
+                                    &repl,
+                                )
+                                .map(|p| p.text);
+
+                                let verify_progress = if let Ok(txt) = patched_progress {
+                                    rt.block_on(plc::verify_lean_text(
+                                        &repo_root,
+                                        &txt,
+                                        StdDuration::from_secs(timeout_s),
+                                    ))
+                                    .ok()
+                                } else {
+                                    None
+                                };
+
+                                let pp_dump = verify_progress.as_ref().and_then(|v| {
+                                    plc::extract_pp_dump_from_lean_output(
+                                        &(v.stdout.clone() + "\n" + &v.stderr),
+                                    )
+                                });
+
+                                let score = pp_dump
+                                    .as_ref()
+                                    .and_then(|pp| score_from_pp_dump(pp))
+                                    .unwrap_or(serde_json::Value::Null);
+                                let delta = if score.is_null() {
+                                    serde_json::Value::Null
+                                } else {
+                                    delta_from_scores(&baseline_score, &score)
+                                };
+                                let improves = match (
+                                    tuple_from_score(&baseline_score),
+                                    tuple_from_score(&score),
+                                ) {
+                                    (Some(b), Some(s)) => Some(s < b),
+                                    _ => None,
+                                };
+
+                                let progress_summary = verify_progress.as_ref().map(|v| {
+                                    json!({
+                                        "ok": v.ok,
+                                        "timeout": v.timeout,
+                                        "returncode": v.returncode,
+                                    })
+                                });
+                                progress = json!({
+                                    "attempted": true,
+                                    "baseline_score": baseline_score,
+                                    "verify": progress_summary.unwrap_or(serde_json::Value::Null),
+                                    "pp_dump_found": pp_dump.is_some(),
+                                    "score": score,
+                                    "delta": delta,
+                                    "improves": improves,
+                                });
+                                cache_progress.insert(progress_cache_key, progress.clone());
+                            }
+                        }
+
+                        results.push(json!({
+                        "idx": idx,
+                        "candidate": { "base": cand_base, "close": cand_close },
+                        "solve": { "verify": solve_summary, "first_error": first_error },
+                        "progress": progress,
+                        "cache": { "solve": solve_cached, "progress": progress.get("attempted").is_some() },
+                    }));
+
+                        if solved {
+                            break;
+                        }
+                    }
+
+                    attempts_total += results.len();
+
+                    let best_solved = results
+                        .iter()
+                        .find(|r| {
+                            r.get("solve")
+                                .and_then(|v| v.get("verify"))
+                                .and_then(|v| v.get("ok"))
+                                .and_then(|b| b.as_bool())
+                                == Some(true)
+                        })
+                        .cloned();
+
+                    let best_progress = if best_solved.is_some() {
+                        serde_json::Value::Null
+                    } else {
+                        // Pick minimum lexicographically by our score tuple, preferring improves=true.
+                        let mut best: Option<(Vec<u64>, serde_json::Value)> = None;
+                        for r in &results {
+                            let t = r
+                                .get("progress")
+                                .and_then(|p| p.get("score"))
+                                .and_then(|s| tuple_from_score(s))
+                                .filter(|v| v.len() == 3);
+                            let Some(tuple) = t else { continue };
+                            let improves = r
+                                .get("progress")
+                                .and_then(|p| p.get("improves"))
+                                .and_then(|v| v.as_bool());
+                            match &best {
+                                None => best = Some((tuple, r.clone())),
+                                Some((best_tuple, best_r)) => {
+                                    let best_improves = best_r
+                                        .get("progress")
+                                        .and_then(|p| p.get("improves"))
+                                        .and_then(|v| v.as_bool());
+                                    let better = match (improves, best_improves) {
+                                        (Some(true), Some(false) | None) => true,
+                                        (Some(false) | None, Some(true)) => false,
+                                        _ => tuple < *best_tuple,
+                                    };
+                                    if better {
+                                        best = Some((tuple, r.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        best.map(|(_, r)| r).unwrap_or(serde_json::Value::Null)
+                    };
+
+                    rounds_out.push(json!({
+                    "round": round_i + 1,
+                    "state_idx": state_idx,
+                    "state_hint": state_hint.clone(),
+                    "analysis": analysis,
+                    "baseline": { "pp_dump": baseline_pp_dump, "score": baseline_score },
+                    "try_this": { "enabled": with_try_this, "count": try_this_count },
+                    "attempts": results.len(),
+                    "results": results,
+                    "best": { "solved": best_solved.clone().unwrap_or(serde_json::Value::Null), "progress": best_progress.clone() },
+                }));
+
+                    if let Some(sol) = best_solved {
+                        best_solved_overall = Some(sol.clone());
+                        // Write the solved text.
+                        let cand_close = sol
+                            .get("candidate")
+                            .and_then(|c| c.get("close"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let solved_text = plc::patch_first_sorry_in_region(
+                            current_shadow,
+                            1,
+                            999_999,
+                            cand_close,
+                        )
+                        .map(|p| p.text)
+                        .ok();
+                        best_shadow_text = solved_text;
+                        // Stop everything on first solved (beam search short-circuit).
+                        frontier.clear();
+                        break;
+                    }
+
+                    if !best_progress.is_null() {
+                        let improves = best_progress
+                            .get("progress")
+                            .and_then(|p| p.get("improves"))
+                            .and_then(|v| v.as_bool());
+                        // Non-regression hill-climb: only apply steps that *actually* improve baseline.
+                        if improves != Some(true) {
+                            continue;
+                        }
+
+                        best_progress_overall = best_progress.clone();
+                        let cand_base = best_progress
+                            .get("candidate")
+                            .and_then(|c| c.get("base"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let repl = format!("{}\n{}", cand_base.trim(), "sorry");
+                        let next_shadow =
+                            plc::patch_first_sorry_in_region(current_shadow, 1, 999_999, &repl)
+                                .map(|p| p.text)
+                                .ok();
+                        if let Some(ns) = next_shadow {
+                            best_shadow_text = Some(ns.clone());
+                            // Use the progress score (post-tactic pp_dump) as a hint for ranking the frontier.
+                            let hint_tuple = best_progress
+                                .get("progress")
+                                .and_then(|p| p.get("score"))
+                                .and_then(|s| tuple_from_score(s))
+                                .unwrap_or_else(|| vec![u64::MAX, u64::MAX, u64::MAX]);
+                            next_frontier.push((ns, hint_tuple, best_progress));
+                        }
+                    }
+                } // end per-state loop
+
+                if best_solved_overall.is_some() {
+                    break;
+                }
+
+                // Dedup next frontier by shadow hash, then keep top `beam` by hint tuple.
+                let mut seen_sha: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                next_frontier.retain(|(txt, _, _)| seen_sha.insert(sha256_hex(txt.as_bytes())));
+                next_frontier.sort_by(|a, b| a.1.cmp(&b.1));
+                let kept = next_frontier.into_iter().take(beam).collect::<Vec<_>>();
+
+                // Optional artifacts: write the best frontier state per round.
+                if write_best {
+                    if let Some((txt, _, _)) = kept.first() {
+                        let p = capsule_dir.join(format!("shadow.round_{}.lean", round_i + 1));
+                        let _ = std::fs::write(&p, txt);
+                    }
+                }
+
+                frontier = kept
+                    .iter()
+                    .map(|(txt, hint, _row)| (txt.clone(), Some(hint.clone())))
+                    .collect();
+
+                // If we couldn't produce any improving next state, stop.
+                if frontier.is_empty() {
+                    break;
+                }
+            }
+
+            let result_kind = if best_solved_overall.is_some() {
+                "solved"
+            } else if !best_progress_overall.is_null() {
+                "progress"
+            } else {
+                "unsolved"
+            };
+
+            if write_best {
+                let out_path = capsule_dir.join("shadow.best.lean");
+                if let Some(txt) = best_shadow_text.as_ref() {
+                    if std::fs::write(&out_path, txt).is_ok() {
+                        best_written = serde_json::Value::String(out_path.display().to_string());
+                    }
+                }
+            }
+
+            let out = json!({
+                "ok": true,
+                "kind": "goal_try",
+                "result_kind": result_kind,
+                "capsule_dir": capsule_dir.display().to_string(),
+                "beam": beam,
+                "rounds": { "requested": rounds, "completed": rounds_out.len() },
+                "baseline_score": initial_baseline_score,
+                "attempts": attempts_total,
+                "best": {
+                    "solved": best_solved_overall.unwrap_or(serde_json::Value::Null),
+                    "progress": best_progress_overall,
+                },
+                "best_written": best_written,
+                "round_results": rounds_out,
+            });
+
+            if let Some(p) = output_json {
+                write_json(&p, &out)?;
+                println!(
+                    "{}",
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "goal_try",
+                        "result_kind": out["result_kind"],
+                    })
+                    .to_string()
+                );
             } else {
                 println!("{}", out.to_string());
             }
@@ -1472,6 +2509,8 @@ fn main() -> Result<(), String> {
                 let small = json!({
                     "ok": true,
                     "written": p.display().to_string(),
+                    "kind": "agent_step",
+                    "result_kind": serde_json::Value::Null,
                     "file": file,
                     "written_file": wrote_path,
                     "verify1_ok": verify1.ok,
@@ -1502,7 +2541,13 @@ fn main() -> Result<(), String> {
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": out["kind"],
+                        "result_kind": out["result_kind"],
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -1540,7 +2585,13 @@ fn main() -> Result<(), String> {
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "rubberduck_prompt",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -1573,7 +2624,13 @@ fn main() -> Result<(), String> {
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "locate_sorries",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -1620,7 +2677,13 @@ fn main() -> Result<(), String> {
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "verify_summary",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -1707,7 +2770,13 @@ fn main() -> Result<(), String> {
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "patch",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -1817,7 +2886,13 @@ fn main() -> Result<(), String> {
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "patch_region",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -1975,7 +3050,13 @@ fn main() -> Result<(), String> {
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "patch_nearest",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -2090,16 +3171,50 @@ fn main() -> Result<(), String> {
             let beam = arg_u64(rest, "--beam").unwrap_or(4) as usize;
             let max_nodes = arg_u64(rest, "--max-nodes").unwrap_or(20) as usize;
             let depth = arg_u64(rest, "--depth").unwrap_or(2) as usize;
-            let candidates_mode =
-                arg_value(rest, "--candidates").unwrap_or_else(|| "det".to_string());
+            // Defaults discipline:
+            // - baseline default: `det` (fast, offline)
+            // - if a repo-owned research preset is provided, default to `lean-try` (still offline)
+            //   and allow LLM escalation once we’re stuck.
+            let (candidates_mode, candidates_mode_source) =
+                if let Some(v) = arg_value(rest, "--candidates") {
+                    (v, "explicit")
+                } else if arg_value(rest, "--research-preset").is_some() {
+                    ("lean-try".to_string(), "research_preset_default")
+                } else {
+                    ("det".to_string(), "baseline_default")
+                };
             let lean_oracle_per_node = arg_flag(rest, "--lean-oracle-per-node");
             let lean_oracle_max_calls =
                 arg_u64(rest, "--lean-oracle-max-calls").unwrap_or(12) as usize;
             let rollout_k = arg_u64(rest, "--rollout-k").unwrap_or(0) as usize;
             let dedup_goal_expansions = arg_flag(rest, "--dedup-goal-expansions");
-            let goal_first_k = arg_u64(rest, "--goal-first-k").unwrap_or(0) as usize;
+            // When using `lean-try` or a research preset, goal-first scheduling is usually a win.
+            // Keep it bounded and non-surprising: default to 3 only in those modes.
+            let goal_first_k_raw = arg_u64(rest, "--goal-first-k").unwrap_or(0) as usize;
+            let goal_first_k_explicit = arg_value(rest, "--goal-first-k").is_some();
+            let mut goal_first_k_source = if goal_first_k_explicit {
+                "explicit"
+            } else if candidates_mode == "lean-try"
+                || arg_value(rest, "--research-preset").is_some()
+            {
+                "mode_default"
+            } else {
+                "default"
+            };
+            let goal_first_k_defaulted = !goal_first_k_explicit
+                && goal_first_k_raw == 0
+                && (candidates_mode == "lean-try"
+                    || arg_value(rest, "--research-preset").is_some());
+            let mut goal_first_k = if goal_first_k_defaulted {
+                3
+            } else {
+                goal_first_k_raw
+            };
             let fill_mode_raw = arg_value(rest, "--fill-mode");
             let focus_line_override = arg_u64(rest, "--focus-line").map(|x| x as usize);
+            let focus_decl_override = arg_value(rest, "--focus-decl");
+            let focus_decl_strict = arg_flag(rest, "--focus-decl-strict");
+            let focus_decl_hard = arg_flag(rest, "--focus-decl-hard");
             let max_candidates_per_node =
                 arg_u64(rest, "--max-candidates-per-node").map(|x| x as usize);
             let verify_k = arg_u64(rest, "--verify-k").map(|x| x as usize);
@@ -2122,17 +3237,133 @@ fn main() -> Result<(), String> {
             let llm_planner_timeout_s = arg_u64(rest, "--llm-planner-timeout-s").unwrap_or(10);
             #[cfg(not(feature = "planner"))]
             let _llm_planner_timeout_s = arg_u64(rest, "--llm-planner-timeout-s").unwrap_or(10);
-            let smt_precheck = arg_flag(rest, "--smt-precheck");
-            let smt_timeout_ms = arg_u64(rest, "--smt-timeout-ms").unwrap_or(1500);
+            let smt_precheck_on = arg_flag(rest, "--smt-precheck");
+            let smt_precheck_off = arg_flag(rest, "--no-smt-precheck");
+            let smt_solver_explicit = arg_value(rest, "--smt-solver").is_some();
+            let mut smt_solver =
+                arg_value(rest, "--smt-solver").unwrap_or_else(|| "auto".to_string());
+            let smt_aggressive = arg_flag(rest, "--smt-aggressive");
+            let mut smt_unsat_core = arg_flag(rest, "--smt-unsat-core");
+            let mut smt_unsat_core_source = if smt_unsat_core { "explicit" } else { "off" };
+            let mut smt_unsat_core_max = arg_u64(rest, "--smt-unsat-core-max")
+                .unwrap_or(12)
+                .clamp(0, 64) as usize;
+            let mut smt_unsat_core_max_source = if arg_value(rest, "--smt-unsat-core-max").is_some()
+            {
+                "explicit"
+            } else {
+                "default"
+            };
+            let smt_support_explicit = arg_flag(rest, "--smt-support");
+            let mut smt_support = smt_support_explicit;
+            let mut smt_support_source = if smt_support { "explicit" } else { "off" };
+            let smt_support_max =
+                arg_u64(rest, "--smt-support-max").unwrap_or(8).clamp(0, 64) as usize;
+            let smt_proof_explicit = arg_flag(rest, "--smt-proof");
+            let mut smt_proof = smt_proof_explicit;
+            let mut smt_proof_source = if smt_proof { "explicit" } else { "off" };
+            let smt_proof_max_chars = arg_u64(rest, "--smt-proof-max-chars")
+                .unwrap_or(12_000)
+                .clamp(0, 200_000) as usize;
+            let smt_proof_dump = arg_flag(rest, "--smt-proof-dump");
+            let smt_proof_dump_dir_opt = arg_value(rest, "--smt-proof-dump-dir").map(PathBuf::from);
+            let smt_proof_dump_max_chars = arg_u64(rest, "--smt-proof-dump-max-chars")
+                .unwrap_or(200_000)
+                .clamp(0, 5_000_000) as usize;
+            if smt_proof_dump && !smt_proof {
+                smt_proof = true;
+                smt_proof_source = "implied_by_dump_flag";
+            }
+            if arg_value(rest, "--smt-repro-dir").is_some() && !smt_proof {
+                smt_proof = true;
+                smt_proof_source = "smt_repro_default";
+            }
+            let mut smt_dump = arg_flag(rest, "--smt-dump");
+            let mut smt_dump_source = if smt_dump { "explicit" } else { "off" };
+            let mut smt_dump_max =
+                arg_u64(rest, "--smt-dump-max").unwrap_or(4).clamp(0, 64) as usize;
+            let mut smt_dump_max_source = if arg_value(rest, "--smt-dump-max").is_some() {
+                "explicit"
+            } else {
+                "default"
+            };
+            let smt_dump_dir_opt = arg_value(rest, "--smt-dump-dir").map(PathBuf::from);
+            // If the user opted into unsat cores, default to producing at least one reproducible
+            // SMT-LIB2 artifact (bounded).
+            if smt_unsat_core && !smt_dump {
+                smt_dump = true;
+                smt_dump_source = "unsat_core_default";
+                if !arg_value(rest, "--smt-dump-max").is_some() {
+                    smt_dump_max = 1;
+                    smt_dump_max_source = "unsat_core_default";
+                }
+            }
+            // Aggressive mode: spend more resources to make SMT “strong”.
+            if smt_aggressive {
+                if !smt_unsat_core {
+                    smt_unsat_core = true;
+                    smt_unsat_core_source = "aggressive_default";
+                }
+                if !smt_proof {
+                    smt_proof = true;
+                    smt_proof_source = "aggressive_default";
+                }
+                if !arg_value(rest, "--smt-unsat-core-max").is_some() {
+                    smt_unsat_core_max = smt_unsat_core_max.max(16);
+                    smt_unsat_core_max_source = "aggressive_default";
+                }
+                if !smt_dump {
+                    smt_dump = true;
+                    smt_dump_source = "aggressive_default";
+                }
+                if !arg_value(rest, "--smt-dump-max").is_some() {
+                    smt_dump_max = smt_dump_max.max(8);
+                    smt_dump_max_source = "aggressive_default";
+                }
+            }
+            let mut smt_solver_source = if smt_solver_explicit {
+                "explicit"
+            } else if arg_value(rest, "--research-preset").is_some() {
+                "research_preset_default"
+            } else if candidates_mode == "lean-try" {
+                "lean_try_default"
+            } else {
+                "default"
+            };
+            let smt_timeout_ms_explicit = arg_value(rest, "--smt-timeout-ms").is_some();
+            let mut smt_timeout_ms = arg_u64(rest, "--smt-timeout-ms").unwrap_or(1500);
+            let mut smt_timeout_ms_source = if smt_timeout_ms_explicit {
+                "explicit"
+            } else if arg_value(rest, "--research-preset").is_some() {
+                "research_preset_default"
+            } else if candidates_mode == "lean-try" {
+                "lean_try_default"
+            } else {
+                "default"
+            };
+            let smt_seed_explicit = arg_value(rest, "--smt-seed").is_some();
             let smt_seed = arg_u64(rest, "--smt-seed").unwrap_or(0);
+            let smt_depth_explicit = arg_value(rest, "--smt-depth").is_some();
+            let smt_depth_raw = arg_u64(rest, "--smt-depth").unwrap_or(0) as usize;
             let llm_timeout_s = arg_u64(rest, "--llm-timeout-s").unwrap_or(60);
-            let goal_dump = arg_flag(rest, "--goal-dump");
-            let escalate_llm = arg_flag(rest, "--escalate-llm");
+            let goal_dump_raw = arg_flag(rest, "--goal-dump");
+            let escalate_llm_flag = arg_flag(rest, "--escalate-llm");
+            let escalate_llm_source = if escalate_llm_flag {
+                "explicit"
+            } else if arg_value(rest, "--research-preset").is_some() {
+                "research_preset_default"
+            } else {
+                "off"
+            };
+            // (Compute smt/goal_dump sources after resolving research_preset + candidates_mode.)
+            let escalate_llm = escalate_llm_flag;
             let allow_sorry_candidates = arg_flag(rest, "--allow-sorry-candidates");
             let include_trace = arg_flag(rest, "--include-trace");
             let pick = arg_value(rest, "--pick").unwrap_or_else(|| "best".to_string());
             let quiet = arg_flag(rest, "--quiet");
             let research_notes_file = arg_value(rest, "--research-notes-file").map(PathBuf::from);
+            let research_preset = arg_value(rest, "--research-preset");
+            let research_top_k = arg_u64(rest, "--research-top-k").unwrap_or(3) as usize;
             let include_diff = arg_flag(rest, "--include-diff");
             let diff_context = arg_u64(rest, "--diff-context").unwrap_or(3) as usize;
             let output_diff_requested = arg_value(rest, "--output-diff").map(PathBuf::from);
@@ -2141,9 +3372,192 @@ fn main() -> Result<(), String> {
             let write_to = arg_value(rest, "--write-to").map(PathBuf::from);
             let include_raw_verify = arg_flag(rest, "--include-raw-verify");
             let output_json = arg_value(rest, "--output-json").map(PathBuf::from);
+            let smt_repro_dir_opt = arg_value(rest, "--smt-repro-dir").map(PathBuf::from);
+            let smt_repro_dir_source = if smt_repro_dir_opt.is_some() {
+                "explicit"
+            } else {
+                "off"
+            };
+
+            // SMT precheck defaults:
+            // - baseline: on (best-effort, bounded; no solver means no effect)
+            // - research preset: on
+            // - lean-try mode: on (user opted into Lean-backed search; SMT usually pays here too)
+            let smt_precheck = if smt_precheck_off {
+                false
+            } else {
+                true || smt_precheck_on
+                    || research_preset.is_some()
+                    || candidates_mode == "lean-try"
+            };
+            let smt_precheck_source = if smt_precheck_off {
+                "explicit_off"
+            } else if smt_precheck_on {
+                "explicit_on"
+            } else if research_preset.is_some() {
+                "research_preset_default"
+            } else if candidates_mode == "lean-try" {
+                "lean_try_default"
+            } else {
+                "baseline_default"
+            };
+            // If SMT is on by baseline default, keep timeout small unless explicitly overridden.
+            if !smt_timeout_ms_explicit
+                && research_preset.is_none()
+                && candidates_mode != "lean-try"
+                && smt_precheck_source == "baseline_default"
+            {
+                smt_timeout_ms = 250;
+                smt_timeout_ms_source = "baseline_default";
+            }
+            if smt_aggressive && !smt_timeout_ms_explicit {
+                smt_timeout_ms = smt_timeout_ms.max(8000);
+                smt_timeout_ms_source = "aggressive_default";
+            }
+
+            // SMT support defaults:
+            // - baseline: off (expensive)
+            // - research preset: on (turn entailment into actionable Lean guidance)
+            // - lean-try mode: on (user opted into heavier automation; support sets usually pay)
+            if !smt_support_explicit {
+                if research_preset.is_some() {
+                    smt_support = true;
+                    smt_support_source = "research_preset_default";
+                } else if candidates_mode == "lean-try" {
+                    smt_support = true;
+                    smt_support_source = "lean_try_default";
+                } else if smt_aggressive {
+                    smt_support = true;
+                    smt_support_source = "aggressive_default";
+                }
+            }
+
+            // Goal dump defaults:
+            // - baseline: off
+            // - research preset: on
+            // - lean-try mode: on (we already spend Lean budget; goal snapshots help ranking + debugging)
+            let goal_dump_defaulted_by_repro = smt_repro_dir_opt.is_some()
+                && !goal_dump_raw
+                && research_preset.is_none()
+                && candidates_mode != "lean-try";
+            let goal_dump = goal_dump_raw
+                || goal_dump_defaulted_by_repro
+                || research_preset.is_some()
+                || candidates_mode == "lean-try";
+            let goal_dump_source = if goal_dump_raw {
+                "explicit"
+            } else if goal_dump_defaulted_by_repro {
+                "smt_repro_default"
+            } else if research_preset.is_some() {
+                "research_preset_default"
+            } else if candidates_mode == "lean-try" {
+                "lean_try_default"
+            } else {
+                "off"
+            };
+
+            // SMT depth defaults:
+            // - baseline: 0 (use all parseable LIA hyps)
+            // - research preset: 2 (bounded var-connectivity closure; faster + less irrelevant noise)
+            let mut smt_depth_source = if smt_depth_explicit {
+                "explicit"
+            } else if research_preset.is_some() {
+                "research_preset_default"
+            } else if candidates_mode == "lean-try" {
+                "lean_try_default"
+            } else {
+                "default"
+            };
+            let smt_depth_defaulted = !smt_depth_explicit
+                && smt_depth_raw == 0
+                && (research_preset.is_some() || candidates_mode == "lean-try");
+            let mut smt_depth = if smt_depth_defaulted {
+                2
+            } else {
+                smt_depth_raw
+            };
+            if smt_aggressive && !smt_depth_explicit {
+                smt_depth = smt_depth.max(2);
+                smt_depth_source = "aggressive_default";
+            }
+
+            // Apply research preset policy overrides (if present).
+            // (These only take effect when the corresponding CLI flag was not explicitly set.)
+            if let Some(preset_name) = research_preset.as_ref() {
+                if let Ok(Some(cfg)) = plc::config::load_from_repo_root(&repo_root) {
+                    if let Some(preset) = cfg.research.resolve_preset(preset_name) {
+                        if let Some(ts) = preset.tree_search {
+                            if !smt_solver_explicit {
+                                if let Some(v) = ts.smt_solver {
+                                    smt_solver = v;
+                                    smt_solver_source = "research_config_override";
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Configure `smtkit` solver choice for this CLI invocation.
+            // This must happen before any SMT probe/session is created.
+            let smt_solver_norm = smt_solver.trim().to_lowercase();
+            if smt_solver_norm != "auto" && !smt_solver_norm.is_empty() {
+                let cmdline = match smt_solver_norm.as_str() {
+                    "z3" => "z3 -in -smt2".to_string(),
+                    "cvc5" => "cvc5 --lang smt2 --incremental".to_string(),
+                    _ => smt_solver.trim().to_string(),
+                };
+                std::env::set_var("SMTKIT_SOLVER", cmdline);
+            }
+
+            // SMT explanation defaults:
+            // - baseline: off (keep hot path fast)
+            // - research preset: on (we want SMT to be auditable when it drives choices)
+            let smt_explain_explicit =
+                arg_flag(rest, "--smt-explain") || arg_flag(rest, "--no-smt-explain");
+            let mut smt_explain_source = if arg_flag(rest, "--no-smt-explain") {
+                "explicit_off"
+            } else if arg_flag(rest, "--smt-explain") {
+                "explicit"
+            } else if research_preset.is_some() {
+                "research_preset_default"
+            } else if candidates_mode == "lean-try" && smt_depth_defaulted {
+                "lean_try_default"
+            } else {
+                "default"
+            };
+            let mut smt_explain = if arg_flag(rest, "--no-smt-explain") {
+                false
+            } else {
+                arg_flag(rest, "--smt-explain")
+                    || research_preset.is_some()
+                    || (candidates_mode == "lean-try" && smt_depth_defaulted)
+            };
+            let smt_explain_max_hyps_explicit = arg_value(rest, "--smt-explain-max-hyps").is_some();
+            let mut smt_explain_max_hyps = arg_u64(rest, "--smt-explain-max-hyps")
+                .unwrap_or(12)
+                .clamp(0, 64) as usize;
+            let mut smt_explain_max_hyps_source = if smt_explain_max_hyps_explicit {
+                "explicit"
+            } else if arg_value(rest, "--research-preset").is_some() {
+                "research_preset_default"
+            } else if candidates_mode == "lean-try" {
+                "lean_try_default"
+            } else {
+                "default"
+            };
 
             if write && write_to.is_some() {
                 return Err("use only one of --write or --write-to".to_string());
+            }
+            if focus_line_override.is_some() && focus_decl_override.is_some() {
+                return Err("use only one of --focus-line or --focus-decl".to_string());
+            }
+            if focus_decl_strict && focus_decl_override.is_none() {
+                return Err("--focus-decl-strict requires --focus-decl".to_string());
+            }
+            if focus_decl_hard && focus_decl_override.is_none() {
+                return Err("--focus-decl-hard requires --focus-decl".to_string());
             }
 
             if beam == 0 {
@@ -2159,6 +3573,13 @@ fn main() -> Result<(), String> {
             let repo_root =
                 plc::find_lean_repo_root(&repo_root).map_err(|e| format!("repo_root: {e}"))?;
             plc::load_dotenv_smart(&repo_root);
+
+            // Best-effort: create the dump directory up-front so `--smt-proof-dump-dir` is
+            // guaranteed to exist even if we end up capturing 0 proofs.
+            if smt_proof_dump {
+                let root = smt_proof_dump_root(&repo_root, &smt_proof_dump_dir_opt);
+                let _ = std::fs::create_dir_all(&root);
+            }
 
             let cache_dir = if no_cache {
                 None
@@ -2178,6 +3599,237 @@ fn main() -> Result<(), String> {
             }
             let original_text = std::fs::read_to_string(&abs)
                 .map_err(|e| format!("read {}: {e}", abs.display()))?;
+
+            // If the file has no `sorry`/`admit`, `tree-search-nearest` is not applicable.
+            // Return a small structured result instead of erroring (useful for “repo is sorry-free” workflows).
+            let locs_any = plc::locate_sorries_in_text(&original_text, 200, 1)?;
+            let primary_any = plc::select_primary_sorry(focus_line_override, &locs_any);
+            if primary_any.is_none() {
+                let out = json!({
+                    "ok": true,
+                    "kind": "tree_search_nearest",
+                    "result_kind": "early_no_sorries",
+                    "repo_root": repo_root.display().to_string(),
+                    "file": file,
+                    "note": "No `sorry`/`admit` tokens found in file; nothing to patch.",
+                    "sorries": 0,
+                    "errors": 0,
+                    "focus": {
+                        "requested_decl": focus_decl_override,
+                        "strict": focus_decl_strict,
+                        "hard": focus_decl_hard,
+                        "note": "focus is not applicable (file has no sorries)",
+                    }
+                });
+                if let Some(p) = output_json {
+                    write_json(&p, &out)?;
+                    println!(
+                        "{}",
+                        json!({
+                            "ok": true,
+                            "written": p.display().to_string(),
+                            "kind": out["kind"],
+                            "result_kind": out["result_kind"],
+                        })
+                        .to_string()
+                    );
+                } else {
+                    println!("{}", out.to_string());
+                }
+                return Ok(());
+            }
+
+            // Ensure the preflight goal dump targets the same hole we intend to search.
+            //
+            // If the user used `--focus-decl`, we may still want a goal dump at that decl’s nearest
+            // `sorry` (even though `focus_line_override` is unset). This matters because:
+            // - goal dumps populate cache-only signals (SMT precheck, goal sig stabilization)
+            // - without this, we can end up dumping a different `sorry` and then SMT/ranking
+            //   becomes unavailable for the actual focused hole.
+            let mut focus_line_for_goal_dump = focus_line_override;
+            if focus_line_for_goal_dump.is_none() {
+                if let Some(fd0) = focus_decl_override.as_ref() {
+                    let fd = fd0.trim().to_string();
+                    let fd_last = fd
+                        .split(|c| c == '.' || c == ':')
+                        .filter(|s| !s.is_empty())
+                        .last()
+                        .unwrap_or(fd.as_str())
+                        .to_string();
+                    let needle = format!(".{fd_last}");
+                    let picked = locs_any.iter().find(|l| {
+                        l.decl_name
+                            .as_ref()
+                            .is_some_and(|dn| dn == &fd || dn == &fd_last || dn.ends_with(&needle))
+                    });
+                    if let Some(p) = picked {
+                        focus_line_for_goal_dump = Some(p.line);
+                    } else {
+                        // Fallback: dump at the file’s primary sorry.
+                        focus_line_for_goal_dump = primary_any.as_ref().map(|p| p.line);
+                    }
+                }
+            }
+
+            // Strict focus should fail fast *before* any expensive verification.
+            // (Otherwise, users pay a baseline verify just to discover a typo in the decl name.)
+            if focus_decl_strict {
+                let fd = focus_decl_override
+                    .clone()
+                    .ok_or_else(|| "--focus-decl-strict requires --focus-decl".to_string())?;
+                let fd = fd.trim().to_string();
+                let fd_last = fd
+                    .split(|c| c == '.' || c == ':')
+                    .filter(|s| !s.is_empty())
+                    .last()
+                    .unwrap_or(fd.as_str())
+                    .to_string();
+                let needle = format!(".{fd_last}");
+                let found = locs_any.iter().any(|l| {
+                    l.decl_name
+                        .as_ref()
+                        .is_some_and(|dn| dn == &fd || dn == &fd_last || dn.ends_with(&needle))
+                });
+                if !found {
+                    // Distinguish “typo” vs “decl exists but has no `sorry`”.
+                    let decl_exists_in_file = original_text.lines().any(|ln| {
+                        let t = ln.trim_start();
+                        let mut it = t.split_whitespace();
+                        let kw = it.next().unwrap_or("");
+                        if !matches!(kw, "theorem" | "lemma" | "def") {
+                            return false;
+                        }
+                        let name = it.next().unwrap_or("");
+                        name == fd || name == fd_last || name.ends_with(&needle)
+                    });
+
+                    let mut available: Vec<String> = locs_any
+                        .iter()
+                        .filter_map(|l| l.decl_name.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    available.sort();
+                    let available_short: Vec<String> = available.into_iter().take(24).collect();
+                    let out = json!({
+                        "ok": false,
+                        "kind": "tree_search_nearest",
+                        "result_kind": if decl_exists_in_file { "early_focus_decl_strict_empty" } else { "early_focus_decl_strict_not_found" },
+                        "repo_root": repo_root.display().to_string(),
+                        "file": file,
+                        "error": if decl_exists_in_file {
+                            "focus_decl_strict: decl exists but contains no `sorry`"
+                        } else {
+                            "focus_decl_strict: requested decl not found among sorry locations"
+                        },
+                        "focus": {
+                            "source": if decl_exists_in_file { "focus_decl_strict_empty" } else { "focus_decl_strict_not_found" },
+                            "requested_decl": fd,
+                            "available_decls": available_short,
+                        }
+                    });
+                    if let Some(p) = output_json.clone() {
+                        write_json(&p, &out)?;
+                        println!(
+                            "{}",
+                            json!({
+                                "ok": false,
+                                "written": p.display().to_string(),
+                                "kind": out["kind"],
+                                "result_kind": out["result_kind"],
+                            })
+                            .to_string()
+                        );
+                    } else {
+                        println!("{}", out.to_string());
+                    }
+                    return Err(if decl_exists_in_file {
+                        "focus_decl_strict: decl exists but empty".to_string()
+                    } else {
+                        "focus_decl_strict: decl not found".to_string()
+                    });
+                }
+            }
+
+            // Hard focus should also decide “do not drift” before expensive verification.
+            // Unlike strict focus, this is a *successful* early stop (ok=true) with a clear note.
+            if focus_decl_hard {
+                let fd = focus_decl_override
+                    .clone()
+                    .ok_or_else(|| "--focus-decl-hard requires --focus-decl".to_string())?;
+                let fd = fd.trim().to_string();
+                let fd_last = fd
+                    .split(|c| c == '.' || c == ':')
+                    .filter(|s| !s.is_empty())
+                    .last()
+                    .unwrap_or(fd.as_str())
+                    .to_string();
+                let needle = format!(".{fd_last}");
+                let found = locs_any.iter().any(|l| {
+                    l.decl_name
+                        .as_ref()
+                        .is_some_and(|dn| dn == &fd || dn == &fd_last || dn.ends_with(&needle))
+                });
+                if !found {
+                    // Distinguish:
+                    // - decl not found anywhere in the file (likely typo)
+                    // - decl exists, but it contains no `sorry` (nothing to patch in that decl)
+                    let decl_exists_in_file = original_text.lines().any(|ln| {
+                        let t = ln.trim_start();
+                        let mut it = t.split_whitespace();
+                        let kw = it.next().unwrap_or("");
+                        if !matches!(kw, "theorem" | "lemma" | "def") {
+                            return false;
+                        }
+                        let name = it.next().unwrap_or("");
+                        name == fd || name == fd_last || name.ends_with(&needle)
+                    });
+
+                    let mut available: Vec<String> = locs_any
+                        .iter()
+                        .filter_map(|l| l.decl_name.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    available.sort();
+                    let available_short: Vec<String> = available.into_iter().take(24).collect();
+                    let out = json!({
+                        "ok": true,
+                        "kind": "tree_search_nearest",
+                        "result_kind": if decl_exists_in_file { "early_focus_decl_hard_empty" } else { "early_focus_decl_hard_not_found" },
+                        "repo_root": repo_root.display().to_string(),
+                        "file": file,
+                        "note": if decl_exists_in_file {
+                            "Hard focus: requested decl exists but contains no `sorry`; nothing to patch (refusing to drift)."
+                        } else {
+                            "Hard focus: requested decl did not match any `sorry` location; refusing to drift to other declarations."
+                        },
+                        "sorries": locs_any.len(),
+                        "focus": {
+                            "source": if decl_exists_in_file { "focus_decl_hard_empty" } else { "focus_decl_hard_not_found" },
+                            "requested_decl": fd,
+                            "available_decls": available_short,
+                            "hard": true
+                        }
+                    });
+                    if let Some(p) = output_json.clone() {
+                        write_json(&p, &out)?;
+                        println!(
+                            "{}",
+                            json!({
+                                "ok": true,
+                                "written": p.display().to_string(),
+                                "kind": out["kind"],
+                                "result_kind": out["result_kind"],
+                            })
+                            .to_string()
+                        );
+                    } else {
+                        println!("{}", out.to_string());
+                    }
+                    return Ok(());
+                }
+            }
 
             // Local default: when caching is enabled, auto-write useful artifacts unless disabled.
             // This makes `.generated/*.json` “actionable” even when the caller didn't pass paths.
@@ -2232,6 +3884,267 @@ fn main() -> Result<(), String> {
 
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+
+            // Repo-owned research preset → bounded prompt context (and traceable metadata in output).
+            //
+            // This makes “LL ops” actionable: research is not just hydrated; it directly conditions
+            // the LLM calls inside this loop (planner/escalation), and we record the context used.
+            let mut research_context: Option<serde_json::Value> = None;
+            if let Some(preset_name) = research_preset.as_deref() {
+                if let Some(cfg) = plc::config::load_from_repo_root(&repo_root)? {
+                    if let Some(preset) = cfg.research.resolve_preset(preset_name) {
+                        // Merge preset-provided tree-search policy with our good defaults:
+                        // - explicit CLI flags win
+                        // - then preset policy (merged with research.defaults.tree_search)
+                        // - then mode defaults (lean-try / research mode)
+                        if let Some(ts) = preset.tree_search.clone() {
+                            if !goal_first_k_explicit {
+                                if let Some(v) = ts.goal_first_k {
+                                    goal_first_k = v;
+                                    goal_first_k_source = "research_config_override";
+                                }
+                            }
+                            if !smt_depth_explicit {
+                                if let Some(v) = ts.smt_depth {
+                                    smt_depth = v;
+                                    smt_depth_source = "research_config_override";
+                                }
+                            }
+                            if !smt_timeout_ms_explicit {
+                                if let Some(v) = ts.smt_timeout_ms {
+                                    smt_timeout_ms = v;
+                                    smt_timeout_ms_source = "research_config_override";
+                                }
+                            }
+                            if !smt_seed_explicit {
+                                // (rare) allow a preset to force determinism for SMT heuristics
+                                // by pinning the seed.
+                                // NOTE: we only override when user didn't set --smt-seed.
+                                // (No field today; reserved for future.)
+                            }
+                            if !smt_explain_explicit {
+                                if let Some(v) = ts.smt_explain {
+                                    smt_explain = v;
+                                    smt_explain_source = "research_config_override";
+                                }
+                            }
+                            if !smt_explain_max_hyps_explicit {
+                                if let Some(v) = ts.smt_explain_max_hyps {
+                                    smt_explain_max_hyps = v.min(64);
+                                    smt_explain_max_hyps_source = "research_config_override";
+                                }
+                            }
+                        }
+                        let mut papers = rt.block_on(plc::arxiv::arxiv_search(
+                            &preset.query,
+                            preset.max_results,
+                            StdDuration::from_millis(preset.timeout_ms),
+                        ))?;
+
+                        let must_any_l: Vec<String> = preset
+                            .must_include_any
+                            .iter()
+                            .map(|s| s.to_lowercase())
+                            .collect();
+                        let must_all_l: Vec<String> = preset
+                            .must_include_all
+                            .iter()
+                            .map(|s| s.to_lowercase())
+                            .collect();
+                        if !must_any_l.is_empty() || !must_all_l.is_empty() {
+                            papers = papers
+                                .into_iter()
+                                .filter(|p| {
+                                    let hay =
+                                        format!("{}\n{}", p.title, p.abstract_text).to_lowercase();
+                                    let ok_any = must_any_l.is_empty()
+                                        || must_any_l.iter().any(|tok| hay.contains(tok));
+                                    let ok_all = must_all_l.is_empty()
+                                        || must_all_l.iter().all(|tok| hay.contains(tok));
+                                    ok_any && ok_all
+                                })
+                                .collect();
+                        }
+
+                        let mut ctx = json!({
+                            "ok": true,
+                            "kind": "research_context",
+                            "preset": preset_name,
+                            "settings": preset,
+                            "arxiv": {
+                                "query": preset.query,
+                                "max_results": preset.max_results,
+                                "timeout_ms": preset.timeout_ms,
+                                "filter": { "must_include_any": preset.must_include_any, "must_include_all": preset.must_include_all },
+                                "papers": papers,
+                            }
+                        });
+
+                        if preset.llm_summary {
+                            let kind = preset
+                                .llm_summary_kind
+                                .as_deref()
+                                .unwrap_or(research_summary_kind_default());
+                            let system = research_summary_system_prompt(kind);
+                            let user = serde_json::to_string(&json!({
+                                "preset": preset_name,
+                                "query": ctx["arxiv"]["query"],
+                                "papers": ctx["arxiv"]["papers"],
+                            }))
+                            .unwrap_or_else(|_| "{\"papers\":[]}".to_string());
+                            let res = match normalize_summary_kind(kind).as_str() {
+                                "formalization_v2" => rt
+                                    .block_on(plc::llm::chat_completion_structured::<
+                                        ResearchSummaryV2,
+                                    >(
+                                        &system,
+                                        &user,
+                                        StdDuration::from_secs(preset.llm_timeout_s),
+                                    ))
+                                    .map(|r| {
+                                        let capped = cap_summary_v2(r.value, &preset);
+                                        let v = serde_json::to_value(&capped)
+                                            .unwrap_or(serde_json::Value::Null);
+                                        (
+                                            r.provider,
+                                            r.model,
+                                            r.model_source,
+                                            r.model_env,
+                                            r.mode,
+                                            v,
+                                        )
+                                    }),
+                                _ => rt
+                                    .block_on(
+                                        plc::llm::chat_completion_structured::<ResearchSummary>(
+                                            &system,
+                                            &user,
+                                            StdDuration::from_secs(preset.llm_timeout_s),
+                                        ),
+                                    )
+                                    .map(|r| {
+                                        let capped = cap_summary_v1(r.value, &preset);
+                                        let v = serde_json::to_value(&capped)
+                                            .unwrap_or(serde_json::Value::Null);
+                                        (
+                                            r.provider,
+                                            r.model,
+                                            r.model_source,
+                                            r.model_env,
+                                            r.mode,
+                                            v,
+                                        )
+                                    }),
+                            };
+                            if let Ok((provider, model, model_source, model_env, mode, v)) = res {
+                                ctx["llm_summary"] = json!({
+                                    "provider": provider,
+                                    "model": model,
+                                    "model_source": model_source,
+                                    "model_env": model_env,
+                                    "mode": mode,
+                                    "kind": kind,
+                                    "content_struct": v,
+                                });
+                            }
+                        }
+
+                        let notes = plc::ingest_research_json(&ctx);
+                        let notes_v =
+                            serde_json::to_value(&notes).unwrap_or(serde_json::Value::Null);
+                        ctx["notes"] = notes_v.clone();
+
+                        // Merge into the prompt notes (bounded).
+                        let mut s = String::new();
+                        s.push_str("Research context (repo-owned preset):\n");
+                        s.push_str(&format!("- preset: {preset_name}\n"));
+                        s.push_str(&format!("- query: {}\n", preset.query));
+                        s.push_str(&format!("- papers: {}\n", papers.len()));
+                        if let Some(xs) = notes_v.get("sources").and_then(|v| v.as_array()) {
+                            s.push_str("\nTop sources:\n");
+                            for src in xs.iter().take(research_top_k) {
+                                let title = src.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                                let url = src
+                                    .get("canonical_url")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| src.get("url").and_then(|v| v.as_str()))
+                                    .unwrap_or("");
+                                if !title.is_empty() || !url.is_empty() {
+                                    s.push_str(&format!("- {} {}\n", title, url));
+                                }
+                            }
+                        }
+                        if let Some(llm) =
+                            ctx.get("llm_summary").and_then(|v| v.get("content_struct"))
+                        {
+                            if let Some(pitfalls) = llm.get("pitfalls") {
+                                s.push_str("\nPitfalls:\n");
+                                s.push_str(&format!("{}\n", pitfalls));
+                            }
+                            if let Some(shape) = llm.get("proof_shape") {
+                                s.push_str("\nProof shape:\n");
+                                s.push_str(&format!("{}\n", shape));
+                            }
+                            if let Some(ids) = llm.get("mathlib_idents") {
+                                s.push_str("\nMathlib idents:\n");
+                                s.push_str(&format!("{}\n", ids));
+                            }
+                        }
+
+                        research_notes_text = match research_notes_text {
+                            Some(prev) => Some(format!("{s}\n\nExternal notes file:\n{prev}")),
+                            None => Some(s),
+                        };
+                        research_notes = Some(json!({
+                            "preset": preset_name,
+                            "top_k": research_top_k,
+                            "deduped_urls": notes.deduped_urls,
+                        }));
+                        research_context = Some(ctx);
+                    }
+                }
+            }
+
+            // Repo-configured hint packs (repo-specific accelerants, opt-in).
+            // For tree-search, a research preset may override which packs are enabled.
+            let hint_rules: Vec<plc::config::HintRule> =
+                load_hint_rules(&repo_root, research_preset.as_deref());
+
+            // Research preset implies “LLM is allowed to help if stuck” (bounded + best-effort).
+            let escalate_llm = escalate_llm || research_preset.is_some();
+            let decision_effects = json!({
+                "candidates_mode": { "value": candidates_mode, "source": candidates_mode_source },
+                "goal_first_k": { "value": goal_first_k, "source": goal_first_k_source },
+                "smt_precheck": { "value": smt_precheck, "source": smt_precheck_source },
+                "smt_aggressive": { "value": smt_aggressive, "source": if smt_aggressive { "explicit" } else { "off" } },
+                "smt_solver": { "value": smt_solver, "source": smt_solver_source },
+                "smt_unsat_core": { "value": smt_unsat_core, "source": smt_unsat_core_source },
+                "smt_unsat_core_max": { "value": smt_unsat_core_max, "source": smt_unsat_core_max_source },
+                "smt_support": { "value": smt_support, "source": smt_support_source },
+                "smt_support_max": { "value": smt_support_max, "source": if arg_value(rest, "--smt-support-max").is_some() { "explicit" } else { "default" } },
+                "smt_dump": { "value": smt_dump, "source": smt_dump_source },
+                "smt_dump_max": { "value": smt_dump_max, "source": smt_dump_max_source },
+                "smt_dump_dir": { "value": smt_dump_dir_opt.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "".to_string()), "source": if arg_value(rest, "--smt-dump-dir").is_some() { "explicit" } else { "default" } },
+                "smt_timeout_ms": { "value": smt_timeout_ms, "source": smt_timeout_ms_source },
+                "smt_depth": {
+                    "value": smt_depth,
+                    "source": smt_depth_source
+                },
+                "smt_explain": {
+                    "value": smt_explain,
+                    "source": smt_explain_source
+                },
+                "smt_explain_max_hyps": { "value": smt_explain_max_hyps, "source": smt_explain_max_hyps_source },
+                "goal_dump": { "value": goal_dump, "source": goal_dump_source },
+                "smt_repro_dir": {
+                    "value": smt_repro_dir_opt
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "".to_string()),
+                    "source": smt_repro_dir_source
+                },
+                "escalate_llm": { "value": escalate_llm, "source": escalate_llm_source },
+            });
 
             // Optional lightweight profiling (accumulates ms). Controlled by `--profile`.
             let mut prof_verify_baseline_ms: u64 = 0;
@@ -2289,6 +4202,9 @@ fn main() -> Result<(), String> {
                         "dedup_goal_expansions": dedup_goal_expansions,
                         "fill_mode": fill_mode_raw.as_deref().unwrap_or("auto"),
                         "log_level": log_level,
+                        "research_preset": research_preset,
+                        "research_top_k": research_top_k,
+                        "escalate_llm": escalate_llm,
                     }
                 }),
             );
@@ -2297,7 +4213,7 @@ fn main() -> Result<(), String> {
             let mut lean_suggest_v: Option<serde_json::Value> = None;
             if goal_dump || matches!(candidates_mode.trim(), "auto" | "lean") {
                 if let Some(dur) = budget_dur(goal_dump_timeout_s) {
-                    let gd = if let Some(fl) = focus_line_override {
+                    let gd = if let Some(fl) = focus_line_for_goal_dump {
                         rt.block_on(plc::goal_dump_in_text_at(
                             &repo_root,
                             &file,
@@ -2333,16 +4249,13 @@ fn main() -> Result<(), String> {
             } else {
                 lean_oracle_per_node
             };
-            let goal_first_k = if candidates_mode == "lean-try" {
-                // Default “goal-first” probing for LeanTree-ish behavior.
-                if goal_first_k == 0 {
+            let goal_first_k =
+                if candidates_mode == "lean-try" && goal_first_k == 0 && !goal_first_k_explicit {
+                    // Default “goal-first” probing for LeanTree-ish behavior.
                     3
                 } else {
                     goal_first_k
-                }
-            } else {
-                goal_first_k
-            };
+                };
             let fill_mode = if candidates_mode == "lean-try" {
                 fill_mode_raw.unwrap_or_else(|| "hybrid".to_string())
             } else {
@@ -2398,13 +4311,13 @@ fn main() -> Result<(), String> {
             // falls back to an explicit `sorry` (honest intermediate state) so nodes stay `ok=true`.
             let safe_tactic_fallback_block = |indent: &str| -> String {
                 format!(
-                    "{indent}try (simp; done)\n{indent}try (aesop; done)\n{indent}try (omega; done)\n{indent}try (nlinarith; done)\n{indent}try (linarith; done)\n{indent}try (ring_nf; done)\n{indent}try (norm_num; done)\n{indent}sorry"
+                    "{indent}try (simp; done)\n{indent}try (norm_cast; done)\n{indent}try (aesop; done)\n{indent}try (omega; done)\n{indent}try (nlinarith; done)\n{indent}try (linarith; done)\n{indent}try (ring_nf; done)\n{indent}try (norm_num; done)\n{indent}sorry"
                 )
             };
 
             // Single-line `first | ... | sorry` form for tactic holes (works well inside nested contexts).
             let safe_first_line = || -> String {
-                "first | (simp; done) | (aesop; done) | (omega; done) | (nlinarith; done) | (linarith; done) | (ring_nf; done) | (norm_num; done) | sorry".to_string()
+                "first | (simp; done) | (norm_cast; done) | (aesop; done) | (omega; done) | (nlinarith; done) | (linarith; done) | (ring_nf; done) | (norm_num; done) | sorry".to_string()
             };
             let mut llm_meta_initial: Option<serde_json::Value> = None;
             let mut llm_escalate_attempts: u64 = 0;
@@ -2420,7 +4333,10 @@ fn main() -> Result<(), String> {
                         .and_then(|v| v.get("pretty"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let mut derived = plc::derive_candidates_from_goal_pretty(pretty);
+                    let mut derived = plc::derive_candidates_from_goal_pretty_with_hint_rules(
+                        pretty,
+                        &hint_rules,
+                    );
                     if derived.is_empty() {
                         derived = default_det_candidates();
                     }
@@ -2472,7 +4388,10 @@ fn main() -> Result<(), String> {
                             .and_then(|v| v.get("pretty"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        xs = plc::derive_candidates_from_goal_pretty(pretty);
+                        xs = plc::derive_candidates_from_goal_pretty_with_hint_rules(
+                            pretty,
+                            &hint_rules,
+                        );
                     }
                 }
                 if xs.is_empty() {
@@ -2593,7 +4512,7 @@ fn main() -> Result<(), String> {
                     }
                 }
                 if let Some(notes) = research_notes_text.as_ref() {
-                    system.push_str("\n\nResearch notes (external; may be incomplete):\n");
+                    system.push_str("\n\nResearch context (may be incomplete):\n");
                     system.push_str(notes);
                 }
 
@@ -2651,7 +4570,10 @@ fn main() -> Result<(), String> {
                                 .and_then(|v| v.get("pretty"))
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-                            let derived = plc::derive_candidates_from_goal_pretty(pretty);
+                            let derived = plc::derive_candidates_from_goal_pretty_with_hint_rules(
+                                pretty,
+                                &hint_rules,
+                            );
                             if derived.is_empty() {
                                 None
                             } else {
@@ -2689,6 +4611,7 @@ fn main() -> Result<(), String> {
                 let strict = vec![
                     "by\n  (simp; done)".to_string(),
                     "by\n  (simp_all; done)".to_string(),
+                    "by\n  (norm_cast; done)".to_string(),
                     "by\n  (aesop; done)".to_string(),
                     "by\n  (omega; done)".to_string(),
                     "by\n  (nlinarith; done)".to_string(),
@@ -2703,8 +4626,8 @@ fn main() -> Result<(), String> {
                 ];
                 // safe: never hard-error; keeps explicit `sorry` fallback (honest intermediate)
                 let safe = vec![
-                    "by\n  first | (simp; done) | (aesop; done) | (omega; done) | (nlinarith; done) | (linarith; done) | (ring_nf; done) | (norm_num; done) | sorry".to_string(),
-                    "by\n  classical\n  first | (simp; done) | (aesop; done) | (omega; done) | (nlinarith; done) | (linarith; done) | (ring_nf; done) | (norm_num; done) | sorry".to_string(),
+                    "by\n  first | (simp; done) | (norm_cast; done) | (aesop; done) | (omega; done) | (nlinarith; done) | (linarith; done) | (ring_nf; done) | (norm_num; done) | sorry".to_string(),
+                    "by\n  classical\n  first | (simp; done) | (norm_cast; done) | (aesop; done) | (omega; done) | (nlinarith; done) | (linarith; done) | (ring_nf; done) | (norm_num; done) | sorry".to_string(),
                 ];
                 let fill = match fm.as_str() {
                     "strict" => strict,
@@ -2761,6 +4684,72 @@ fn main() -> Result<(), String> {
                                                   // - “misses” means we *wanted* `hyps_texts` (for SMT/ranking) but couldn't find them.
                                                   // This is meant to track whether our “no extra Lean calls” design is actually working.
 
+            // If we already have a goal snapshot for the initial focus, pre-populate the caches.
+            // This enables state-aware ranking (and SMT precheck) even when we never invoke the
+            // Lean oracle candidate generator.
+            if let Some(gd) = goal_dump_v.as_ref() {
+                if let Some(pp) = gd.get("pp_dump") {
+                    if let Some(line) = gd
+                        .get("selected_sorry")
+                        .and_then(|s| s.get("line"))
+                        .and_then(|v| v.as_u64())
+                    {
+                        let text_hash = hash_text(&original_text);
+                        let key = (text_hash, original_text.len(), line as usize);
+                        let state_key = hash_state_key(pp).unwrap_or(UNKNOWN_STATE_KEY);
+                        let n_goals = pp
+                            .get("goals")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        let hyps_total = pp
+                            .get("goals")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .map(|g| {
+                                        g.get("hyps")
+                                            .and_then(|h| h.as_array())
+                                            .map(|x| x.len())
+                                            .unwrap_or(0)
+                                    })
+                                    .sum::<usize>()
+                            })
+                            .unwrap_or(0);
+                        let target = pp
+                            .get("goals")
+                            .and_then(|v| v.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|g| g.get("pretty"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| {
+                                s.lines().find_map(|ln| {
+                                    ln.trim_start()
+                                        .strip_prefix("⊢")
+                                        .map(|r| r.trim().to_string())
+                                })
+                            })
+                            .unwrap_or_default();
+                        goal_dump_cache.insert(key, (state_key, n_goals, hyps_total, target));
+
+                        let hyps_texts: Vec<String> = pp
+                            .get("goals")
+                            .and_then(|v| v.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|g| g.get("hyps"))
+                            .and_then(|v| v.as_array())
+                            .map(|hs| {
+                                hs.iter()
+                                    .filter_map(|h| h.get("text").and_then(|v| v.as_str()))
+                                    .map(|s| s.to_string())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        goal_dump_hyps_cache.insert(key, hyps_texts);
+                    }
+                }
+            }
+
             #[cfg(feature = "planner")]
             let mut planner_cache: std::collections::HashMap<
                 (u64, u64),
@@ -2773,11 +4762,175 @@ fn main() -> Result<(), String> {
             #[cfg(feature = "planner")]
             let mut prof_planner_ms: u64 = 0;
 
-            let mut smt_entails_cache: std::collections::HashMap<(u64, u64), bool> =
-                std::collections::HashMap::new(); // ((state_key, goal_sig) -> entails)
+            let mut smt_entails_cache: std::collections::HashMap<(u64, u64, usize), bool> =
+                std::collections::HashMap::new(); // ((state_key, goal_sig, depth) -> entails)
+            let mut smt_artifacts_done: std::collections::HashSet<(u64, u64, usize)> =
+                std::collections::HashSet::new(); // ((state_key, goal_sig, depth) -> already produced artifacts)
+            let mut smt_proof_done: std::collections::HashSet<(u64, u64, usize)> =
+                std::collections::HashSet::new(); // ((state_key, goal_sig, depth) -> attempted proof capture)
+            let mut smt_proof_dump_done: std::collections::HashSet<(u64, u64, usize)> =
+                std::collections::HashSet::new(); // ((state_key, goal_sig, depth) -> attempted proof dump capture)
             let mut smt_cache_hits: u64 = 0;
             let mut smt_cache_misses: u64 = 0;
+            let mut smt_errors: u64 = 0;
+            let mut smt_last_error: Option<String> = None;
+            let mut smt_dumps_written: u64 = 0;
+            let mut smt_dump_paths: Vec<String> = Vec::new();
+            // Keep a bounded copy of the most recent SMT dump so JSON consumers can see it even if
+            // opening the dump file is inconvenient.
+            let mut smt_dump_last_path: Option<String> = None;
+            let mut smt_dump_last_chars: Option<usize> = None;
+            let mut smt_dump_last_preview: Option<String> = None;
+            let mut smt_proof_attempts: u64 = 0;
+            let mut smt_proofs_captured: u64 = 0;
+            let mut smt_proof_last_error: Option<String> = None;
+            let mut smt_proof_last: Option<serde_json::Value> = None;
+            let mut smt_proof_dump_paths: Vec<String> = Vec::new();
+            let mut smt_proof_dump_attempts: u64 = 0;
+            let mut smt_proof_dump_written: u64 = 0;
+            let mut smt_proof_dump_skipped_too_large: u64 = 0;
+            let mut smt_proof_dump_last_error: Option<String> = None;
+            let mut smt_entails_attempts: u64 = 0;
+            let mut smt_entails_escalations: u64 = 0;
+            let mut smt_entails_trace: Vec<serde_json::Value> = Vec::new();
             let mut prof_smt_ms: u64 = 0;
+            let mut smt_reuse: Option<plc::smt_lia::ReusableSmtSession> = None;
+
+            // Best-effort: if the user asked for SMT proofs/dumps, sometimes we want to attempt
+            // once directly from the initial goal dump (if present).
+            //
+            // Primary motivation: avoid "SMT entailment served from cache so we never recomputed
+            // a proof object / dump artifact" surprises.
+            //
+            // We intentionally do **not** do this unconditionally, because if SMT entailment is
+            // computed freshly (cache miss), the later path can produce the same artifacts and we'd
+            // double-count / duplicate files.
+            if (smt_proof || smt_proof_dump)
+                && (smt_proof_attempts == 0 || smt_proof_dump_attempts == 0)
+            {
+                if let Some(gd) = goal_dump_v.as_ref() {
+                    if let Some(pp) = gd.get("pp_dump") {
+                        let state_key = hash_state_key(pp).unwrap_or(UNKNOWN_STATE_KEY);
+                        let target = pp
+                            .get("goals")
+                            .and_then(|v| v.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|g| g.get("pretty"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| {
+                                s.lines().find_map(|ln| {
+                                    ln.trim_start()
+                                        .strip_prefix("⊢")
+                                        .map(|r| r.trim().to_string())
+                                })
+                            })
+                            .unwrap_or_default();
+                        let goal_sig = hash_text(&target);
+
+                        if state_key != UNKNOWN_STATE_KEY && !target.is_empty() {
+                            let eager_ok = if !smt_precheck {
+                                true
+                            } else if let Some(cd) = cache_dir.as_ref() {
+                                cache_read_smt_entails(cd, state_key, goal_sig, smt_depth).is_some()
+                            } else {
+                                false
+                            };
+
+                            if !eager_ok {
+                                // Expect a cache miss (or no SMT precheck), so let the normal
+                                // computation path drive artifact generation.
+                                // (We still keep the `--smt-proof-dump` directory creation behavior elsewhere.)
+                            } else {
+                                let ck = (state_key, goal_sig, smt_depth);
+
+                                if smt_proof && smt_proof_done.insert(ck) {
+                                    smt_proof_attempts = smt_proof_attempts.saturating_add(1);
+                                    match plc::smt_lia::unsat_proof_from_pp_dump(
+                                        pp,
+                                        smt_timeout_ms,
+                                        smt_seed,
+                                        smt_depth,
+                                        smt_proof_max_chars,
+                                    ) {
+                                        Ok(Some(pf)) => {
+                                            smt_proofs_captured =
+                                                smt_proofs_captured.saturating_add(1);
+                                            smt_proof_last = Some(pf);
+                                        }
+                                        Ok(None) => {
+                                            smt_proof_last_error =
+                                                Some("proof_unavailable".to_string());
+                                        }
+                                        Err(e) => {
+                                            smt_proof_last_error = Some(truncate_str(&e, 400));
+                                        }
+                                    }
+                                }
+
+                                if smt_proof && smt_proof_dump && smt_proof_dump_done.insert(ck) {
+                                    smt_proof_dump_attempts =
+                                        smt_proof_dump_attempts.saturating_add(1);
+                                    match plc::smt_lia::unsat_proof_from_pp_dump(
+                                        pp,
+                                        smt_timeout_ms,
+                                        smt_seed,
+                                        smt_depth,
+                                        smt_proof_dump_max_chars,
+                                    ) {
+                                        Ok(Some(pf_full)) => {
+                                            let preview = pf_full
+                                                .get("preview")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            let total_chars = pf_full
+                                                .get("chars")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0)
+                                                as usize;
+                                            let preview_chars = preview.chars().count();
+                                            if total_chars <= smt_proof_dump_max_chars
+                                                && preview_chars == total_chars
+                                            {
+                                                let root = smt_proof_dump_root(
+                                                    &repo_root,
+                                                    &smt_proof_dump_dir_opt,
+                                                );
+                                                let path = maybe_write_smt_proof_dump(
+                                                    &root, state_key, goal_sig, smt_depth, preview,
+                                                );
+                                                if !smt_proof_dump_paths.contains(&path) {
+                                                    smt_proof_dump_paths.push(path);
+                                                    smt_proof_dump_written =
+                                                        smt_proof_dump_written.saturating_add(1);
+                                                }
+                                            } else {
+                                                smt_proof_dump_skipped_too_large =
+                                                    smt_proof_dump_skipped_too_large
+                                                        .saturating_add(1);
+                                                smt_proof_dump_last_error = Some(format!(
+                                                "proof_too_large_for_dump chars={total_chars} max_chars={}",
+                                                smt_proof_dump_max_chars
+                                            ));
+                                            }
+                                        }
+                                        Ok(None) => {
+                                            smt_proof_dump_last_error =
+                                                Some("proof_unavailable".to_string());
+                                        }
+                                        Err(e) => {
+                                            smt_proof_dump_last_error = Some(truncate_str(&e, 400));
+                                        }
+                                    }
+                                }
+
+                                // Mark artifacts as produced for this key so cache-hit paths can skip
+                                // redundant proof/dump generation later in the run.
+                                smt_artifacts_done.insert((state_key, goal_sig, smt_depth));
+                            }
+                        }
+                    }
+                }
+            }
 
             // Baseline verify (for first-error line; also returned in output).
             let (baseline_raw_v, baseline_summary, baseline_ms, baseline_skipped) =
@@ -2829,9 +4982,74 @@ fn main() -> Result<(), String> {
             //
             // If the user provided `--focus-line`, use the `sorry` closest to that line as the
             // focus decl/line (otherwise we tend to get stuck on the first `sorry` in the file).
-            let (focus_decl_name, focus_line_1, focus_sorry, focus_source) = {
+            let (
+                focus_decl_name,
+                focus_line_1,
+                focus_sorry,
+                focus_source,
+                focus_requested_decl,
+                focus_available_decls,
+            ) = {
                 let locs0 = plc::locate_sorries_in_text(&original_text, 200, 1).unwrap_or_default();
-                if let Some(fl) = focus_line_override {
+                let available: Vec<String> = locs0
+                    .iter()
+                    .filter_map(|l| l.decl_name.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                let mut available = available;
+                available.sort();
+                let available_short: Vec<String> = available.into_iter().take(24).collect();
+                if let Some(fd) = focus_decl_override.clone() {
+                    let fd = fd.trim().to_string();
+                    let fd_last = fd
+                        .split(|c| c == '.' || c == ':')
+                        .filter(|s| !s.is_empty())
+                        .last()
+                        .unwrap_or(fd.as_str())
+                        .to_string();
+                    let picked_exact = locs0
+                        .iter()
+                        .find(|l| l.decl_name.as_deref() == Some(fd.as_str()))
+                        .cloned();
+                    // Best-effort unqualified match:
+                    // - some locators only record the local name (`foo`) rather than `Namespace.foo`
+                    let needle = format!(".{fd_last}");
+                    let picked_suffix = locs0
+                        .iter()
+                        .find(|l| {
+                            l.decl_name
+                                .as_ref()
+                                .is_some_and(|dn| dn.ends_with(&needle) || dn == &fd_last)
+                        })
+                        .cloned();
+                    let picked = picked_exact.or(picked_suffix);
+                    if picked.is_some() {
+                        (
+                            picked.as_ref().and_then(|s| s.decl_name.clone()),
+                            picked.as_ref().map(|s| s.line),
+                            picked,
+                            "focus_decl",
+                            Some(fd),
+                            available_short,
+                        )
+                    } else {
+                        let first_error_line_1 = baseline_summary
+                            .get("first_error_loc")
+                            .and_then(|l| l.get("line"))
+                            .and_then(|v| v.as_u64())
+                            .map(|x| x as usize);
+                        let picked = plc::select_primary_sorry(first_error_line_1, &locs0);
+                        (
+                            picked.as_ref().and_then(|s| s.decl_name.clone()),
+                            picked.as_ref().map(|s| s.line),
+                            picked,
+                            "focus_decl_not_found_fallback",
+                            Some(fd),
+                            available_short,
+                        )
+                    }
+                } else if let Some(fl) = focus_line_override {
                     let picked = locs0
                         .iter()
                         .min_by_key(|l| (l.line as i64 - fl as i64).abs())
@@ -2841,6 +5059,8 @@ fn main() -> Result<(), String> {
                         picked.as_ref().map(|s| s.line),
                         picked,
                         "focus_line",
+                        None,
+                        available_short,
                     )
                 } else {
                     let first_error_line_1 = baseline_summary
@@ -2854,6 +5074,8 @@ fn main() -> Result<(), String> {
                         picked.as_ref().map(|s| s.line),
                         picked,
                         "first_error_or_primary_sorry",
+                        None,
+                        available_short,
                     )
                 }
             };
@@ -2863,8 +5085,12 @@ fn main() -> Result<(), String> {
                     "decl": focus_decl_name,
                     "line": focus_line_1,
                     "source": focus_source,
+                    "requested_decl": focus_requested_decl,
+                    "available_decls": focus_available_decls,
                 }),
             );
+
+            // Note: hard focus mismatch is handled earlier (before baseline verify).
 
             // Small helper for grokkable reporting.
             let classify_failure_mode = |first_error: Option<&str>| -> &'static str {
@@ -3171,13 +5397,35 @@ fn main() -> Result<(), String> {
                     let locs_all =
                         plc::locate_sorries_in_text(&parent.text, 200, 1).unwrap_or_default();
                     let locs = if let Some(dn) = parent.focus_decl_name.as_deref() {
+                        // Decl name matching can be inconsistent across locators:
+                        // sometimes we get `foo`, sometimes `Namespace.foo`.
+                        // Treat them as equivalent by comparing the last segment too.
+                        let dn_last = dn
+                            .split(|c| c == '.' || c == ':')
+                            .filter(|s| !s.is_empty())
+                            .last()
+                            .unwrap_or(dn);
+                        let needle = format!(".{dn_last}");
                         let xs: Vec<plc::SorryLocation> = locs_all
                             .iter()
                             .cloned()
-                            .filter(|l| l.decl_name.as_deref() == Some(dn))
+                            .filter(|l| {
+                                l.decl_name.as_ref().is_some_and(|got| {
+                                    got == dn || got == dn_last || got.ends_with(&needle)
+                                })
+                            })
                             .collect();
                         if xs.is_empty() {
-                            locs_all
+                            if focus_decl_hard {
+                                // Hard focus: do not drift to other declarations.
+                                record_event(
+                                    "focus_decl_hard_no_sorries_in_decl",
+                                    json!({ "decl": dn, "node_id": parent.id }),
+                                );
+                                vec![]
+                            } else {
+                                locs_all
+                            }
                         } else {
                             xs
                         }
@@ -3234,6 +5482,10 @@ fn main() -> Result<(), String> {
                         .and_then(|l| l.get("line"))
                         .and_then(|v| v.as_u64())
                         .map(|x| x as usize);
+                    if locs.is_empty() {
+                        // Hard-focus leaf: nothing to patch in the target decl for this node.
+                        continue;
+                    }
                     let selected = if candidates_mode == "lean-try"
                         && goal_first_k > 0
                         && !locs.is_empty()
@@ -3658,7 +5910,7 @@ Constraints:
                                         if smt_precheck {
                                             if let Some(pp0) = pp {
                                                 let goal_sig = hash_text(&target);
-                                                let ck = (state_key, goal_sig);
+                                                let ck = (state_key, goal_sig, smt_depth);
                                                 let mut entails_opt: Option<bool> = None;
                                                 if let Some(v) = smt_entails_cache.get(&ck).copied()
                                                 {
@@ -3666,7 +5918,7 @@ Constraints:
                                                     entails_opt = Some(v);
                                                 } else if let Some(cd2) = cache_dir.as_ref() {
                                                     if let Some(v) = cache_read_smt_entails(
-                                                        cd2, state_key, goal_sig,
+                                                        cd2, state_key, goal_sig, smt_depth,
                                                     ) {
                                                         smt_cache_hits += 1;
                                                         smt_entails_cache.insert(ck, v);
@@ -3676,12 +5928,31 @@ Constraints:
                                                 if entails_opt.is_none() {
                                                     smt_cache_misses += 1;
                                                     let t_smt0 = std::time::Instant::now();
-                                                    let entails = smt_entails_from_pp_dump(
-                                                        pp0,
-                                                        smt_timeout_ms,
-                                                        smt_seed,
-                                                    )
-                                                    .unwrap_or(None);
+                                                    let (entails, attempts) =
+                                                        smt_entails_from_pp_dump_escalating(
+                                                            pp0,
+                                                            smt_timeout_ms,
+                                                            smt_seed,
+                                                            smt_depth,
+                                                            &smt_solver_norm,
+                                                            smt_aggressive,
+                                                            &mut smt_reuse,
+                                                            &mut smt_entails_trace,
+                                                        )
+                                                        .unwrap_or_else(|e| {
+                                                            smt_errors += 1;
+                                                            smt_last_error =
+                                                                Some(truncate_str(&e, 400));
+                                                            (None, 1)
+                                                        });
+                                                    smt_entails_attempts = smt_entails_attempts
+                                                        .saturating_add(attempts);
+                                                    if attempts > 1 {
+                                                        smt_entails_escalations =
+                                                            smt_entails_escalations.saturating_add(
+                                                                attempts.saturating_sub(1),
+                                                            );
+                                                    }
                                                     prof_smt_ms = prof_smt_ms.saturating_add(
                                                         t_smt0.elapsed().as_millis() as u64,
                                                     );
@@ -3689,7 +5960,8 @@ Constraints:
                                                         smt_entails_cache.insert(ck, b);
                                                         if let Some(cd2) = cache_dir.as_ref() {
                                                             cache_write_smt_entails(
-                                                                cd2, state_key, goal_sig, b,
+                                                                cd2, state_key, goal_sig,
+                                                                smt_depth, b,
                                                             );
                                                         }
                                                         entails_opt = Some(b);
@@ -3808,15 +6080,15 @@ Constraints:
                                     if smt_precheck {
                                         if let Some(pp0) = pp {
                                             let goal_sig = hash_text(&target);
-                                            let ck = (state_key, goal_sig);
+                                            let ck = (state_key, goal_sig, smt_depth);
                                             let mut entails_opt: Option<bool> = None;
                                             if let Some(v) = smt_entails_cache.get(&ck).copied() {
                                                 smt_cache_hits += 1;
                                                 entails_opt = Some(v);
                                             } else if let Some(cd2) = cache_dir.as_ref() {
-                                                if let Some(v) =
-                                                    cache_read_smt_entails(cd2, state_key, goal_sig)
-                                                {
+                                                if let Some(v) = cache_read_smt_entails(
+                                                    cd2, state_key, goal_sig, smt_depth,
+                                                ) {
                                                     smt_cache_hits += 1;
                                                     smt_entails_cache.insert(ck, v);
                                                     entails_opt = Some(v);
@@ -3825,12 +6097,31 @@ Constraints:
                                             if entails_opt.is_none() {
                                                 smt_cache_misses += 1;
                                                 let t_smt0 = std::time::Instant::now();
-                                                let entails = smt_entails_from_pp_dump(
-                                                    pp0,
-                                                    smt_timeout_ms,
-                                                    smt_seed,
-                                                )
-                                                .unwrap_or(None);
+                                                let (entails, attempts) =
+                                                    smt_entails_from_pp_dump_escalating(
+                                                        pp0,
+                                                        smt_timeout_ms,
+                                                        smt_seed,
+                                                        smt_depth,
+                                                        &smt_solver_norm,
+                                                        smt_aggressive,
+                                                        &mut smt_reuse,
+                                                        &mut smt_entails_trace,
+                                                    )
+                                                    .unwrap_or_else(|e| {
+                                                        smt_errors += 1;
+                                                        smt_last_error =
+                                                            Some(truncate_str(&e, 400));
+                                                        (None, 1)
+                                                    });
+                                                smt_entails_attempts =
+                                                    smt_entails_attempts.saturating_add(attempts);
+                                                if attempts > 1 {
+                                                    smt_entails_escalations =
+                                                        smt_entails_escalations.saturating_add(
+                                                            attempts.saturating_sub(1),
+                                                        );
+                                                }
                                                 prof_smt_ms = prof_smt_ms.saturating_add(
                                                     t_smt0.elapsed().as_millis() as u64,
                                                 );
@@ -3838,7 +6129,7 @@ Constraints:
                                                     smt_entails_cache.insert(ck, b);
                                                     if let Some(cd2) = cache_dir.as_ref() {
                                                         cache_write_smt_entails(
-                                                            cd2, state_key, goal_sig, b,
+                                                            cd2, state_key, goal_sig, smt_depth, b,
                                                         );
                                                     }
                                                     entails_opt = Some(b);
@@ -3891,13 +6182,13 @@ Constraints:
                                             .unwrap_or_default();
                                         if !target.is_empty() {
                                             let goal_sig = hash_text(&target);
-                                            let ck = (state_key, goal_sig);
+                                            let ck = (state_key, goal_sig, smt_depth);
                                             let mut cached = smt_entails_cache.get(&ck).copied();
                                             if cached.is_none() {
                                                 if let Some(cd) = cache_dir.as_ref() {
-                                                    if let Some(ent) =
-                                                        cache_read_smt_entails(cd, state_key, goal_sig)
-                                                    {
+                                                    if let Some(ent) = cache_read_smt_entails(
+                                                        cd, state_key, goal_sig, smt_depth,
+                                                    ) {
                                                         cached = Some(ent);
                                                         smt_entails_cache.insert(ck, ent);
                                                         smt_cache_hits += 1;
@@ -3908,43 +6199,69 @@ Constraints:
                                                 // No extra Lean calls. If we have cached hypothesis text for this hole,
                                                 // we can still run SMT without Lean (best-effort LIA).
                                                 smt_cache_misses += 1;
-                                                let hyps_texts =
-                                                    if let Some(xs) = goal_dump_hyps_cache.get(&k).cloned() {
-                                                        goal_dump_hyps_cache_hits += 1;
-                                                        xs
-                                                    } else if let Some(cd) = cache_dir.as_ref() {
-                                                        if let Some(xs) = cache_read_goal_dump_hyps_texts(
+                                                let hyps_texts = if let Some(xs) =
+                                                    goal_dump_hyps_cache.get(&k).cloned()
+                                                {
+                                                    goal_dump_hyps_cache_hits += 1;
+                                                    xs
+                                                } else if let Some(cd) = cache_dir.as_ref() {
+                                                    if let Some(xs) =
+                                                        cache_read_goal_dump_hyps_texts(
                                                             cd,
                                                             th,
                                                             parent.text.len(),
                                                             s0.line,
-                                                        ) {
-                                                            goal_dump_hyps_cache_hits += 1;
-                                                            goal_dump_hyps_cache.insert(k, xs.clone());
-                                                            xs
-                                                        } else {
-                                                            goal_dump_hyps_cache_misses += 1;
-                                                            Vec::new()
-                                                        }
+                                                        )
+                                                    {
+                                                        goal_dump_hyps_cache_hits += 1;
+                                                        goal_dump_hyps_cache.insert(k, xs.clone());
+                                                        xs
                                                     } else {
                                                         goal_dump_hyps_cache_misses += 1;
                                                         Vec::new()
-                                                    };
+                                                    }
+                                                } else {
+                                                    goal_dump_hyps_cache_misses += 1;
+                                                    Vec::new()
+                                                };
                                                 if !hyps_texts.is_empty() {
                                                     let t0 = std::time::Instant::now();
-                                                    let ent = smt_entails_from_hyps_target(
-                                                        &hyps_texts,
-                                                        &target,
-                                                        smt_timeout_ms,
-                                                        smt_seed,
-                                                    )
-                                                    .unwrap_or(None);
-                                                    prof_smt_ms = prof_smt_ms
-                                                        .saturating_add(t0.elapsed().as_millis() as u64);
+                                                    let (ent, attempts) =
+                                                        smt_entails_from_hyps_target_escalating(
+                                                            &hyps_texts,
+                                                            &target,
+                                                            smt_timeout_ms,
+                                                            smt_seed,
+                                                            smt_depth,
+                                                            &smt_solver_norm,
+                                                            smt_aggressive,
+                                                            &mut smt_reuse,
+                                                            &mut smt_entails_trace,
+                                                        )
+                                                        .unwrap_or_else(|e| {
+                                                            smt_errors += 1;
+                                                            smt_last_error =
+                                                                Some(truncate_str(&e, 400));
+                                                            (None, 1)
+                                                        });
+                                                    smt_entails_attempts = smt_entails_attempts
+                                                        .saturating_add(attempts);
+                                                    if attempts > 1 {
+                                                        smt_entails_escalations =
+                                                            smt_entails_escalations.saturating_add(
+                                                                attempts.saturating_sub(1),
+                                                            );
+                                                    }
+                                                    prof_smt_ms = prof_smt_ms.saturating_add(
+                                                        t0.elapsed().as_millis() as u64,
+                                                    );
                                                     if let Some(ent) = ent {
                                                         smt_entails_cache.insert(ck, ent);
                                                         if let Some(cd) = cache_dir.as_ref() {
-                                                            cache_write_smt_entails(cd, state_key, goal_sig, ent);
+                                                            cache_write_smt_entails(
+                                                                cd, state_key, goal_sig, smt_depth,
+                                                                ent,
+                                                            );
                                                         }
                                                         cached = Some(ent);
                                                     }
@@ -4147,6 +6464,25 @@ Constraints:
                                 .and_then(|v| v.as_str())
                                 .and_then(|s| s.lines().find(|l| !l.trim().is_empty()))
                                 .map(|s| s.trim().to_string());
+                            let suggestions_preview: Option<Vec<String>> = if log_level >= 2 {
+                                Some(
+                                    suggs
+                                        .iter()
+                                        .take(3)
+                                        .map(|s| {
+                                            let t = s.trim().to_string();
+                                            if t.chars().count() > 400 {
+                                                let head: String = t.chars().take(400).collect();
+                                                format!("{head}...")
+                                            } else {
+                                                t
+                                            }
+                                        })
+                                        .collect(),
+                                )
+                            } else {
+                                None
+                            };
                             record_event(
                                 "oracle_result",
                                 json!({
@@ -4154,6 +6490,7 @@ Constraints:
                                     "ok": ls.is_some(),
                                     "error": ls_err,
                                     "suggestions_n": suggs.len(),
+                                    "suggestions_preview": suggestions_preview,
                                     "has_pp_dump": has_pp_dump,
                                     "oracle_retry_attempted": oracle_retry_attempted,
                                     "verify_ok": verify_ok,
@@ -4244,14 +6581,20 @@ Constraints:
                                     .and_then(|v| v.get("pretty"))
                                     .and_then(|v| v.as_str())
                                 {
-                                    derived = plc::derive_candidates_from_goal_pretty(pretty);
+                                    derived =
+                                        plc::derive_candidates_from_goal_pretty_with_hint_rules(
+                                            pretty,
+                                            &hint_rules,
+                                        );
                                 }
                                 // Also derive from the target + hypothesis snippets (often includes type hints).
                                 if !target.trim().is_empty() {
-                                    let mut more = plc::derive_candidates_from_goal_context(
-                                        &hyps_texts,
-                                        &target,
-                                    );
+                                    let mut more =
+                                        plc::derive_candidates_from_goal_context_with_hint_rules(
+                                            &hyps_texts,
+                                            &target,
+                                            &hint_rules,
+                                        );
                                     derived.append(&mut more);
                                 }
                             }
@@ -4336,11 +6679,158 @@ Constraints:
                     };
                     let candidates_here0 =
                         adapt_candidates_for_error(base_candidates, parent_first_error);
-                    let candidates_here0 = adapt_candidates_for_sorry_context(
+                    let mut candidates_here0 = adapt_candidates_for_sorry_context(
                         &candidates_here0,
                         &sel.line_text,
                         is_tactic_context,
                     );
+                    // If the hole is inside an existing `by` block, prefer tactic-shaped candidates.
+                    // (The default `det` candidate list is proof-term shaped: `by ...`.)
+                    if is_tactic_context {
+                        // Small goal-shape heuristics to make the top-of-beam candidates matter.
+                        // (Beam search will only try the first few candidates per node.)
+                        let (target_shape, hyps_shape) = {
+                            let th = hash_text(&parent.text);
+                            let k = (th, parent.text.len(), sel.line);
+                            let mut target = goal_dump_cache
+                                .get(&k)
+                                .map(|(_, _, _, t)| t.clone())
+                                .unwrap_or_default();
+                            let mut hyps =
+                                goal_dump_hyps_cache.get(&k).cloned().unwrap_or_default();
+                            if hyps.is_empty() {
+                                // Fallback: use the most recent goal dump snapshot (no extra Lean calls).
+                                if let Some(gd) = goal_dump_v.as_ref() {
+                                    if let Some(a) = gd
+                                        .get("pp_dump")
+                                        .and_then(|v| v.get("goals"))
+                                        .and_then(|v| v.as_array())
+                                    {
+                                        if let Some(g0) = a.first() {
+                                            if target.trim().is_empty() {
+                                                if let Some(pretty) =
+                                                    g0.get("pretty").and_then(|v| v.as_str())
+                                                {
+                                                    target = pretty
+                                                        .lines()
+                                                        .find_map(|ln| {
+                                                            ln.trim_start()
+                                                                .strip_prefix("⊢")
+                                                                .map(|r| r.trim().to_string())
+                                                        })
+                                                        .unwrap_or_default();
+                                                }
+                                            }
+                                            if let Some(hs) =
+                                                g0.get("hyps").and_then(|v| v.as_array())
+                                            {
+                                                hyps = hs
+                                                    .iter()
+                                                    .filter_map(|h| {
+                                                        h.get("text")
+                                                            .and_then(|v| v.as_str())
+                                                            .map(|s| s.to_string())
+                                                    })
+                                                    .collect();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            (target, hyps)
+                        };
+                        // Dynamic “structure” candidates inferred from local context.
+                        let mut dynamic: Vec<String> = Vec::new();
+                        let even_hyp = hyps_shape.iter().find_map(|h| {
+                            let (lhs, rhs) = h.split_once(':')?;
+                            if rhs.contains("Even") {
+                                Some(lhs.trim().split_whitespace().next()?.to_string())
+                            } else {
+                                None
+                            }
+                        });
+                        let mut div_hyps: Vec<String> = Vec::new();
+                        for h in &hyps_shape {
+                            if let Some((lhs, rhs)) = h.split_once(':') {
+                                if rhs.contains('∣') {
+                                    if let Some(nm) = lhs.trim().split_whitespace().next() {
+                                        if !nm.is_empty() {
+                                            div_hyps.push(nm.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div_hyps.sort();
+                        div_hyps.dedup();
+                        if target_shape.contains("∣") {
+                            if let Some(hn) = even_hyp.as_ref() {
+                                dynamic
+                                    .push(format!("rcases {hn} with ⟨k, rfl⟩; exact ⟨k, by ring⟩"));
+                                dynamic.push(format!(
+                                    "rcases {hn} with ⟨k, rfl⟩; exact ⟨k, by omega⟩"
+                                ));
+                            }
+                            // Very common shape: prove divisibility of a difference from two divisibility hypotheses.
+                            // Example: `(4:ℤ) ∣ a` and `(4:ℤ) ∣ b` → `(4:ℤ) ∣ a - b`.
+                            if div_hyps.len() >= 2 {
+                                let ha = &div_hyps[0];
+                                let hb = &div_hyps[1];
+                                dynamic.push(format!(
+                                    "rcases {ha} with ⟨ka, rfl⟩; rcases {hb} with ⟨kb, rfl⟩; exact ⟨ka - kb, by ring⟩"
+                                ));
+                            }
+                        }
+
+                        let prioritize_even_div = target_shape.contains("∣") && even_hyp.is_some();
+                        let mut pref: Vec<String> = vec![
+                            // Algebra/arithmetic workhorses.
+                            "ring".to_string(),
+                            "ring_nf".to_string(),
+                            "omega".to_string(),
+                            "linarith".to_string(),
+                            "nlinarith".to_string(),
+                            "norm_cast".to_string(),
+                            "norm_num".to_string(),
+                            "simp".to_string(),
+                            "simp_all".to_string(),
+                            "aesop".to_string(),
+                            // Mathlib suggestions can be surprisingly effective for “obvious” goals.
+                            "exact?".to_string(),
+                            "apply?".to_string(),
+                        ];
+                        // Add a small, bounded set of goal-derived candidates.
+                        // This is repo-agnostic: it only uses the pretty-printed goal + hypotheses surface.
+                        //
+                        // Important: this is a tactic hole, so candidates must be tactic-shaped.
+                        // `derive_candidates_from_goal_context` returns term-shaped `by ...` blocks;
+                        // convert them into tactic scripts.
+                        let mut derived = plc::derive_candidates_from_goal_context_with_hint_rules(
+                            &hyps_shape,
+                            &target_shape,
+                            &hint_rules,
+                        );
+                        derived.truncate(12);
+                        derived = plc::tree_search::adapt_candidates_for_tactic_hole(&derived);
+                        // Keep dynamic candidates at the very front (they're goal-specific and
+                        // should land in the beam). Derived candidates come next; then pref list.
+                        if !dynamic.is_empty() {
+                            let mut v = dynamic;
+                            // Keep derived close to the front, but after the dynamic candidates.
+                            v.append(&mut derived);
+                            v.append(&mut pref);
+                            pref = v;
+                        } else if !derived.is_empty() {
+                            derived.append(&mut pref);
+                            pref = derived;
+                        }
+                        if !prioritize_even_div {
+                            // For non-divisibility goals, prefer simp/aesop first.
+                            pref.rotate_left(10);
+                        }
+                        pref.append(&mut candidates_here0);
+                        candidates_here0 = sanitize_candidates(pref);
+                    }
 
                     // Optional: if deterministic tactics stalled, opportunistically ask the LLM
                     // for more candidates for this exact region.
@@ -4383,7 +6873,7 @@ Constraints:
                             }
                         }
                         if let Some(notes) = research_notes_text.as_ref() {
-                            system.push_str("\n\nResearch notes (external; may be incomplete):\n");
+                            system.push_str("\n\nResearch context (may be incomplete):\n");
                             system.push_str(notes);
                         }
                         let extra = rt.block_on(plc::llm::chat_completion(
@@ -4427,7 +6917,7 @@ Constraints:
                     // Optional SMT entailment signal for this hole (cache-only; no Lean calls here).
                     // This is used to re-rank candidates: if the goal is implied by a linear arithmetic fragment,
                     // prioritize arithmetic tactics; if not implied, de-prioritize them.
-                    let (smt_entails_opt, smt_hint_json): (
+                    let (smt_entails_opt, mut smt_hint_json): (
                         Option<bool>,
                         Option<serde_json::Value>,
                     ) = if smt_precheck {
@@ -4450,30 +6940,469 @@ Constraints:
                                 )
                             } else if let Some(cd) = cache_dir.as_ref() {
                                 let goal_sig = hash_text(&target);
-                                let ck = (sk, goal_sig);
+                                let ck = (sk, goal_sig, smt_depth);
+                                // If the user asked for SMT artifacts (proof/core/dumps), we still want to
+                                // *use* the cached entailment result for ranking, but we should not skip
+                                // producing artifacts just because we hit the cache.
+                                let want_smt_artifacts =
+                                    smt_dump || smt_unsat_core || smt_support || smt_proof;
+
                                 if let Some(v) = smt_entails_cache.get(&ck).copied() {
                                     smt_cache_hits += 1;
-                                    (
-                                        Some(v),
-                                        Some(json!({
-                                            "entails": v,
-                                            "source": "mem",
-                                            "state_key": sk,
-                                            "goal_sig": goal_sig,
-                                        })),
-                                    )
-                                } else if let Some(v) = cache_read_smt_entails(cd, sk, goal_sig) {
+                                    let mut hint = json!({
+                                        "entails": v,
+                                        "source": "mem",
+                                        "state_key": sk,
+                                        "goal_sig": goal_sig,
+                                    });
+                                    if want_smt_artifacts && v && !smt_artifacts_done.contains(&ck)
+                                    {
+                                        let hyps_texts = if let Some(xs) =
+                                            goal_dump_hyps_cache.get(&k).cloned()
+                                        {
+                                            goal_dump_hyps_cache_hits += 1;
+                                            xs
+                                        } else if let Some(xs) = cache_read_goal_dump_hyps_texts(
+                                            cd,
+                                            th,
+                                            parent.text.len(),
+                                            sel.line,
+                                        ) {
+                                            goal_dump_hyps_cache_hits += 1;
+                                            goal_dump_hyps_cache.insert(k, xs.clone());
+                                            xs
+                                        } else {
+                                            goal_dump_hyps_cache_misses += 1;
+                                            Vec::new()
+                                        };
+                                        if !hyps_texts.is_empty() {
+                                            if smt_dump && smt_dumps_written < smt_dump_max as u64 {
+                                                let pp_dump = json!({
+                                                    "goals": [{
+                                                        "pretty": format!("{}\n⊢ {}", hyps_texts.join("\n"), target),
+                                                        "hyps": hyps_texts.iter().take(48).map(|s| json!({"text": s})).collect::<Vec<_>>()
+                                                    }]
+                                                });
+                                                if let Some(script) =
+                                                    plc::smt_lia::smt2_script_from_pp_dump(
+                                                        &pp_dump,
+                                                        smt_timeout_ms,
+                                                        smt_seed,
+                                                        smt_depth,
+                                                    )
+                                                {
+                                                    let root = smt_dump_root(
+                                                        &repo_root,
+                                                        &smt_dump_dir_opt,
+                                                    );
+                                                    let path = maybe_write_smt2_dump(
+                                                        &root, sk, goal_sig, smt_depth, &script,
+                                                    );
+                                                    smt_dumps_written += 1;
+                                                    smt_dump_paths.push(path.clone());
+                                                    smt_dump_last_path = Some(path.clone());
+                                                    smt_dump_last_chars =
+                                                        Some(script.chars().count());
+                                                    smt_dump_last_preview =
+                                                        Some(truncate_str(&script, 4_000));
+                                                    if let Some(obj) = hint.as_object_mut() {
+                                                        obj.insert(
+                                                            "smt2_dump".to_string(),
+                                                            json!(path),
+                                                        );
+                                                        obj.insert(
+                                                            "smt2_dump_chars".to_string(),
+                                                            json!(script.chars().count()),
+                                                        );
+                                                        obj.insert(
+                                                            "smt2_dump_preview".to_string(),
+                                                            json!(truncate_str(&script, 2_000)),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if (smt_unsat_core || smt_support || smt_proof) && v {
+                                                // Rebuild pp_dump in the shape required by the helper fns.
+                                                let pp_dump = json!({
+                                                    "goals": [{
+                                                        "pretty": format!("{}\n⊢ {}", hyps_texts.join("\n"), target),
+                                                        "hyps": hyps_texts.iter().take(48).map(|s| json!({"text": s})).collect::<Vec<_>>()
+                                                    }]
+                                                });
+                                                if let Some(obj) = hint.as_object_mut() {
+                                                    if smt_unsat_core || smt_support {
+                                                        let core =
+                                                            plc::smt_lia::unsat_core_from_pp_dump(
+                                                                &pp_dump,
+                                                                smt_timeout_ms,
+                                                                smt_seed,
+                                                                smt_depth,
+                                                                if smt_unsat_core {
+                                                                    smt_unsat_core_max
+                                                                } else {
+                                                                    smt_support_max
+                                                                },
+                                                            )
+                                                            .unwrap_or(None)
+                                                            .unwrap_or(serde_json::Value::Null);
+                                                        obj.insert("unsat_core".to_string(), core);
+                                                    }
+                                                    if smt_proof
+                                                        && smt_proof_done
+                                                            .insert((sk, goal_sig, smt_depth))
+                                                    {
+                                                        smt_proof_attempts =
+                                                            smt_proof_attempts.saturating_add(1);
+                                                        match plc::smt_lia::unsat_proof_from_pp_dump(
+                                                            &pp_dump,
+                                                            smt_timeout_ms,
+                                                            smt_seed,
+                                                            smt_depth,
+                                                            smt_proof_max_chars,
+                                                        ) {
+                                                            Ok(Some(pf)) => {
+                                                                smt_proofs_captured =
+                                                                    smt_proofs_captured
+                                                                        .saturating_add(1);
+                                                                smt_proof_last = Some(pf.clone());
+                                                                obj.insert(
+                                                                    "unsat_proof".to_string(),
+                                                                    pf,
+                                                                );
+                                                            }
+                                                            Ok(None) => {
+                                                                obj.insert(
+                                                                    "unsat_proof".to_string(),
+                                                                    serde_json::Value::Null,
+                                                                );
+                                                                smt_proof_last_error = Some(
+                                                                    "proof_unavailable".to_string(),
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                obj.insert(
+                                                                    "unsat_proof".to_string(),
+                                                                    serde_json::Value::Null,
+                                                                );
+                                                                smt_proof_last_error =
+                                                                    Some(truncate_str(&e, 400));
+                                                            }
+                                                        }
+                                                    }
+                                                    if smt_proof
+                                                        && smt_proof_dump
+                                                        && smt_proof_dump_done
+                                                            .insert((sk, goal_sig, smt_depth))
+                                                    {
+                                                        smt_proof_dump_attempts =
+                                                            smt_proof_dump_attempts
+                                                                .saturating_add(1);
+                                                        if let Ok(Some(pf_full)) =
+                                                            plc::smt_lia::unsat_proof_from_pp_dump(
+                                                                &pp_dump,
+                                                                smt_timeout_ms,
+                                                                smt_seed,
+                                                                smt_depth,
+                                                                smt_proof_dump_max_chars,
+                                                            )
+                                                        {
+                                                            if let Some(preview) = pf_full
+                                                                .get("preview")
+                                                                .and_then(|v| v.as_str())
+                                                            {
+                                                                let total_chars = pf_full
+                                                                    .get("chars")
+                                                                    .and_then(|v| v.as_u64())
+                                                                    .unwrap_or(0)
+                                                                    as usize;
+                                                                let preview_chars =
+                                                                    preview.chars().count();
+                                                                if total_chars
+                                                                    <= smt_proof_dump_max_chars
+                                                                    && preview_chars == total_chars
+                                                                {
+                                                                    let root = smt_proof_dump_root(
+                                                                        &repo_root,
+                                                                        &smt_proof_dump_dir_opt,
+                                                                    );
+                                                                    let path =
+                                                                        maybe_write_smt_proof_dump(
+                                                                            &root, sk, goal_sig,
+                                                                            smt_depth, preview,
+                                                                        );
+                                                                    if !smt_proof_dump_paths
+                                                                        .contains(&path)
+                                                                    {
+                                                                        smt_proof_dump_paths
+                                                                            .push(path.clone());
+                                                                        smt_proof_dump_written =
+                                                                            smt_proof_dump_written
+                                                                                .saturating_add(1);
+                                                                    }
+                                                                    obj.insert(
+                                                                        "unsat_proof_path"
+                                                                            .to_string(),
+                                                                        json!(path),
+                                                                    );
+                                                                } else {
+                                                                    smt_proof_dump_skipped_too_large =
+                                                                        smt_proof_dump_skipped_too_large
+                                                                            .saturating_add(1);
+                                                                    smt_proof_dump_last_error = Some(
+                                                                        format!(
+                                                                            "proof_too_large_for_dump chars={total_chars} max_chars={}",
+                                                                            smt_proof_dump_max_chars
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            }
+                                                        } else {
+                                                            smt_proof_dump_last_error = Some(
+                                                                "proof_unavailable".to_string(),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Only mark artifacts as done if we actually attempted to build them.
+                                    if want_smt_artifacts && v && !smt_artifacts_done.contains(&ck)
+                                    {
+                                        smt_artifacts_done.insert(ck);
+                                    }
+
+                                    (Some(v), Some(hint))
+                                } else if let Some(v) =
+                                    cache_read_smt_entails(cd, sk, goal_sig, smt_depth)
+                                {
                                     smt_cache_hits += 1;
                                     smt_entails_cache.insert(ck, v);
-                                    (
-                                        Some(v),
-                                        Some(json!({
-                                            "entails": v,
-                                            "source": "disk",
-                                            "state_key": sk,
-                                            "goal_sig": goal_sig,
-                                        })),
-                                    )
+                                    let mut hint = json!({
+                                        "entails": v,
+                                        "source": "disk",
+                                        "state_key": sk,
+                                        "goal_sig": goal_sig,
+                                    });
+                                    if want_smt_artifacts && v && !smt_artifacts_done.contains(&ck)
+                                    {
+                                        let hyps_texts = if let Some(xs) =
+                                            goal_dump_hyps_cache.get(&k).cloned()
+                                        {
+                                            goal_dump_hyps_cache_hits += 1;
+                                            xs
+                                        } else if let Some(xs) = cache_read_goal_dump_hyps_texts(
+                                            cd,
+                                            th,
+                                            parent.text.len(),
+                                            sel.line,
+                                        ) {
+                                            goal_dump_hyps_cache_hits += 1;
+                                            goal_dump_hyps_cache.insert(k, xs.clone());
+                                            xs
+                                        } else {
+                                            goal_dump_hyps_cache_misses += 1;
+                                            Vec::new()
+                                        };
+                                        if !hyps_texts.is_empty() {
+                                            if smt_dump && smt_dumps_written < smt_dump_max as u64 {
+                                                let pp_dump = json!({
+                                                    "goals": [{
+                                                        "pretty": format!("{}\n⊢ {}", hyps_texts.join("\n"), target),
+                                                        "hyps": hyps_texts.iter().take(48).map(|s| json!({"text": s})).collect::<Vec<_>>()
+                                                    }]
+                                                });
+                                                if let Some(script) =
+                                                    plc::smt_lia::smt2_script_from_pp_dump(
+                                                        &pp_dump,
+                                                        smt_timeout_ms,
+                                                        smt_seed,
+                                                        smt_depth,
+                                                    )
+                                                {
+                                                    let root = smt_dump_root(
+                                                        &repo_root,
+                                                        &smt_dump_dir_opt,
+                                                    );
+                                                    let path = maybe_write_smt2_dump(
+                                                        &root, sk, goal_sig, smt_depth, &script,
+                                                    );
+                                                    smt_dumps_written += 1;
+                                                    smt_dump_paths.push(path.clone());
+                                                    smt_dump_last_path = Some(path.clone());
+                                                    smt_dump_last_chars =
+                                                        Some(script.chars().count());
+                                                    smt_dump_last_preview =
+                                                        Some(truncate_str(&script, 4_000));
+                                                    if let Some(obj) = hint.as_object_mut() {
+                                                        obj.insert(
+                                                            "smt2_dump".to_string(),
+                                                            json!(path),
+                                                        );
+                                                        obj.insert(
+                                                            "smt2_dump_chars".to_string(),
+                                                            json!(script.chars().count()),
+                                                        );
+                                                        obj.insert(
+                                                            "smt2_dump_preview".to_string(),
+                                                            json!(truncate_str(&script, 2_000)),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if (smt_unsat_core || smt_support || smt_proof) && v {
+                                                let pp_dump = json!({
+                                                    "goals": [{
+                                                        "pretty": format!("{}\n⊢ {}", hyps_texts.join("\n"), target),
+                                                        "hyps": hyps_texts.iter().take(48).map(|s| json!({"text": s})).collect::<Vec<_>>()
+                                                    }]
+                                                });
+                                                if let Some(obj) = hint.as_object_mut() {
+                                                    if smt_unsat_core || smt_support {
+                                                        let core =
+                                                            plc::smt_lia::unsat_core_from_pp_dump(
+                                                                &pp_dump,
+                                                                smt_timeout_ms,
+                                                                smt_seed,
+                                                                smt_depth,
+                                                                if smt_unsat_core {
+                                                                    smt_unsat_core_max
+                                                                } else {
+                                                                    smt_support_max
+                                                                },
+                                                            )
+                                                            .unwrap_or(None)
+                                                            .unwrap_or(serde_json::Value::Null);
+                                                        obj.insert("unsat_core".to_string(), core);
+                                                    }
+                                                    if smt_proof
+                                                        && smt_proof_done
+                                                            .insert((sk, goal_sig, smt_depth))
+                                                    {
+                                                        smt_proof_attempts =
+                                                            smt_proof_attempts.saturating_add(1);
+                                                        match plc::smt_lia::unsat_proof_from_pp_dump(
+                                                            &pp_dump,
+                                                            smt_timeout_ms,
+                                                            smt_seed,
+                                                            smt_depth,
+                                                            smt_proof_max_chars,
+                                                        ) {
+                                                            Ok(Some(pf)) => {
+                                                                smt_proofs_captured =
+                                                                    smt_proofs_captured
+                                                                        .saturating_add(1);
+                                                                smt_proof_last = Some(pf.clone());
+                                                                obj.insert(
+                                                                    "unsat_proof".to_string(),
+                                                                    pf,
+                                                                );
+                                                            }
+                                                            Ok(None) => {
+                                                                obj.insert(
+                                                                    "unsat_proof".to_string(),
+                                                                    serde_json::Value::Null,
+                                                                );
+                                                                smt_proof_last_error = Some(
+                                                                    "proof_unavailable".to_string(),
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                obj.insert(
+                                                                    "unsat_proof".to_string(),
+                                                                    serde_json::Value::Null,
+                                                                );
+                                                                smt_proof_last_error =
+                                                                    Some(truncate_str(&e, 400));
+                                                            }
+                                                        }
+                                                    }
+                                                    if smt_proof
+                                                        && smt_proof_dump
+                                                        && smt_proof_dump_done
+                                                            .insert((sk, goal_sig, smt_depth))
+                                                    {
+                                                        smt_proof_dump_attempts =
+                                                            smt_proof_dump_attempts
+                                                                .saturating_add(1);
+                                                        if let Ok(Some(pf_full)) =
+                                                            plc::smt_lia::unsat_proof_from_pp_dump(
+                                                                &pp_dump,
+                                                                smt_timeout_ms,
+                                                                smt_seed,
+                                                                smt_depth,
+                                                                smt_proof_dump_max_chars,
+                                                            )
+                                                        {
+                                                            if let Some(preview) = pf_full
+                                                                .get("preview")
+                                                                .and_then(|v| v.as_str())
+                                                            {
+                                                                let total_chars = pf_full
+                                                                    .get("chars")
+                                                                    .and_then(|v| v.as_u64())
+                                                                    .unwrap_or(0)
+                                                                    as usize;
+                                                                let preview_chars =
+                                                                    preview.chars().count();
+                                                                if total_chars
+                                                                    <= smt_proof_dump_max_chars
+                                                                    && preview_chars == total_chars
+                                                                {
+                                                                    let root = smt_proof_dump_root(
+                                                                        &repo_root,
+                                                                        &smt_proof_dump_dir_opt,
+                                                                    );
+                                                                    let path =
+                                                                        maybe_write_smt_proof_dump(
+                                                                            &root, sk, goal_sig,
+                                                                            smt_depth, preview,
+                                                                        );
+                                                                    if !smt_proof_dump_paths
+                                                                        .contains(&path)
+                                                                    {
+                                                                        smt_proof_dump_paths
+                                                                            .push(path.clone());
+                                                                        smt_proof_dump_written =
+                                                                            smt_proof_dump_written
+                                                                                .saturating_add(1);
+                                                                    }
+                                                                    obj.insert(
+                                                                        "unsat_proof_path"
+                                                                            .to_string(),
+                                                                        json!(path),
+                                                                    );
+                                                                } else {
+                                                                    smt_proof_dump_skipped_too_large =
+                                                                        smt_proof_dump_skipped_too_large
+                                                                            .saturating_add(1);
+                                                                    smt_proof_dump_last_error = Some(
+                                                                        format!(
+                                                                            "proof_too_large_for_dump chars={total_chars} max_chars={}",
+                                                                            smt_proof_dump_max_chars
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            }
+                                                        } else {
+                                                            smt_proof_dump_last_error = Some(
+                                                                "proof_unavailable".to_string(),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Only mark artifacts as done if we actually attempted to build them.
+                                    if want_smt_artifacts && v && !smt_artifacts_done.contains(&ck)
+                                    {
+                                        smt_artifacts_done.insert(ck);
+                                    }
+
+                                    (Some(v), Some(hint))
                                 } else {
                                     // Try to compute from cached hyps_texts + target (no Lean).
                                     smt_cache_misses += 1;
@@ -4506,28 +7435,292 @@ Constraints:
                                         )
                                     } else {
                                         let t0 = std::time::Instant::now();
-                                        let ent = smt_entails_from_hyps_target(
-                                            &hyps_texts,
-                                            &target,
-                                            smt_timeout_ms,
-                                            smt_seed,
-                                        )
-                                        .unwrap_or(None);
+                                        let (ent, attempts) =
+                                            smt_entails_from_hyps_target_escalating(
+                                                &hyps_texts,
+                                                &target,
+                                                smt_timeout_ms,
+                                                smt_seed,
+                                                smt_depth,
+                                                &smt_solver_norm,
+                                                smt_aggressive,
+                                                &mut smt_reuse,
+                                                &mut smt_entails_trace,
+                                            )
+                                            .unwrap_or_else(|e| {
+                                                smt_errors += 1;
+                                                smt_last_error = Some(truncate_str(&e, 400));
+                                                (None, 1)
+                                            });
+                                        smt_entails_attempts =
+                                            smt_entails_attempts.saturating_add(attempts);
+                                        if attempts > 1 {
+                                            smt_entails_escalations = smt_entails_escalations
+                                                .saturating_add(attempts.saturating_sub(1));
+                                        }
                                         prof_smt_ms = prof_smt_ms
                                             .saturating_add(t0.elapsed().as_millis() as u64);
                                         if let Some(ent) = ent {
                                             smt_entails_cache.insert(ck, ent);
-                                            cache_write_smt_entails(cd, sk, goal_sig, ent);
-                                            (
-                                                Some(ent),
-                                                Some(json!({
-                                                    "entails": ent,
-                                                    "source": "computed",
-                                                    "state_key": sk,
-                                                    "goal_sig": goal_sig,
-                                                })),
-                                            )
+                                            cache_write_smt_entails(
+                                                cd, sk, goal_sig, smt_depth, ent,
+                                            );
+                                            let mut hint = json!({
+                                                "entails": ent,
+                                                "source": "computed",
+                                                "state_key": sk,
+                                                "goal_sig": goal_sig,
+                                            });
+                                            if smt_dump && smt_dumps_written < smt_dump_max as u64 {
+                                                let pp_dump = json!({
+                                                    "goals": [{
+                                                        "pretty": format!("{}\n⊢ {}", hyps_texts.join("\n"), target),
+                                                        "hyps": hyps_texts.iter().take(48).map(|s| json!({"text": s})).collect::<Vec<_>>()
+                                                    }]
+                                                });
+                                                if let Some(script) =
+                                                    plc::smt_lia::smt2_script_from_pp_dump(
+                                                        &pp_dump,
+                                                        smt_timeout_ms,
+                                                        smt_seed,
+                                                        smt_depth,
+                                                    )
+                                                {
+                                                    let root = smt_dump_root(
+                                                        &repo_root,
+                                                        &smt_dump_dir_opt,
+                                                    );
+                                                    let path = maybe_write_smt2_dump(
+                                                        &root, sk, goal_sig, smt_depth, &script,
+                                                    );
+                                                    smt_dumps_written += 1;
+                                                    smt_dump_paths.push(path.clone());
+                                                    smt_dump_last_path = Some(path.clone());
+                                                    smt_dump_last_chars =
+                                                        Some(script.chars().count());
+                                                    smt_dump_last_preview =
+                                                        Some(truncate_str(&script, 4_000));
+                                                    if let Some(obj) = hint.as_object_mut() {
+                                                        obj.insert(
+                                                            "smt2_dump".to_string(),
+                                                            json!(path),
+                                                        );
+                                                        obj.insert(
+                                                            "smt2_dump_chars".to_string(),
+                                                            json!(script.chars().count()),
+                                                        );
+                                                        obj.insert(
+                                                            "smt2_dump_preview".to_string(),
+                                                            json!(truncate_str(&script, 2_000)),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            if (smt_unsat_core || smt_support || smt_proof) && ent {
+                                                // Best-effort: rebuild a minimal pp_dump shape.
+                                                // Used for: unsat cores, support hints, and (optional) UNSAT proof objects.
+                                                let mut pretty = String::new();
+                                                for h in hyps_texts.iter().take(48) {
+                                                    pretty.push_str(h);
+                                                    pretty.push('\n');
+                                                }
+                                                pretty.push_str("⊢ ");
+                                                pretty.push_str(&target);
+                                                let hyps_json: Vec<serde_json::Value> = hyps_texts
+                                                    .iter()
+                                                    .take(48)
+                                                    .map(|s| json!({ "text": s }))
+                                                    .collect();
+                                                let pp_dump = json!({
+                                                    "goals": [{
+                                                        "pretty": pretty,
+                                                        "hyps": hyps_json
+                                                    }]
+                                                });
+                                                if let Some(obj) = hint.as_object_mut() {
+                                                    if smt_unsat_core || smt_support {
+                                                        let core =
+                                                            plc::smt_lia::unsat_core_from_pp_dump(
+                                                                &pp_dump,
+                                                                smt_timeout_ms,
+                                                                smt_seed,
+                                                                smt_depth,
+                                                                if smt_unsat_core {
+                                                                    smt_unsat_core_max
+                                                                } else {
+                                                                    smt_support_max
+                                                                },
+                                                            )
+                                                            .unwrap_or(None)
+                                                            .unwrap_or(serde_json::Value::Null);
+                                                        obj.insert("unsat_core".to_string(), core);
+                                                    }
+                                                    if smt_proof {
+                                                        smt_proof_attempts =
+                                                            smt_proof_attempts.saturating_add(1);
+                                                        match plc::smt_lia::unsat_proof_from_pp_dump(
+                                                            &pp_dump,
+                                                            smt_timeout_ms,
+                                                            smt_seed,
+                                                            smt_depth,
+                                                            smt_proof_max_chars,
+                                                        ) {
+                                                            Ok(Some(pf)) => {
+                                                                smt_proofs_captured =
+                                                                    smt_proofs_captured
+                                                                        .saturating_add(1);
+                                                                smt_proof_last = Some(pf.clone());
+                                                                obj.insert(
+                                                                    "unsat_proof".to_string(),
+                                                                    pf,
+                                                                );
+                                                            }
+                                                            Ok(None) => {
+                                                                obj.insert(
+                                                                    "unsat_proof".to_string(),
+                                                                    serde_json::Value::Null,
+                                                                );
+                                                                smt_proof_last_error = Some(
+                                                                    "proof_unavailable".to_string(),
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                obj.insert(
+                                                                    "unsat_proof".to_string(),
+                                                                    serde_json::Value::Null,
+                                                                );
+                                                                smt_proof_last_error =
+                                                                    Some(truncate_str(&e, 400));
+                                                            }
+                                                        }
+                                                    }
+                                                    // Optional: write the proof object to disk for reproducible debugging.
+                                                    //
+                                                    // Note: this is best-effort and bounded by `--smt-proof-dump-max-chars`.
+                                                    if smt_proof && smt_proof_dump {
+                                                        smt_proof_dump_attempts =
+                                                            smt_proof_dump_attempts
+                                                                .saturating_add(1);
+                                                        if let Ok(Some(pf_full)) =
+                                                            plc::smt_lia::unsat_proof_from_pp_dump(
+                                                                &pp_dump,
+                                                                smt_timeout_ms,
+                                                                smt_seed,
+                                                                smt_depth,
+                                                                smt_proof_dump_max_chars,
+                                                            )
+                                                        {
+                                                            if let Some(preview) = pf_full
+                                                                .get("preview")
+                                                                .and_then(|v| v.as_str())
+                                                            {
+                                                                let total_chars = pf_full
+                                                                    .get("chars")
+                                                                    .and_then(|v| v.as_u64())
+                                                                    .unwrap_or(0)
+                                                                    as usize;
+                                                                let preview_chars =
+                                                                    preview.chars().count();
+
+                                                                // IMPORTANT: only write a `.sexp` dump when we have the full proof text.
+                                                                // If we write a truncated prefix, it is very likely to be syntactically invalid.
+                                                                if total_chars
+                                                                    <= smt_proof_dump_max_chars
+                                                                    && preview_chars == total_chars
+                                                                {
+                                                                    let root = smt_proof_dump_root(
+                                                                        &repo_root,
+                                                                        &smt_proof_dump_dir_opt,
+                                                                    );
+                                                                    let path =
+                                                                        maybe_write_smt_proof_dump(
+                                                                            &root, sk, goal_sig,
+                                                                            smt_depth, preview,
+                                                                        );
+                                                                    if !smt_proof_dump_paths
+                                                                        .contains(&path)
+                                                                    {
+                                                                        smt_proof_dump_paths
+                                                                            .push(path.clone());
+                                                                        smt_proof_dump_written =
+                                                                            smt_proof_dump_written
+                                                                                .saturating_add(1);
+                                                                    }
+                                                                    obj.insert(
+                                                                        "unsat_proof_path"
+                                                                            .to_string(),
+                                                                        json!(path),
+                                                                    );
+                                                                } else {
+                                                                    smt_proof_dump_skipped_too_large =
+                                                                        smt_proof_dump_skipped_too_large
+                                                                            .saturating_add(1);
+                                                                    smt_proof_dump_last_error = Some(
+                                                                        format!(
+                                                                            "proof_too_large_for_dump chars={total_chars} max_chars={}",
+                                                                            smt_proof_dump_max_chars
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            }
+                                                        } else {
+                                                            smt_proof_dump_last_error = Some(
+                                                                "proof_unavailable".to_string(),
+                                                            );
+                                                        }
+                                                    }
+                                                    if let Some(v) = obj.get("unsat_core") {
+                                                        let ctx_hyp_names: std::collections::HashSet<
+                                                            String,
+                                                        > = hyps_texts
+                                                            .iter()
+                                                            .filter_map(|s| hyp_name_from_text_line(s))
+                                                            .collect();
+                                                        if let Some(hs) = smt_support_lean_hints(
+                                                            v,
+                                                            &ctx_hyp_names,
+                                                        ) {
+                                                            obj.insert(
+                                                                "smt_support_lean".to_string(),
+                                                                json!(hs),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            (Some(ent), Some(hint))
                                         } else {
+                                            if smt_dump && smt_dumps_written < smt_dump_max as u64 {
+                                                let pp_dump = json!({
+                                                    "goals": [{
+                                                        "pretty": format!("{}\n⊢ {}", hyps_texts.join("\n"), target),
+                                                        "hyps": hyps_texts.iter().take(48).map(|s| json!({"text": s})).collect::<Vec<_>>()
+                                                    }]
+                                                });
+                                                if let Some(script) =
+                                                    plc::smt_lia::smt2_script_from_pp_dump(
+                                                        &pp_dump,
+                                                        smt_timeout_ms,
+                                                        smt_seed,
+                                                        smt_depth,
+                                                    )
+                                                {
+                                                    let root = smt_dump_root(
+                                                        &repo_root,
+                                                        &smt_dump_dir_opt,
+                                                    );
+                                                    let path = maybe_write_smt2_dump(
+                                                        &root, sk, goal_sig, smt_depth, &script,
+                                                    );
+                                                    smt_dumps_written += 1;
+                                                    smt_dump_paths.push(path.clone());
+                                                    smt_dump_last_path = Some(path.clone());
+                                                    smt_dump_last_chars =
+                                                        Some(script.chars().count());
+                                                    smt_dump_last_preview =
+                                                        Some(truncate_str(&script, 4_000));
+                                                }
+                                            }
                                             (
                                                 None,
                                                 Some(json!({
@@ -4535,21 +7728,155 @@ Constraints:
                                                     "source": "computed_unknown",
                                                     "state_key": sk,
                                                     "goal_sig": goal_sig,
+                                                    "reason_unknown": smt_reuse
+                                                        .as_ref()
+                                                        .map(|s| s.stats())
+                                                        .and_then(|v| v.get("last_reason_unknown").cloned())
+                                                        .unwrap_or(serde_json::Value::Null),
                                                 })),
                                             )
                                         }
                                     }
                                 }
                             } else {
-                                (
-                                    None,
-                                    Some(json!({
-                                        "entails": serde_json::Value::Null,
-                                        "source": "no_cache_dir",
-                                        "state_key": sk,
-                                        "goal_sig": serde_json::Value::Null,
-                                    })),
-                                )
+                                // No disk cache: still try a purely in-memory SMT check (no extra Lean calls).
+                                let goal_sig = hash_text(&target);
+                                let ck = (sk, goal_sig, smt_depth);
+                                smt_cache_misses += 1;
+                                let hyps_texts =
+                                    goal_dump_hyps_cache.get(&k).cloned().unwrap_or_default();
+                                if hyps_texts.is_empty() {
+                                    (
+                                        None,
+                                        Some(json!({
+                                            "entails": serde_json::Value::Null,
+                                            "source": "no_hyps",
+                                            "state_key": sk,
+                                            "goal_sig": goal_sig,
+                                        })),
+                                    )
+                                } else {
+                                    let t0 = std::time::Instant::now();
+                                    let (ent, attempts) = smt_entails_from_hyps_target_escalating(
+                                        &hyps_texts,
+                                        &target,
+                                        smt_timeout_ms,
+                                        smt_seed,
+                                        smt_depth,
+                                        &smt_solver_norm,
+                                        smt_aggressive,
+                                        &mut smt_reuse,
+                                        &mut smt_entails_trace,
+                                    )
+                                    .unwrap_or_else(|e| {
+                                        smt_errors += 1;
+                                        smt_last_error = Some(truncate_str(&e, 400));
+                                        (None, 1)
+                                    });
+                                    smt_entails_attempts =
+                                        smt_entails_attempts.saturating_add(attempts);
+                                    if attempts > 1 {
+                                        smt_entails_escalations = smt_entails_escalations
+                                            .saturating_add(attempts.saturating_sub(1));
+                                    }
+                                    prof_smt_ms =
+                                        prof_smt_ms.saturating_add(t0.elapsed().as_millis() as u64);
+                                    if let Some(ent) = ent {
+                                        smt_entails_cache.insert(ck, ent);
+                                        let mut hint = json!({
+                                            "entails": ent,
+                                            "source": "computed",
+                                            "state_key": sk,
+                                            "goal_sig": goal_sig,
+                                        });
+                                        if smt_dump && smt_dumps_written < smt_dump_max as u64 {
+                                            let pp_dump = json!({
+                                                "goals": [{
+                                                    "pretty": format!("{}\n⊢ {}", hyps_texts.join("\n"), target),
+                                                    "hyps": hyps_texts.iter().take(48).map(|s| json!({"text": s})).collect::<Vec<_>>()
+                                                }]
+                                            });
+                                            if let Some(script) =
+                                                plc::smt_lia::smt2_script_from_pp_dump(
+                                                    &pp_dump,
+                                                    smt_timeout_ms,
+                                                    smt_seed,
+                                                    smt_depth,
+                                                )
+                                            {
+                                                let root =
+                                                    smt_dump_root(&repo_root, &smt_dump_dir_opt);
+                                                let path = maybe_write_smt2_dump(
+                                                    &root, sk, goal_sig, smt_depth, &script,
+                                                );
+                                                smt_dumps_written += 1;
+                                                smt_dump_paths.push(path.clone());
+                                                smt_dump_last_path = Some(path.clone());
+                                                smt_dump_last_chars = Some(script.chars().count());
+                                                smt_dump_last_preview =
+                                                    Some(truncate_str(&script, 4_000));
+                                                if let Some(obj) = hint.as_object_mut() {
+                                                    obj.insert(
+                                                        "smt2_dump".to_string(),
+                                                        json!(path),
+                                                    );
+                                                    obj.insert(
+                                                        "smt2_dump_chars".to_string(),
+                                                        json!(script.chars().count()),
+                                                    );
+                                                    obj.insert(
+                                                        "smt2_dump_preview".to_string(),
+                                                        json!(truncate_str(&script, 2_000)),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        (Some(ent), Some(hint))
+                                    } else {
+                                        if smt_dump && smt_dumps_written < smt_dump_max as u64 {
+                                            let pp_dump = json!({
+                                                "goals": [{
+                                                    "pretty": format!("{}\n⊢ {}", hyps_texts.join("\n"), target),
+                                                    "hyps": hyps_texts.iter().take(48).map(|s| json!({"text": s})).collect::<Vec<_>>()
+                                                }]
+                                            });
+                                            if let Some(script) =
+                                                plc::smt_lia::smt2_script_from_pp_dump(
+                                                    &pp_dump,
+                                                    smt_timeout_ms,
+                                                    smt_seed,
+                                                    smt_depth,
+                                                )
+                                            {
+                                                let root =
+                                                    smt_dump_root(&repo_root, &smt_dump_dir_opt);
+                                                let path = maybe_write_smt2_dump(
+                                                    &root, sk, goal_sig, smt_depth, &script,
+                                                );
+                                                smt_dumps_written += 1;
+                                                smt_dump_paths.push(path.clone());
+                                                smt_dump_last_path = Some(path.clone());
+                                                smt_dump_last_chars = Some(script.chars().count());
+                                                smt_dump_last_preview =
+                                                    Some(truncate_str(&script, 4_000));
+                                            }
+                                        }
+                                        (
+                                            None,
+                                            Some(json!({
+                                                "entails": serde_json::Value::Null,
+                                                "source": "computed_unknown",
+                                                "state_key": sk,
+                                                "goal_sig": goal_sig,
+                                                "reason_unknown": smt_reuse
+                                                    .as_ref()
+                                                    .map(|s| s.stats())
+                                                    .and_then(|v| v.get("last_reason_unknown").cloned())
+                                                    .unwrap_or(serde_json::Value::Null),
+                                            })),
+                                        )
+                                    }
+                                }
                             }
                         } else {
                             (None, None)
@@ -4558,21 +7885,140 @@ Constraints:
                         (None, None)
                     };
 
+                    // Conservative default: when using depth-limited SMT, a SAT result can simply mean
+                    // "not enough relevant hyps were included". Treat `false` as `unknown` unless we
+                    // used the full hypothesis set (`smt_depth==0`).
+                    let smt_entails_effective: Option<bool> =
+                        if smt_depth > 0 && smt_entails_opt == Some(false) {
+                            None
+                        } else {
+                            smt_entails_opt
+                        };
+
+                    // If requested, attach a small, bounded “fragment explanation” (what SMT actually
+                    // saw after depth filtering). This is designed to be cheap (no extra Lean calls).
+                    if smt_explain {
+                        if let Some(v) = smt_hint_json.as_mut().and_then(|v| v.as_object_mut()) {
+                            v.insert("depth".to_string(), json!(smt_depth));
+                            // Best-effort: compute from cached hyps_texts + target.
+                            let th = hash_text(&parent.text);
+                            let k = (th, parent.text.len(), sel.line);
+                            let target = goal_dump_cache
+                                .get(&k)
+                                .map(|(_, _, _, t)| t.clone())
+                                .unwrap_or_default();
+                            let hyps_texts =
+                                goal_dump_hyps_cache.get(&k).cloned().unwrap_or_default();
+                            v.insert(
+                                "fragment".to_string(),
+                                smt_explain_fragment_from_hyps_target(
+                                    &hyps_texts,
+                                    &target,
+                                    smt_depth,
+                                    smt_explain_max_hyps,
+                                )
+                                .unwrap_or(serde_json::Value::Null),
+                            );
+
+                            // Optional unsat core / support set (expensive): only meaningful when entailment is `true`.
+                            if (smt_unsat_core || smt_support) && smt_entails_opt == Some(true) {
+                                let mut pretty = String::new();
+                                for h in hyps_texts.iter().take(48) {
+                                    pretty.push_str(h);
+                                    pretty.push('\n');
+                                }
+                                pretty.push_str("⊢ ");
+                                pretty.push_str(&target);
+                                let hyps_json: Vec<serde_json::Value> = hyps_texts
+                                    .iter()
+                                    .take(48)
+                                    .map(|s| json!({ "text": s }))
+                                    .collect();
+                                let pp_dump = json!({
+                                    "goals": [{
+                                        "pretty": pretty,
+                                        "hyps": hyps_json
+                                    }]
+                                });
+                                let core = plc::smt_lia::unsat_core_from_pp_dump(
+                                    &pp_dump,
+                                    smt_timeout_ms,
+                                    smt_seed,
+                                    smt_depth,
+                                    if smt_unsat_core {
+                                        smt_unsat_core_max
+                                    } else {
+                                        smt_support_max
+                                    },
+                                )
+                                .unwrap_or(None)
+                                .unwrap_or(serde_json::Value::Null);
+                                v.insert("unsat_core".to_string(), core);
+                                let ctx_hyp_names: std::collections::HashSet<String> = hyps_texts
+                                    .iter()
+                                    .filter_map(|s| hyp_name_from_text_line(s))
+                                    .collect();
+                                if let Some(hs) = smt_support_lean_hints(
+                                    v.get("unsat_core").unwrap(),
+                                    &ctx_hyp_names,
+                                ) {
+                                    v.insert("smt_support_lean".to_string(), json!(hs));
+                                }
+                            }
+                        }
+                    }
+
                     // If SMT says the local LIA fragment entails the target, inject a few
                     // deterministic arithmetic tactics at the front. This makes the SMT signal
                     // *actionable* rather than only a ranking hint.
-                    if smt_entails_opt == Some(true) {
+                    if smt_entails_effective == Some(true) {
+                        // If we computed an explicit support-guided Lean proof sketch, try it first.
+                        // (It will be adapted to tactic-vs-term context below.)
+                        let mut support_candidates: Vec<String> = smt_hint_json
+                            .as_ref()
+                            .and_then(|v| v.get("smt_support_lean"))
+                            .and_then(|v| v.as_array())
+                            .map(|xs| {
+                                xs.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        if !support_candidates.is_empty() {
+                            // Adapt all candidates to term-vs-tactic context (bounded).
+                            support_candidates.truncate(smt_support_max);
+                            support_candidates = adapt_candidates_for_sorry_context(
+                                &support_candidates,
+                                &sel.line_text,
+                                is_tactic_context,
+                            );
+                        }
                         // Candidates are proof-term replacements inside an existing `by` block,
                         // so these are tactics, not `by ...`.
-                        let mut inject = vec![
+                        let mut inject: Vec<String> = Vec::new();
+                        inject.extend(support_candidates.into_iter().take(smt_support_max));
+                        inject.extend(vec![
                             "omega".to_string(),
                             "linarith".to_string(),
                             "nlinarith".to_string(),
+                            "norm_cast".to_string(),
                             "simp; omega".to_string(),
-                        ];
+                        ]);
                         // Prepend and then sanitize/dedupe/bound later.
                         inject.extend(candidates_here.into_iter());
                         candidates_here = sanitize_candidates(inject);
+                    } else if smt_entails_effective == Some(false) && smt_depth == 0 {
+                        // If SMT says the LIA fragment does *not* entail the target, avoid spending
+                        // node budget on pure arithmetic tactics that are unlikely to close the goal.
+                        // (This is intentionally conservative: only drop obvious LIA-only candidates.)
+                        candidates_here.retain(|c| {
+                            let t = c.to_lowercase();
+                            !(t.contains("omega")
+                                || t.contains("linarith")
+                                || t.contains("nlinarith")
+                                || t.contains("norm_num"))
+                        });
+                        candidates_here = sanitize_candidates(candidates_here);
                     }
 
                     // If the goal looks “wide” or “context heavy”, we should prefer low-branching
@@ -4598,6 +8044,7 @@ Constraints:
                         prior: i64,
                         complexity: i64,
                         smt_bonus: i64,
+                        shape_bonus: i64,
                         is_arith: bool,
                         arith_keyword: Option<String>,
                         first_cmd: String,
@@ -4670,6 +8117,42 @@ Constraints:
                         }
                         None
                     };
+                    let goal_shape_even_div: bool = goal_dump_v
+                        .as_ref()
+                        .and_then(|gd| {
+                            gd.get("pp_dump")
+                                .and_then(|v| v.get("goals"))
+                                .and_then(|v| v.as_array())
+                                .and_then(|a| a.first())
+                        })
+                        .map(|g0| {
+                            let target = g0
+                                .get("pretty")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| {
+                                    s.lines().find_map(|ln| {
+                                        ln.trim_start()
+                                            .strip_prefix("⊢")
+                                            .map(|r| r.trim().to_string())
+                                    })
+                                })
+                                .unwrap_or_default();
+                            let has_even = g0
+                                .get("hyps")
+                                .and_then(|v| v.as_array())
+                                .map(|hs| {
+                                    hs.iter().any(|h| {
+                                        h.get("text")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.contains("Even"))
+                                            .unwrap_or(false)
+                                    })
+                                })
+                                .unwrap_or(false);
+                            target.contains("∣") && has_even
+                        })
+                        .unwrap_or(false);
+
                     let mut ranked: Vec<CandRank> = candidates_here
                         .iter()
                         .take(cap)
@@ -4699,13 +8182,18 @@ Constraints:
                             } else {
                                 "other"
                             };
-                            let smt_bonus: i64 = match smt_entails_opt {
+                            let smt_bonus: i64 = match smt_entails_effective {
                                 Some(true) if is_arith => -5_000,
                                 Some(false) if is_arith => 5_000,
                                 _ => 0,
                             };
                             // Note: `smt_bonus` is deliberately coarse. We only want SMT to act as a
                             // *tie-breaker* or a strong nudge, not to dominate the learned/state-action prior.
+                            let shape_bonus: i64 = if goal_shape_even_div && first_cmd == "rcases" {
+                                -50_000
+                            } else {
+                                0
+                            };
                             let lines = c.lines().count() as i64;
                             let holes = c.matches("?_").count() as i64;
                             let bullets = c.matches("\n·").count() as i64;
@@ -4714,13 +8202,15 @@ Constraints:
                                 + bullets * 10
                                 + lines * 5
                                 + len / 40
-                                + hyps_total / 20;
+                                + hyps_total / 20
+                                + shape_bonus;
                             CandRank {
                                 cand: c,
                                 cand_h,
                                 prior,
                                 complexity,
                                 smt_bonus,
+                                shape_bonus,
                                 is_arith,
                                 arith_keyword,
                                 first_cmd,
@@ -4785,13 +8275,13 @@ Constraints:
                             let smt_reason = if meta_vars_target > 0 && r.is_arith {
                                 "meta_vars_target"
                             } else if r.smt_bonus != 0 && r.is_arith {
-                                match smt_entails_opt {
+                                match smt_entails_effective {
                                     Some(true) => "smt_entails_true_boost",
                                     Some(false) => "smt_entails_false_penalize",
                                     None => "no_smt_signal",
                                 }
                             } else if r.is_arith {
-                                match smt_entails_opt {
+                                match smt_entails_effective {
                                     Some(true) | Some(false) => "smt_signal_no_effect",
                                     None => "no_smt_signal",
                                 }
@@ -4808,6 +8298,7 @@ Constraints:
                                 "prior": r.prior,
                                 "complexity": r.complexity,
                                 "smt_bonus": r.smt_bonus,
+                                "shape_bonus": r.shape_bonus,
                                 "second_key": r.complexity + r.smt_bonus,
                                 "reason": smt_reason,
                             }));
@@ -4817,6 +8308,9 @@ Constraints:
                             "n_goals": n_goals,
                             "hyps_total": hyps_total,
                             "meta_vars_target": meta_vars_target,
+                            // Canonical, stable field for SMT provenance/artifacts.
+                            "smt_evidence": smt_hint_json.clone().unwrap_or(serde_json::Value::Null),
+                            // Back-compat alias (older outputs used `rank_hint.smt`).
                             "smt": smt_hint_json.clone().unwrap_or(serde_json::Value::Null),
                             "top": top_rows,
                         }))
@@ -5094,6 +8588,14 @@ Constraints:
                                 "counts": summary.get("counts").cloned().unwrap_or(serde_json::Value::Null),
                                 "sorries": locs2_len,
                                 "conservative_sorries": conservative2,
+                                "replacement_hash": if log_level >= 2 { json!(hash_text(cand)) } else { serde_json::Value::Null },
+                                "replacement_preview": if log_level >= 2 {
+                                    let t = cand.trim();
+                                    let head: String = t.chars().take(240).collect();
+                                    if t.chars().count() > 240 { json!(format!("{head}...")) } else { json!(head) }
+                                } else {
+                                    serde_json::Value::Null
+                                },
                             }),
                         );
 
@@ -5169,8 +8671,8 @@ Constraints:
             }
 
             // Pick best node (either done or best-scoring leaf).
-            let best = if let Some(d) = best_done {
-                d
+            let best = if let Some(ref d) = best_done {
+                d.clone()
             } else if all.is_empty() {
                 // If we bailed early (e.g. total-timeout) before moving any nodes into `all`,
                 // fall back to the root node so we can still emit a useful partial result.
@@ -5274,17 +8776,232 @@ Constraints:
                     ))
                 }
             };
+            let mut picked = picked.clone();
+
+            // If the winning patch uses mathlib's suggestion tactics (`exact?`, `apply?`, etc.),
+            // try to "determinize" it into the concrete suggestion (the `Try this:` line).
+            //
+            // Rationale: `exact?` is convenient but can drift across Mathlib/Lean versions; the
+            // suggested `exact foo ...` term is much more stable.
+            if let Some(repl) = picked.last_replacement.clone() {
+                let uses_suggest = repl.contains("exact?")
+                    || repl.contains("apply?")
+                    || repl.contains("simp?")
+                    || repl.contains("aesop?");
+                if uses_suggest {
+                    if let Some(raw) = picked.verify_raw.as_ref().and_then(|v| v.as_object()) {
+                        let stdout = raw.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+                        let stderr = raw.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+                        let merged = format!("{stdout}\n{stderr}");
+                        let suggs = plc::extract_try_this_suggestions(&merged);
+                        if let Some(s0) = suggs.first() {
+                            let s0_line = s0.trim();
+                            // Build a replacement in the same syntactic "shape" as the original.
+                            let repl_trim = repl.trim_start();
+                            let is_term_hole = repl_trim.starts_with("by");
+                            let indent_under_by = |block: &str| -> String {
+                                block
+                                    .lines()
+                                    .map(|ln| format!("  {ln}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            };
+                            // First: if the suggestion is a single line, try to "inline determinize"
+                            // within the existing replacement (e.g. rewrite `by exact?` into
+                            // `by exact foo`), instead of replacing the entire block.
+                            let nested_opt = if !s0_line.contains('\n') {
+                                if repl.contains("exact?") && s0_line.starts_with("exact ") {
+                                    Some(repl.replacen("exact?", s0_line, 1))
+                                } else if repl.contains("apply?")
+                                    && (s0_line.starts_with("apply ")
+                                        || s0_line.starts_with("refine ")
+                                        || s0_line.starts_with("exact "))
+                                {
+                                    Some(repl.replacen("apply?", s0_line, 1))
+                                } else if repl.contains("have ")
+                                    && repl.contains(":= by exact?")
+                                    && s0_line.starts_with("exact ")
+                                {
+                                    Some(repl.replacen("exact?", s0_line, 1))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            let new_repl_opt = nested_opt.or_else(|| {
+                                if is_term_hole {
+                                    if s0.trim_start().starts_with("by") {
+                                        Some(s0.to_string())
+                                    } else if s0.contains('\n') {
+                                        if repl.contains("classical") {
+                                            Some(format!(
+                                                "by\n  classical\n{}",
+                                                indent_under_by(s0)
+                                            ))
+                                        } else {
+                                            Some(format!("by\n{}", indent_under_by(s0)))
+                                        }
+                                    } else if repl.contains("classical") {
+                                        Some(format!("by\n  classical\n  {s0}"))
+                                    } else {
+                                        Some(format!("by\n  {s0}"))
+                                    }
+                                } else {
+                                    // Tactic hole: keep it single-line (indentation may vary by context).
+                                    if s0.trim_start().starts_with("by") {
+                                        None
+                                    } else if s0.contains('\n') {
+                                        None
+                                    } else {
+                                        Some(s0.to_string())
+                                    }
+                                }
+                            });
+
+                            if let Some(new_repl) = new_repl_opt.filter(|nr| nr != &repl) {
+                                // Prefer rewriting within the recorded region (more robust than a
+                                // global string match).
+                                let det_text_opt = picked
+                                    .last_region
+                                    .and_then(|(a, b)| {
+                                        // Token-level determinization inside the region.
+                                        //
+                                        // If we have multiple `Try this:` suggestions, we can often
+                                        // eliminate multiple `exact?`/`apply?` occurrences in one pass.
+                                        let mut t = picked.text.clone();
+                                        let mut changed = false;
+                                        for s in suggs.iter().take(6) {
+                                            let s = s.trim();
+                                            if s.is_empty() || s.contains('\n') {
+                                                continue;
+                                            }
+                                            if t.contains("exact?")
+                                                && repl.contains("exact?")
+                                                && s.starts_with("exact ")
+                                            {
+                                                if let Some(t2) =
+                                                    plc::tree_search::replace_in_region_first(
+                                                        &t, a, b, "exact?", s,
+                                                    )
+                                                {
+                                                    t = t2;
+                                                    changed = true;
+                                                    continue;
+                                                }
+                                            }
+                                            if t.contains("apply?")
+                                                && repl.contains("apply?")
+                                                && (s.starts_with("apply ")
+                                                    || s.starts_with("refine ")
+                                                    || s.starts_with("exact "))
+                                            {
+                                                if let Some(t2) =
+                                                    plc::tree_search::replace_in_region_first(
+                                                        &t, a, b, "apply?", s,
+                                                    )
+                                                {
+                                                    t = t2;
+                                                    changed = true;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        if changed {
+                                            return Some(t);
+                                        }
+
+                                        // Fallback: replace the whole block (requires exact match).
+                                        plc::tree_search::replace_in_region_once(
+                                            &picked.text,
+                                            a,
+                                            b,
+                                            &repl,
+                                            &new_repl,
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        // Fallback: only if we can locate the original replacement uniquely.
+                                        if picked.text.matches(&repl).count() == 1 {
+                                            Some(picked.text.replacen(&repl, &new_repl, 1))
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                if let Some(det_text) = det_text_opt {
+                                    if let Some(dur) = budget_dur(timeout_s) {
+                                        let t0 = std::time::Instant::now();
+                                        if let Ok(v) = rt.block_on(plc::verify_lean_text(
+                                            &repo_root, &det_text, dur,
+                                        )) {
+                                            let det_raw_v = serde_json::to_value(v)
+                                                .map_err(|e| format!("serialize verify: {e}"))?;
+                                            let det_summary =
+                                                verify_summary_from_raw_value(&det_raw_v);
+                                            let det_ok =
+                                                det_summary.get("ok").and_then(|v| v.as_bool())
+                                                    == Some(true);
+                                            let det_sw = det_summary
+                                                .get("counts")
+                                                .and_then(|c| c.get("sorry_warnings"))
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0);
+                                            if det_ok && det_sw == 0 {
+                                                // Accept determinized patch.
+                                                picked.text = det_text;
+                                                picked.last_replacement = Some(new_repl);
+                                                picked.verify_raw = Some(det_raw_v);
+                                                picked.verify_summary = Some(det_summary);
+                                                let locs2 = plc::locate_sorries_in_text(
+                                                    &picked.text,
+                                                    500,
+                                                    1,
+                                                )
+                                                .unwrap_or_default();
+                                                picked.sorries = Some(locs2.len());
+                                                picked.conservative_sorries = Some(
+                                                    plc::count_sorry_tokens_conservative(
+                                                        &picked.text,
+                                                    )
+                                                    .unwrap_or(0),
+                                                );
+                                            }
+                                        }
+                                        prof_verify_nodes_ms = prof_verify_nodes_ms
+                                            .saturating_add(t0.elapsed().as_millis() as u64);
+                                        prof_verify_nodes_calls += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Finalize event stream before rendering any human summaries.
             // We also drop the recorder closure so we can immutably read `events_tail` safely.
             record_event(
                 "end",
                 json!({
-                    "bailouts": { "total_timeout": bailed_total_timeout },
+                    "bailouts": {
+                        "total_timeout": bailed_total_timeout,
+                    },
                     "remaining_ms": remaining_ms(run_deadline),
                 }),
             );
             drop(record_event);
+
+            // Hard-focus “stuck” signal: we refused to drift to other decls and found no more holes
+            // inside the focus decl on at least one expanded node.
+            let hard_focus_stuck = focus_decl_hard
+                && !bailed_total_timeout
+                && best_done.is_none()
+                && events_by_kind
+                    .get("focus_decl_hard_no_sorries_in_decl")
+                    .copied()
+                    .unwrap_or(0)
+                    > 0;
 
             if !quiet && summary_level > 0 && log_level > 0 {
                 let counts = |s: &serde_json::Value, k: &str| -> u64 {
@@ -5550,12 +9267,20 @@ Constraints:
 
             let mut written_file: Option<String> = None;
             if write || write_to.is_some() {
-                let target = write_to.as_ref().unwrap_or(&abs);
+                let target: std::path::PathBuf = if let Some(p) = write_to.as_ref() {
+                    if p.is_absolute() {
+                        p.clone()
+                    } else {
+                        repo_root.join(p)
+                    }
+                } else {
+                    abs.clone()
+                };
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("failed to create dir {}: {}", parent.display(), e))?;
                 }
-                std::fs::write(target, picked.text.as_bytes())
+                std::fs::write(&target, picked.text.as_bytes())
                     .map_err(|e| format!("write {}: {e}", target.display()))?;
                 written_file = Some(target.display().to_string());
             }
@@ -5609,6 +9334,7 @@ Constraints:
             };
 
             // Optional human-friendly Markdown report.
+            let mut report_md_preview: Option<String> = None;
             let report_md_written: Option<String> = if let Some(p) = report_md.as_ref() {
                 let baseline_sorries = plc::locate_sorries_in_text(&original_text, 500, 1)
                     .unwrap_or_default()
@@ -5641,6 +9367,18 @@ Constraints:
                         dn,
                         focus_line_1.unwrap_or(0)
                     ));
+                }
+                md.push_str(&format!("- focus source: `{}`\n", focus_source));
+                if focus_source == "focus_decl_not_found_fallback" {
+                    if let Some(req) = focus_requested_decl.as_deref() {
+                        md.push_str(&format!("- focus requested decl: `{}`\n", req));
+                    }
+                    if !focus_available_decls.is_empty() {
+                        md.push_str("- focus available decls (sample):\n");
+                        for d in focus_available_decls.iter().take(12) {
+                            md.push_str(&format!("  - `{}`\n", d));
+                        }
+                    }
                 }
                 md.push_str("\n### Primary failure mode\n\n");
                 md.push_str(&format!("- mode: `{}`\n", mode));
@@ -5697,6 +9435,22 @@ Constraints:
                 md.push_str("- If the search is bouncing between holes, increase `--goal-first-k` (default 3 for lean-try).\n");
                 md.push_str("- If you want to prioritize actually closing goals, try `--fill-mode strict` or `--fill-mode hybrid`.\n");
                 md.push_str("- If you want exploration, enable `--escalate-llm` (and configure provider).\n");
+
+                // Keep a small inline preview in the JSON output. This makes the report usable even when
+                // the report file path is inconvenient to open in an IDE (e.g. ignored/generated dirs).
+                let max_preview_chars = 8000usize;
+                let total_chars = md.chars().count();
+                let (kept, truncated) = if total_chars > max_preview_chars {
+                    (md.chars().take(max_preview_chars).collect::<String>(), true)
+                } else {
+                    (md.clone(), false)
+                };
+                report_md_preview = Some(if truncated {
+                    format!("{kept}\n\n[proofpatch: report_md preview truncated]\n")
+                } else {
+                    kept
+                });
+
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("failed to create dir {}: {}", parent.display(), e))?;
@@ -5738,6 +9492,12 @@ Constraints:
                 "repo_root": repo_root.display().to_string(),
                 "file": file,
                 "written_file": written_file,
+                "result_kind": "search",
+                "note": if hard_focus_stuck {
+                    serde_json::Value::String("Hard focus prevented further expansion: no remaining `sorry` in focus decl on some nodes (and drift is disabled).".to_string())
+                } else {
+                    serde_json::Value::Null
+                },
                 "write_mode": if write { "inplace" } else if write_to.is_some() { "to_path" } else { "none" },
                 "diff": diff_unified,
                 "diff_written": diff_written,
@@ -5749,7 +9509,8 @@ Constraints:
                     },
                     "report_md": {
                         "requested": report_md_requested.as_ref().map(|p| p.display().to_string()),
-                        "written": report_md_written
+                        "written": report_md_written,
+                        "preview": report_md_preview
                     },
                     "diff_output": {
                         "requested": output_diff_requested.as_ref().map(|p| p.display().to_string()),
@@ -5821,6 +9582,7 @@ Constraints:
                     "depth": depth,
                     "candidates": candidates_mode,
                     "candidates_count": candidates.len(),
+                    "decision_effects": decision_effects,
                     "lean_oracle_per_node": lean_oracle_per_node,
                     "lean_oracle_max_calls": lean_oracle_max_calls,
                     "rollout_k": rollout_k,
@@ -5834,6 +9596,7 @@ Constraints:
                     "llm_summary_timeout_s": llm_summary_timeout_s,
                     "llm_planner": llm_planner,
                     "smt_precheck": smt_precheck,
+                    "smt_depth": smt_depth,
                     "smt_timeout_ms": smt_timeout_ms,
                     "smt_seed": smt_seed,
                     "escalate_llm": escalate_llm,
@@ -5841,6 +9604,8 @@ Constraints:
                     "include_trace": include_trace,
                     "pick": pick,
                     "research_notes": research_notes,
+                    "research_preset": research_preset,
+                    "research_top_k": research_top_k,
                     "include_diff": include_diff,
                     "diff_context": diff_context,
                     "max_candidates_per_node": max_candidates_per_node,
@@ -5854,6 +9619,7 @@ Constraints:
                 },
                 "bailouts": {
                     "total_timeout": bailed_total_timeout,
+                    "focus_decl_hard_stuck": hard_focus_stuck,
                 },
                 "oracle": {
                     "calls": lean_oracle_calls,
@@ -5875,11 +9641,66 @@ Constraints:
                     "smt": {
                         "cache_hits": smt_cache_hits,
                         "cache_misses": smt_cache_misses,
+                        "entails_attempts": smt_entails_attempts,
+                        "entails_escalations": smt_entails_escalations,
+                        "entails_trace": smt_entails_trace,
+                        "errors": smt_errors,
+                        "last_error": smt_last_error,
+                        "note": if smt_dump && smt_dumps_written == 0 && !goal_dump {
+                            json!("SMT dumping typically needs goal dumps; re-run with `--goal-dump` (and `--smt-precheck`) to populate hypotheses/targets.")
+                        } else {
+                            serde_json::Value::Null
+                        },
+                        "proofs": {
+                            "enabled": { "value": smt_proof, "source": smt_proof_source },
+                            "max_chars": smt_proof_max_chars,
+                            "attempts": smt_proof_attempts,
+                            "captured": smt_proofs_captured,
+                            "last_error": smt_proof_last_error,
+                            "last": smt_proof_last,
+                            "note": if smt_proof && smt_proof_attempts == 0 {
+                                if smt_proof_dump && goal_dump_v.is_none() {
+                                    json!("SMT proof dumping typically needs goal dumps; re-run with `--goal-dump` (and usually `--smt-precheck`) so `proofpatch` can see hypotheses/targets.")
+                                } else {
+                                    json!("UNSAT proof objects are only available when an entailment check returns `entails=true` (i.e., the SMT query finds UNSAT for `hyps ∧ ¬target`).")
+                                }
+                            } else if smt_proof && smt_proof_attempts > 0 && smt_proofs_captured == 0 && smt_proof_last_error.is_none() {
+                                json!("No proof was captured; this can happen if the solver reports `unknown`, does not support `(get-proof)`, or returns `unsupported` for this query shape.")
+                            } else {
+                                serde_json::Value::Null
+                            },
+                            "dump": {
+                                "enabled": smt_proof_dump,
+                                "dir": smt_proof_dump_dir_opt
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "".to_string()),
+                                "max_chars": smt_proof_dump_max_chars,
+                                "attempts": smt_proof_dump_attempts,
+                                "written": smt_proof_dump_written,
+                                "skipped_too_large": smt_proof_dump_skipped_too_large,
+                                "last_error": smt_proof_dump_last_error,
+                                "paths": smt_proof_dump_paths,
+                            },
+                        },
+                        "dumps_written": smt_dumps_written,
+                        "dump_paths": smt_dump_paths,
+                        "dump_last": {
+                            "path": smt_dump_last_path,
+                            "chars": smt_dump_last_chars,
+                            "preview": smt_dump_last_preview,
+                        },
                         "goal_dump_hyps_cache_hits": goal_dump_hyps_cache_hits,
-                        "goal_dump_hyps_cache_misses": goal_dump_hyps_cache_misses
+                        "goal_dump_hyps_cache_misses": goal_dump_hyps_cache_misses,
+                        "solver": plc::smt_lia::smt_solver_probe(),
+                        "reuse": smt_reuse
+                            .as_ref()
+                            .map(|s| s.stats())
+                            .unwrap_or(serde_json::Value::Null),
                     }
                 },
                 "baseline_verify": { "summary": baseline_summary },
+                "research_context": research_context,
                 "goal_dump": goal_dump_v,
                 "lean_suggestions": lean_suggest_v,
                 "llm": {
@@ -5897,9 +9718,17 @@ Constraints:
                     "parent": best.parent_id,
                     "last_region": best.last_region.map(|(a,b)| json!({"start_line": a, "end_line": b})),
                     "last_replacement": best.last_replacement,
+                    "smt_support_used": best
+                        .last_replacement
+                        .as_ref()
+                        .map(|s| s.contains("proofpatch:smt_support"))
+                        .unwrap_or(false),
                     "sorries": best.sorries,
                     "conservative_sorries": best.conservative_sorries,
                     "focus_goal_sig": best.focus_goal_sig,
+                    // Canonical, stable field for SMT provenance/artifacts.
+                    "smt_evidence": best.smt_hint.clone(),
+                    // Back-compat alias.
                     "smt_hint": best.smt_hint,
                     "rank_hint": best.rank_hint,
                     "verify": {
@@ -5913,9 +9742,15 @@ Constraints:
                     "parent": best_progress.parent_id,
                     "last_region": best_progress.last_region.map(|(a,b)| json!({"start_line": a, "end_line": b})),
                     "last_replacement": best_progress.last_replacement,
+                    "smt_support_used": best_progress
+                        .last_replacement
+                        .as_ref()
+                        .map(|s| s.contains("proofpatch:smt_support"))
+                        .unwrap_or(false),
                     "sorries": best_progress.sorries,
                     "conservative_sorries": best_progress.conservative_sorries,
                     "focus_goal_sig": best_progress.focus_goal_sig,
+                    "smt_evidence": best_progress.smt_hint.clone(),
                     "smt_hint": best_progress.smt_hint,
                     "rank_hint": best_progress.rank_hint,
                     "verify": {
@@ -5929,9 +9764,15 @@ Constraints:
                     "parent": best_ok.parent_id,
                     "last_region": best_ok.last_region.map(|(a,b)| json!({"start_line": a, "end_line": b})),
                     "last_replacement": best_ok.last_replacement,
+                    "smt_support_used": best_ok
+                        .last_replacement
+                        .as_ref()
+                        .map(|s| s.contains("proofpatch:smt_support"))
+                        .unwrap_or(false),
                     "sorries": best_ok.sorries,
                     "conservative_sorries": best_ok.conservative_sorries,
                     "focus_goal_sig": best_ok.focus_goal_sig,
+                    "smt_evidence": best_ok.smt_hint.clone(),
                     "smt_hint": best_ok.smt_hint,
                     "rank_hint": best_ok.rank_hint,
                     "verify": {
@@ -5945,9 +9786,15 @@ Constraints:
                     "parent": picked.parent_id,
                     "last_region": picked.last_region.map(|(a,b)| json!({"start_line": a, "end_line": b})),
                     "last_replacement": picked.last_replacement,
+                    "smt_support_used": picked
+                        .last_replacement
+                        .as_ref()
+                        .map(|s| s.contains("proofpatch:smt_support"))
+                        .unwrap_or(false),
                     "sorries": picked.sorries,
                     "conservative_sorries": picked.conservative_sorries,
                     "focus_goal_sig": picked.focus_goal_sig,
+                    "smt_evidence": picked.smt_hint.clone(),
                     "smt_hint": picked.smt_hint,
                     "rank_hint": picked.rank_hint,
                     "verify": {
@@ -6007,11 +9854,14 @@ Constraints:
                     "picked": pick,
                     "focus_decl": focus_decl_name,
                     "focus_line": focus_line_1,
+                    "focus_decl_hard": focus_decl_hard,
                     "baseline": baseline_summary,
                     "picked_verify": picked.verify_summary
                 },
                 "focus": {
                     "source": focus_source,
+                    "requested_decl": focus_requested_decl,
+                    "available_decls": focus_available_decls,
                     "primary_sorry": focus_sorry.as_ref().map(|s| json!({
                         "token": s.token,
                         "decl_kind": s.decl_kind,
@@ -6233,11 +10083,400 @@ Constraints:
                 );
             }
 
+            // Normalize SMT proof dump paths: we may write the same file more than once
+            // (e.g., best-effort + cached entailment artifact paths). Keep the JSON stable by
+            // deduping paths and aligning `written` with the unique path count.
+            if let Some(dump_v) = out
+                .get_mut("oracle")
+                .and_then(|v| v.get_mut("smt"))
+                .and_then(|v| v.get_mut("proofs"))
+                .and_then(|v| v.get_mut("dump"))
+            {
+                if let Some(dump_obj) = dump_v.as_object_mut() {
+                    let mut new_len: Option<usize> = None;
+                    if let Some(arr) = dump_obj.get_mut("paths").and_then(|v| v.as_array_mut()) {
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        let mut dedup: Vec<serde_json::Value> = Vec::new();
+                        for it in arr.iter() {
+                            if let Some(s) = it.as_str() {
+                                if seen.insert(s.to_string()) {
+                                    dedup.push(it.clone());
+                                }
+                            }
+                        }
+                        *arr = dedup;
+                        new_len = Some(arr.len());
+                    }
+                    if let Some(n) = new_len {
+                        dump_obj.insert("written".to_string(), json!(n as u64));
+                    }
+                }
+            }
+
+            // Optional: auto-generate a durable SMT repro bundle.
+            if let Some(p) = smt_repro_dir_opt.as_ref() {
+                let base = if p.is_absolute() {
+                    p.clone()
+                } else {
+                    repo_root.join(p)
+                };
+                let dir = if base.join("tree_search.json").exists() {
+                    let ts_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_else(|_| StdDuration::from_millis(0))
+                        .as_millis();
+                    base.join(format!("run_{ts_ms}"))
+                } else {
+                    base
+                };
+                let _ = std::fs::create_dir_all(&dir);
+
+                // Always write the full tree-search JSON into the bundle (so it's self-contained),
+                // even if `--output-json` is not set.
+                let tree_search_path = dir.join("tree_search.json");
+                let _ = write_json(&tree_search_path, &out);
+
+                let pp_dump = goal_dump_v
+                    .as_ref()
+                    .and_then(|gd| gd.get("pp_dump"))
+                    .cloned();
+
+                let mut smt_repro_status = json!({
+                    "dir": dir.display().to_string(),
+                    "tree_search_json": tree_search_path.display().to_string(),
+                    "ok": false,
+                    "note": "no_goal_dump",
+                });
+
+                if let Some(pp_dump) = pp_dump {
+                    let smt2_path = dir.join("repro.smt2");
+                    let proof_path = dir.join("repro.sexp");
+                    let smt_repro_json = dir.join("smt_repro.json");
+
+                    // Reuse the same core logic as `smt-repro` (inline, bounded).
+                    let timeout_ms = smt_timeout_ms;
+                    let seed = smt_seed;
+                    let depth = smt_depth;
+                    let proof_max_chars = smt_proof_dump_max_chars;
+
+                    let smt2 =
+                        plc::smt_lia::smt2_script_from_pp_dump(&pp_dump, timeout_ms, seed, depth);
+                    let smt2_has = smt2.is_some();
+                    if let Some(s) = smt2.as_ref() {
+                        let _ = std::fs::write(&smt2_path, s.as_bytes());
+                    }
+                    let proof = plc::smt_lia::unsat_proof_from_pp_dump(
+                        &pp_dump,
+                        timeout_ms,
+                        seed,
+                        depth,
+                        proof_max_chars,
+                    );
+
+                    // Write proof only when not truncated.
+                    let mut proof_written = false;
+                    if let Ok(Some(pf)) = proof.as_ref() {
+                        let preview = pf.get("preview").and_then(|v| v.as_str()).unwrap_or("");
+                        let total_chars =
+                            pf.get("chars").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let preview_chars = preview.chars().count();
+                        if total_chars <= proof_max_chars && preview_chars == total_chars {
+                            let _ = std::fs::write(&proof_path, preview.as_bytes());
+                            proof_written = true;
+                        }
+                    }
+                    let smt2_text = smt2.clone().unwrap_or_else(|| "".to_string());
+
+                    let out2 = json!({
+                        "ok": true,
+                        "kind": "smt_repro",
+                        "input_json": tree_search_path.display().to_string(),
+                        "solver": plc::smt_lia::smt_solver_probe(),
+                        "params": {
+                            "timeout_ms": timeout_ms,
+                            "seed": seed,
+                            "depth": depth,
+                            "proof_max_chars": proof_max_chars,
+                        },
+                        "artifacts": {
+                            "smt2_written": if smt2_has { serde_json::Value::String(smt2_path.display().to_string()) } else { serde_json::Value::Null },
+                            "proof_written": if proof_written { serde_json::Value::String(proof_path.display().to_string()) } else { serde_json::Value::Null },
+                        },
+                        "smt2": smt2_text,
+                        "proof": match proof {
+                            Ok(pf) => pf.unwrap_or(serde_json::Value::Null),
+                            Err(e) => json!({"error": truncate_str(&e, 400)}),
+                        }
+                    });
+                    let _ = write_json(&smt_repro_json, &out2);
+                    smt_repro_status = json!({
+                        "dir": dir.display().to_string(),
+                        "tree_search_json": tree_search_path.display().to_string(),
+                        "smt_repro_json": smt_repro_json.display().to_string(),
+                        "smt2": if smt2_has { smt2_path.display().to_string() } else { "".to_string() },
+                        "proof": if proof_written { proof_path.display().to_string() } else { "".to_string() },
+                        "ok": true,
+                        "note": serde_json::Value::Null
+                    });
+                }
+
+                if let Some(obj) = out.as_object_mut() {
+                    if let Some(cfg) = obj.get_mut("config").and_then(|v| v.as_object_mut()) {
+                        cfg.insert(
+                            "smt_repro_dir".to_string(),
+                            json!({
+                                "value": dir.display().to_string(),
+                                "source": smt_repro_dir_source
+                            }),
+                        );
+                    }
+                    if let Some(art) = obj.get_mut("artifacts").and_then(|v| v.as_object_mut()) {
+                        art.insert("smt_repro".to_string(), smt_repro_status);
+                    }
+                }
+            }
+
             if let Some(p) = output_json {
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "tree_search_nearest",
+                        "result_kind": out["result_kind"],
+                    })
+                    .to_string()
+                );
+            } else {
+                println!("{}", out.to_string());
+            }
+            Ok(())
+        }
+
+        "smt-repro" => {
+            let input_json = arg_value(rest, "--input-json")
+                .ok_or_else(|| "missing --input-json".to_string())?;
+            let timeout_ms = arg_u64(rest, "--timeout-ms")
+                .unwrap_or(5_000)
+                .clamp(0, 600_000);
+            let seed = arg_u64(rest, "--seed").unwrap_or(0);
+            let depth = arg_u64(rest, "--depth").unwrap_or(0).clamp(0, 64) as usize;
+            let emit_smt2 = arg_value(rest, "--emit-smt2").map(PathBuf::from);
+            let emit_proof = arg_value(rest, "--emit-proof").map(PathBuf::from);
+            let bundle_dir = arg_value(rest, "--bundle-dir").map(PathBuf::from);
+            let proof_max_chars = arg_u64(rest, "--proof-max-chars")
+                .unwrap_or(200_000)
+                .clamp(0, 5_000_000) as usize;
+            let output_json = arg_value(rest, "--output-json").map(PathBuf::from);
+
+            let input_label = input_json.clone();
+            let input_text = if input_json == "-" {
+                let mut s = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut s)
+                    .map_err(|e| format!("read stdin: {e}"))?;
+                s
+            } else {
+                let p = PathBuf::from(&input_json);
+                std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?
+            };
+            let v = serde_json::from_str::<serde_json::Value>(&input_text)
+                .map_err(|e| format!("json parse {input_label}: {e}"))?;
+
+            // Accept a few shapes:
+            // - a raw `pp_dump` with key `goals`
+            // - a `goal_dump` record with key `pp_dump`
+            // - a full `tree-search-nearest` output with key `goal_dump.pp_dump`
+            let pp_dump = if v.get("goals").and_then(|x| x.as_array()).is_some() {
+                v.clone()
+            } else if let Some(pp) = v.get("pp_dump") {
+                pp.clone()
+            } else if let Some(pp) = v.get("goal_dump").and_then(|gd| gd.get("pp_dump")) {
+                pp.clone()
+            } else {
+                return Err("input json must contain a `pp_dump` (or be a `tree-search-nearest` output with `goal_dump.pp_dump`)".to_string());
+            };
+
+            // Optional bundle dir: write a full capsule (pp_dump + outputs + manifest).
+            let mut emit_smt2 = emit_smt2;
+            let mut emit_proof = emit_proof;
+            let mut output_json = output_json;
+            if let Some(dir) = bundle_dir.as_ref() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("failed to create dir {}: {e}", dir.display()))?;
+                if output_json.is_none() {
+                    output_json = Some(dir.join("smt_repro.json"));
+                }
+                if emit_smt2.is_none() {
+                    emit_smt2 = Some(dir.join("repro.smt2"));
+                }
+                if emit_proof.is_none() {
+                    emit_proof = Some(dir.join("repro.sexp"));
+                }
+            }
+
+            let solver_probe = plc::smt_lia::smt_solver_probe();
+            let smt2 = plc::smt_lia::smt2_script_from_pp_dump(&pp_dump, timeout_ms, seed, depth);
+            let proof = plc::smt_lia::unsat_proof_from_pp_dump(
+                &pp_dump,
+                timeout_ms,
+                seed,
+                depth,
+                proof_max_chars,
+            );
+
+            // Optional artifacts.
+            let mut smt2_written: Option<String> = None;
+            if let (Some(path), Some(s)) = (emit_smt2.as_ref(), smt2.as_ref()) {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
+                }
+                std::fs::write(path, s.as_bytes())
+                    .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+                smt2_written = Some(path.display().to_string());
+            }
+
+            let mut proof_written: Option<String> = None;
+            if let Some(path) = emit_proof.as_ref() {
+                // Only write if we have the full proof text (avoid writing a likely-invalid truncated sexp).
+                let pf_ok = proof.as_ref().ok().and_then(|x| x.as_ref()).and_then(|pf| {
+                    let preview = pf.get("preview")?.as_str()?;
+                    let chars = pf.get("chars")?.as_u64()? as usize;
+                    let preview_chars = preview.chars().count();
+                    if chars <= proof_max_chars && preview_chars == chars {
+                        Some(preview.to_string())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(txt) = pf_ok {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            format!("failed to create dir {}: {e}", parent.display())
+                        })?;
+                    }
+                    std::fs::write(path, txt.as_bytes())
+                        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+                    proof_written = Some(path.display().to_string());
+                }
+            }
+
+            let goals_n = pp_dump
+                .get("goals")
+                .and_then(|g| g.as_array())
+                .map(|g| g.len())
+                .unwrap_or(0);
+            let result_kind =
+                if solver_probe.get("available").and_then(|v| v.as_bool()) != Some(true) {
+                    "solver_unavailable"
+                } else if smt2.is_some() {
+                    "ok"
+                } else {
+                    "no_entailment"
+                };
+            let note = match result_kind {
+                "solver_unavailable" => "no SMT solver detected by probe",
+                "no_entailment" => {
+                    "pp_dump parsed, but the goal does not look like a supported SMT-LIA entailment"
+                }
+                _ => "",
+            };
+
+            let capsule = if let Some(dir) = bundle_dir.as_ref() {
+                // Always write pp_dump.json (even if no entailment).
+                let pp_path = dir.join("pp_dump.json");
+                write_json(&pp_path, &pp_dump)?;
+
+                // Write a small manifest with stable identifiers (hashes) and environment notes.
+                let pp_bytes = serde_json::to_vec(&pp_dump)
+                    .map_err(|e| format!("failed to encode pp_dump for hashing: {e}"))?;
+                let smt2_sha256 = smt2.as_ref().map(|s| sha256_hex(s.as_bytes()));
+                let proof_sha256 = proof
+                    .as_ref()
+                    .ok()
+                    .and_then(|x| x.as_ref())
+                    .and_then(|pf| pf.get("preview").and_then(|v| v.as_str()))
+                    .map(|s| sha256_hex(s.as_bytes()));
+                let manifest = json!({
+                    "kind": "proofpatch_smt_capsule",
+                    "tool": {
+                        "proofpatch_cli_version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "input": {
+                        "input_json": input_label,
+                        "pp_dump_path": pp_path.display().to_string(),
+                        "pp_dump_sha256": sha256_hex(&pp_bytes),
+                        "pp_dump_goals": goals_n,
+                    },
+                    "params": {
+                        "timeout_ms": timeout_ms,
+                        "seed": seed,
+                        "depth": depth,
+                        "proof_max_chars": proof_max_chars,
+                    },
+                    "solver": solver_probe,
+                    "result": {
+                        "result_kind": result_kind,
+                        "note": if note.is_empty() { serde_json::Value::Null } else { json!(note) },
+                        "smt2_sha256": smt2_sha256,
+                        "proof_sha256": proof_sha256,
+                    }
+                });
+                let manifest_path = dir.join("manifest.json");
+                write_json(&manifest_path, &manifest)?;
+                json!({
+                    "bundle_dir": dir.display().to_string(),
+                    "pp_dump": pp_path.display().to_string(),
+                    "manifest": manifest_path.display().to_string(),
+                })
+            } else {
+                serde_json::Value::Null
+            };
+
+            let out = json!({
+                "ok": true,
+                "kind": "smt_repro",
+                "result_kind": result_kind,
+                "input_json": input_label,
+                "solver": solver_probe,
+                "params": {
+                    "timeout_ms": timeout_ms,
+                    "seed": seed,
+                    "depth": depth,
+                    "proof_max_chars": proof_max_chars,
+                },
+                "pp_dump": {
+                    "goals": goals_n,
+                },
+                "note": if note.is_empty() { serde_json::Value::Null } else { json!(note) },
+                "capsule": capsule,
+                "artifacts": {
+                    "smt2_requested": emit_smt2.as_ref().map(|p| p.display().to_string()),
+                    "smt2_written": smt2_written,
+                    "proof_requested": emit_proof.as_ref().map(|p| p.display().to_string()),
+                    "proof_written": proof_written,
+                },
+                "smt2": smt2.unwrap_or_else(|| "".to_string()),
+                "proof": match proof {
+                    Ok(pf) => pf.unwrap_or(serde_json::Value::Null),
+                    Err(e) => json!({"error": truncate_str(&e, 400)}),
+                }
+            });
+
+            if let Some(p) = output_json {
+                write_json(&p, &out)?;
+                println!(
+                    "{}",
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "smt_repro",
+                        "result_kind": out["result_kind"],
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -6287,7 +10526,13 @@ Constraints:
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "suggest",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -6397,7 +10642,13 @@ Constraints:
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "loop",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -6474,7 +10725,13 @@ Constraints:
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "review_prompt",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -6692,7 +10949,13 @@ Constraints:
                     write_json(&p, &out)?;
                     println!(
                         "{}",
-                        json!({"ok": true, "written": p.display().to_string()}).to_string()
+                        json!({
+                            "ok": true,
+                            "written": p.display().to_string(),
+                            "kind": "review_diff",
+                            "result_kind": serde_json::Value::Null,
+                        })
+                        .to_string()
                     );
                 } else {
                     println!("{}", out.to_string());
@@ -6726,7 +10989,13 @@ Constraints:
                     write_json(&p, &out)?;
                     println!(
                         "{}",
-                        json!({"ok": true, "written": p.display().to_string()}).to_string()
+                        json!({
+                            "ok": true,
+                            "written": p.display().to_string(),
+                            "kind": "review_diff",
+                            "result_kind": serde_json::Value::Null,
+                        })
+                        .to_string()
                     );
                 } else {
                     println!("{}", out.to_string());
@@ -6858,7 +11127,13 @@ Constraints:
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "review_diff",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -6964,7 +11239,13 @@ Constraints:
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "llm_chat",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -7411,6 +11692,7 @@ Constraints:
             let nearby_lines = arg_u64(rest, "--nearby-lines").unwrap_or(80) as usize;
             let max_nearby = arg_u64(rest, "--max-nearby").unwrap_or(30) as usize;
             let max_imports = arg_u64(rest, "--max-imports").unwrap_or(50) as usize;
+            let output_json = arg_value(rest, "--output-json").map(PathBuf::from);
 
             let repo_root =
                 plc::find_lean_repo_root(&repo_root).map_err(|e| format!("repo_root: {e}"))?;
@@ -7426,7 +11708,85 @@ Constraints:
             )?;
             let out = serde_json::to_value(pack)
                 .map_err(|e| format!("failed to serialize context pack: {e}"))?;
-            println!("{}", out.to_string());
+            if let Some(p) = output_json {
+                write_json(&p, &out)?;
+                println!(
+                    "{}",
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "context_pack",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
+                );
+            } else {
+                println!("{}", out.to_string());
+            }
+            Ok(())
+        }
+
+        "scratch-lemma" => {
+            let repo_root = arg_value(rest, "--repo")
+                .ok_or_else(|| "missing --repo".to_string())
+                .map(PathBuf::from)?;
+            let file = arg_value(rest, "--file").ok_or_else(|| "missing --file".to_string())?;
+            let name = arg_value(rest, "--name").ok_or_else(|| "missing --name".to_string())?;
+            let kind = arg_value(rest, "--kind").unwrap_or_else(|| "theorem".to_string());
+            if kind != "theorem" && kind != "lemma" {
+                return Err("--kind must be theorem or lemma".to_string());
+            }
+            let out_rel = arg_value(rest, "--out")
+                .unwrap_or_else(|| format!(".generated/{}_Scratch.lean", name.replace('.', "_")));
+
+            let repo_root =
+                plc::find_lean_repo_root(&repo_root).map_err(|e| format!("repo_root: {e}"))?;
+
+            // Minimal, reliable scratch template for “work backwards” iterations.
+            // `file` can be either:
+            // - a `.lean` path (e.g. `GeometryOfNumbers/Computable/LLLExactTermination.lean`), or
+            // - an import module path (e.g. `GeometryOfNumbers.Computable.LLLExactTermination`).
+            let import_mod = if file.ends_with(".lean") || file.contains('/') || file.contains('\\')
+            {
+                file.trim_end_matches(".lean")
+                    .replace(['/', '\\'], ".")
+                    .trim_matches('.')
+                    .to_string()
+            } else {
+                file.trim_matches('.').to_string()
+            };
+            let mut txt = String::new();
+            txt.push_str(&format!("import {import_mod}\n\n"));
+            txt.push_str("namespace ProofpatchScratch\n\n");
+            txt.push_str("/-- Scratch lemma scaffold.\n\n");
+            txt.push_str("Replace the statement and proof, but keep a `sorry` while iterating.\n");
+            txt.push_str("-/\n");
+            txt.push_str(&format!("{kind} {name}_scratch : True := by\n"));
+            txt.push_str("  sorry\n\n");
+            txt.push_str("end ProofpatchScratch\n");
+
+            let out_abs = repo_root.join(&out_rel);
+            if let Some(parent) = out_abs.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&out_abs, txt.as_bytes())
+                .map_err(|e| format!("write {}: {e}", out_abs.display()))?;
+
+            println!(
+                "{}",
+                json!({
+                    "ok": true,
+                    "kind": "scratch_lemma",
+                    "repo_root": repo_root.display().to_string(),
+                    "source_file": file,
+                    "import_mod": import_mod,
+                    "name": name,
+                    "out_rel": out_rel,
+                    "out_abs": out_abs.display().to_string(),
+                })
+                .to_string()
+            );
             Ok(())
         }
 
@@ -7435,6 +11795,7 @@ Constraints:
             let max_results = arg_u64(rest, "--max-results").unwrap_or(8).clamp(1, 50) as usize;
             let timeout_ms = arg_u64(rest, "--timeout-ms").unwrap_or(20_000);
             let must_include = arg_values(rest, "--must-include");
+            let must_include_all = arg_values(rest, "--must-include-all");
             let llm_summary = arg_flag(rest, "--llm-summary");
             let llm_timeout_s = arg_u64(rest, "--llm-timeout-s").unwrap_or(20);
             let quiet = arg_flag(rest, "--quiet");
@@ -7453,20 +11814,35 @@ Constraints:
             // If the user didn't specify a filter but the query looks LLL-ish, filter automatically.
             let mut must: Vec<String> = must_include;
             let ql = query.to_lowercase();
-            if must.is_empty() && (ql.contains("lll") || ql.contains("lenstra") || ql.contains("lovasz")) {
-                must = vec!["lll".into(), "lenstra".into(), "lovasz".into(), "lattice".into()];
+            if must.is_empty()
+                && (ql.contains("lll") || ql.contains("lenstra") || ql.contains("lovasz"))
+            {
+                must = vec![
+                    "lll".into(),
+                    "lenstra".into(),
+                    "lovasz".into(),
+                    "lattice".into(),
+                ];
             }
-            let papers: Vec<plc::arxiv::ArxivPaper> = if must.is_empty() {
-                papers
-            } else {
-                let must_l: Vec<String> = must.iter().map(|s| s.to_lowercase()).collect();
-                papers
-                    .into_iter()
-                    .filter(|p| {
-                        let hay = format!("{}\n{}", p.title, p.abstract_text).to_lowercase();
-                        must_l.iter().any(|tok| hay.contains(tok))
-                    })
-                    .collect()
+            let papers: Vec<plc::arxiv::ArxivPaper> = {
+                let must_any_l: Vec<String> = must.iter().map(|s| s.to_lowercase()).collect();
+                let must_all_l: Vec<String> =
+                    must_include_all.iter().map(|s| s.to_lowercase()).collect();
+                if must_any_l.is_empty() && must_all_l.is_empty() {
+                    papers
+                } else {
+                    papers
+                        .into_iter()
+                        .filter(|p| {
+                            let hay = format!("{}\n{}", p.title, p.abstract_text).to_lowercase();
+                            let ok_any = must_any_l.is_empty()
+                                || must_any_l.iter().any(|tok| hay.contains(tok));
+                            let ok_all = must_all_l.is_empty()
+                                || must_all_l.iter().all(|tok| hay.contains(tok));
+                            ok_any && ok_all
+                        })
+                        .collect()
+                }
             };
 
             let mut out = json!({
@@ -7474,7 +11850,7 @@ Constraints:
                 "kind": "arxiv_search",
                 "query": query,
                 "max_results": max_results,
-                "filter": { "must_include_any": must },
+                "filter": { "must_include_any": must, "must_include_all": must_include_all },
                 "papers": papers,
                 // A minimal envelope compatible with `research-ingest`.
                 "research": {
@@ -7550,7 +11926,16 @@ Constraints:
 
             if let Some(p) = output_json {
                 write_json(&p, &out)?;
-                println!("{}", json!({"ok": true, "written": p.display().to_string()}).to_string());
+                println!(
+                    "{}",
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "arxiv_search",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
+                );
             } else {
                 println!("{}", out.to_string());
             }
@@ -7572,33 +11957,46 @@ Constraints:
             // Ensure keys are visible from either <repo>/.env or dev/.env.
             plc::load_dotenv_smart(&repo_root);
 
-            let cfg = plc::config::load_from_repo_root(&repo_root)?
-                .ok_or_else(|| format!("missing config: {}", plc::config::config_path(&repo_root).display()))?;
-            let preset = cfg
-                .research
-                .resolve_preset(&preset_name)
-                .ok_or_else(|| {
-                    let mut names: Vec<String> = cfg.research.presets.keys().cloned().collect();
-                    names.sort();
-                    format!(
-                        "unknown preset: {} (available: {})",
-                        preset_name,
-                        names.join(", ")
-                    )
-                })?;
+            let cfg = plc::config::load_from_repo_root(&repo_root)?.ok_or_else(|| {
+                format!(
+                    "missing config: {}",
+                    plc::config::config_path(&repo_root).display()
+                )
+            })?;
+            let preset = cfg.research.resolve_preset(&preset_name).ok_or_else(|| {
+                let mut names: Vec<String> = cfg.research.presets.keys().cloned().collect();
+                names.sort();
+                format!(
+                    "unknown preset: {} (available: {})",
+                    preset_name,
+                    names.join(", ")
+                )
+            })?;
 
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
 
-            let mut papers = rt.block_on(plc::arxiv::arxiv_search(
+            // Best-effort: if arXiv fetch fails, still write a structured artifact when
+            // `--output-json` is set (and return a non-zero exit via `Err(...)`).
+            let arxiv_res = rt.block_on(plc::arxiv::arxiv_search(
                 &preset.query,
                 preset.max_results,
                 StdDuration::from_millis(preset.timeout_ms),
-            ))?;
+            ));
+            let (mut papers, arxiv_error): (Vec<plc::arxiv::ArxivPaper>, Option<String>) =
+                match arxiv_res {
+                    Ok(p) => (p, None),
+                    Err(e) => (vec![], Some(format!("{e}"))),
+                };
 
-            if !preset.must_include_any.is_empty() {
-                let must_l: Vec<String> = preset
+            if !preset.must_include_any.is_empty() || !preset.must_include_all.is_empty() {
+                let must_any_l: Vec<String> = preset
                     .must_include_any
+                    .iter()
+                    .map(|s| s.to_lowercase())
+                    .collect();
+                let must_all_l: Vec<String> = preset
+                    .must_include_all
                     .iter()
                     .map(|s| s.to_lowercase())
                     .collect();
@@ -7606,24 +12004,29 @@ Constraints:
                     .into_iter()
                     .filter(|p| {
                         let hay = format!("{}\n{}", p.title, p.abstract_text).to_lowercase();
-                        must_l.iter().any(|tok| hay.contains(tok))
+                        let ok_any =
+                            must_any_l.is_empty() || must_any_l.iter().any(|tok| hay.contains(tok));
+                        let ok_all =
+                            must_all_l.is_empty() || must_all_l.iter().all(|tok| hay.contains(tok));
+                        ok_any && ok_all
                     })
                     .collect();
             }
 
             let mut out = json!({
-                "ok": true,
+                "ok": arxiv_error.is_none(),
                 "kind": "research_auto",
                 "repo_root": repo_root.display().to_string(),
                 "config_path": plc::config::config_path(&repo_root).display().to_string(),
                 "preset": preset_name,
                 "settings": preset,
                 "arxiv": {
-                    "ok": true,
+                    "ok": arxiv_error.is_none(),
+                    "error": arxiv_error,
                     "kind": "arxiv_search",
                     "query": preset.query,
                     "max_results": preset.max_results,
-                    "filter": { "must_include_any": preset.must_include_any },
+                    "filter": { "must_include_any": preset.must_include_any, "must_include_all": preset.must_include_all },
                     "papers": papers,
                     "research": {
                         "tool": "arxiv",
@@ -7642,7 +12045,8 @@ Constraints:
                 }
             });
 
-            if preset.llm_summary {
+            // Only attempt an LLM summary if we successfully fetched papers.
+            if preset.llm_summary && out["arxiv"]["ok"].as_bool().unwrap_or(false) {
                 let kind = preset
                     .llm_summary_kind
                     .as_deref()
@@ -7655,25 +12059,47 @@ Constraints:
                 }))
                 .unwrap_or_else(|_| "{\"papers\":[]}".to_string());
                 let res = match normalize_summary_kind(kind).as_str() {
-                    "formalization_v2" => rt.block_on(plc::llm::chat_completion_structured::<ResearchSummaryV2>(
-                        &system,
-                        &user,
-                        StdDuration::from_secs(preset.llm_timeout_s),
-                    )).map(|r| {
-                        let capped = cap_summary_v2(r.value, &preset);
-                        // Erase the type into JSON for downstream consumption.
-                        let v = serde_json::to_value(&capped).unwrap_or(serde_json::Value::Null);
-                        (r.provider, r.model, r.model_source, r.model_env, r.mode, v, r.raw)
-                    }),
-                    _ => rt.block_on(plc::llm::chat_completion_structured::<ResearchSummary>(
-                        &system,
-                        &user,
-                        StdDuration::from_secs(preset.llm_timeout_s),
-                    )).map(|r| {
-                        let capped = cap_summary_v1(r.value, &preset);
-                        let v = serde_json::to_value(&capped).unwrap_or(serde_json::Value::Null);
-                        (r.provider, r.model, r.model_source, r.model_env, r.mode, v, r.raw)
-                    }),
+                    "formalization_v2" => rt
+                        .block_on(plc::llm::chat_completion_structured::<ResearchSummaryV2>(
+                            &system,
+                            &user,
+                            StdDuration::from_secs(preset.llm_timeout_s),
+                        ))
+                        .map(|r| {
+                            let capped = cap_summary_v2(r.value, &preset);
+                            // Erase the type into JSON for downstream consumption.
+                            let v =
+                                serde_json::to_value(&capped).unwrap_or(serde_json::Value::Null);
+                            (
+                                r.provider,
+                                r.model,
+                                r.model_source,
+                                r.model_env,
+                                r.mode,
+                                v,
+                                r.raw,
+                            )
+                        }),
+                    _ => rt
+                        .block_on(plc::llm::chat_completion_structured::<ResearchSummary>(
+                            &system,
+                            &user,
+                            StdDuration::from_secs(preset.llm_timeout_s),
+                        ))
+                        .map(|r| {
+                            let capped = cap_summary_v1(r.value, &preset);
+                            let v =
+                                serde_json::to_value(&capped).unwrap_or(serde_json::Value::Null);
+                            (
+                                r.provider,
+                                r.model,
+                                r.model_source,
+                                r.model_env,
+                                r.mode,
+                                v,
+                                r.raw,
+                            )
+                        }),
                 };
                 match res {
                     Ok((provider, model, model_source, model_env, mode, v, raw)) => {
@@ -7712,11 +12138,26 @@ Constraints:
 
             if let Some(p) = output_json {
                 write_json(&p, &out)?;
-                println!("{}", json!({"ok": true, "written": p.display().to_string()}).to_string());
+                println!(
+                    "{}",
+                    json!({
+                        "ok": out["ok"].as_bool().unwrap_or(false),
+                        "written": p.display().to_string(),
+                        "error": out["arxiv"]["error"],
+                    })
+                    .to_string()
+                );
             } else {
                 println!("{}", out.to_string());
             }
-            Ok(())
+            if out["ok"].as_bool().unwrap_or(false) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "arxiv fetch: {}",
+                    out["arxiv"]["error"].as_str().unwrap_or("unknown error")
+                ))
+            }
         }
 
         "research-ingest" => {
@@ -7736,7 +12177,13 @@ Constraints:
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "research_ingest",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());
@@ -7771,7 +12218,13 @@ Constraints:
                 write_json(&p, &out)?;
                 println!(
                     "{}",
-                    json!({"ok": true, "written": p.display().to_string()}).to_string()
+                    json!({
+                        "ok": true,
+                        "written": p.display().to_string(),
+                        "kind": "research_attach",
+                        "result_kind": serde_json::Value::Null,
+                    })
+                    .to_string()
                 );
             } else {
                 println!("{}", out.to_string());

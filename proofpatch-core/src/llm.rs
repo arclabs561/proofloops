@@ -571,7 +571,9 @@ where
                 mode = "content_extract".to_string();
                 serde_json::from_value(vv).map_err(|e| format!("structured json decode: {e}"))?
             } else {
-                return Err(format!("structured tool-calling failed ({e}); content parse also failed"));
+                return Err(format!(
+                    "structured tool-calling failed ({e}); content parse also failed"
+                ));
             };
             return Ok(StructuredChatResult {
                 provider: done.provider,

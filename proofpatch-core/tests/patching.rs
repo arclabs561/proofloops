@@ -80,3 +80,41 @@ def b : Nat := sorry\n";
     assert!(locs[0].line_text.contains("def a"));
     assert!(locs[1].line_text.contains("def b"));
 }
+
+#[test]
+fn extract_try_this_suggestions_parses_inline_form() {
+    let out = r#"
+some log noise
+Try this: exact foo a b
+more noise
+"#;
+    let xs = plc::extract_try_this_suggestions(out);
+    assert_eq!(xs, vec!["exact foo a b".to_string()]);
+}
+
+#[test]
+fn extract_try_this_suggestions_parses_block_form_with_tag() {
+    let out = r#"
+Try this:
+  [apply] refine bar ?_
+another line
+"#;
+    let xs = plc::extract_try_this_suggestions(out);
+    assert_eq!(xs, vec!["refine bar ?_".to_string()]);
+}
+
+#[test]
+fn extract_try_this_suggestions_parses_multiline_block() {
+    let out = r#"
+Try this:
+  refine And.intro ?_ ?_
+  · exact ha
+  · exact hb
+unrelated
+"#;
+    let xs = plc::extract_try_this_suggestions(out);
+    assert_eq!(
+        xs,
+        vec![["refine And.intro ?_ ?_", "· exact ha", "· exact hb"].join("\n")]
+    );
+}

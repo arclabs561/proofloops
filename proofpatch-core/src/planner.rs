@@ -85,7 +85,9 @@ pub async fn plan(
     evidence_json: &str,
     timeout: std::time::Duration,
 ) -> Result<(PlannerDecision, String), String> {
-    let done = crate::llm::chat_completion_structured::<PlannerDecision>(system, evidence_json, timeout).await?;
+    let done =
+        crate::llm::chat_completion_structured::<PlannerDecision>(system, evidence_json, timeout)
+            .await?;
     let json = serde_json::to_string(&done.value)
         .map_err(|e| format!("planner json encode failed: {e}"))?;
     Ok((done.value, json))

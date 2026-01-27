@@ -62,11 +62,95 @@ pub fn hash_state_key(pp_dump: &Value) -> Option<u64> {
     Some(hash_text(&s))
 }
 
+/// Replace `old` with `new` once inside a 1-based, inclusive line region.
+///
+/// Returns `None` if:
+/// - the region is out of bounds
+/// - `old` does not occur exactly once inside the region
+///
+/// Note: this is deliberately *text-based* (not Lean-aware). It is intended for small,
+/// best-effort postprocessing steps (e.g. determinizing `exact?` into a concrete `exact foo ...`)
+/// without accidentally rewriting other occurrences elsewhere in the file.
+pub fn replace_in_region_once(
+    text: &str,
+    start_line: usize,
+    end_line: usize,
+    old: &str,
+    new: &str,
+) -> Option<String> {
+    if start_line == 0 || end_line == 0 || end_line < start_line {
+        return None;
+    }
+    if old.is_empty() || old == new {
+        return None;
+    }
+    // `split('\n')` preserves a trailing empty segment when `text` ends with '\n'.
+    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let start0 = start_line - 1;
+    let end0 = end_line - 1;
+    if start0 >= lines.len() || end0 >= lines.len() {
+        return None;
+    }
+    let region = lines[start0..=end0].join("\n");
+    if region.matches(old).count() != 1 {
+        return None;
+    }
+    let region2 = region.replacen(old, new, 1);
+    let new_region_lines: Vec<String> = region2.split('\n').map(|s| s.to_string()).collect();
+    lines.splice(start0..=end0, new_region_lines);
+    Some(lines.join("\n"))
+}
+
+/// Replace the first occurrence of `old` with `new` inside a 1-based, inclusive line region.
+///
+/// Returns `None` if:
+/// - the region is out of bounds
+/// - `old` does not occur inside the region
+pub fn replace_in_region_first(
+    text: &str,
+    start_line: usize,
+    end_line: usize,
+    old: &str,
+    new: &str,
+) -> Option<String> {
+    if start_line == 0 || end_line == 0 || end_line < start_line {
+        return None;
+    }
+    if old.is_empty() || old == new {
+        return None;
+    }
+    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let start0 = start_line - 1;
+    let end0 = end_line - 1;
+    if start0 >= lines.len() || end0 >= lines.len() {
+        return None;
+    }
+    let region = lines[start0..=end0].join("\n");
+    if !region.contains(old) {
+        return None;
+    }
+    let region2 = region.replacen(old, new, 1);
+    let new_region_lines: Vec<String> = region2.split('\n').map(|s| s.to_string()).collect();
+    lines.splice(start0..=end0, new_region_lines);
+    Some(lines.join("\n"))
+}
+
 pub fn default_det_candidates() -> Vec<String> {
     vec![
         // Cheap first.
         "by\n  (simp; done)".to_string(),
         "by\n  classical\n  (simp; done)".to_string(),
+        // Common algebraic normalization pattern: expand squares, then ring.
+        // This is generic (not repo-specific) and frequently closes “sum of squares” equalities.
+        "by\n  simp [pow_two]; ring".to_string(),
+        // Cast-bridging (common in arithmetic-heavy developments like geometry-of-numbers).
+        "by\n  (norm_cast; done)".to_string(),
         // Heavier automation.
         "by\n  aesop".to_string(),
         "by\n  classical\n  aesop".to_string(),

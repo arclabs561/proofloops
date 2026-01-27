@@ -263,20 +263,45 @@ impl Tool for ProofpatchTool {
     }
 
     fn schema(&self) -> Value {
-        json!({
+        // Discriminated union on `action` so clients can validate arguments.
+        let actions: Vec<(&str, Value)> = vec![
+            ("triage_file", ProofpatchTriageFileTool.schema()),
+            (
+                "tree_search_nearest",
+                ProofpatchTreeSearchNearestTool.schema(),
+            ),
+            ("context_pack", ProofpatchContextPackTool.schema()),
+            ("verify_summary", ProofpatchVerifySummaryTool.schema()),
+            ("locate_sorries", ProofpatchLocateSorriesTool.schema()),
+            ("patch_nearest", ProofpatchPatchNearestTool.schema()),
+            ("patch_region", ProofpatchPatchRegionTool.schema()),
+        ];
+
+        let mut one_of: Vec<Value> = Vec::new();
+        one_of.push(json!({
             "type": "object",
             "properties": {
-                "action": {
-                    "type": "string",
-                    "description": "One of: triage_file, tree_search_nearest, context_pack, verify_summary, locate_sorries, patch_nearest, patch_region"
-                },
-                "arguments": {
-                    "type": "object",
-                    "description": "Arguments for the chosen action (same shape as the underlying tool).",
-                    "default": {}
-                }
+                "action": { "const": "describe" },
+                "arguments": { "type": "object", "default": {} }
             },
             "required": ["action"]
+        }));
+
+        for (name, schema) in actions {
+            one_of.push(json!({
+                "type": "object",
+                "properties": {
+                    "action": { "const": name },
+                    "arguments": schema
+                },
+                "required": ["action", "arguments"]
+            }));
+        }
+
+        json!({
+            "type": "object",
+            "description": "Unified entrypoint for proofpatch (dispatches to sub-actions). Use action=describe to discover per-action schemas.",
+            "oneOf": one_of
         })
     }
 
@@ -284,6 +309,35 @@ impl Tool for ProofpatchTool {
         let action = extract_string(args, "action")?.trim().to_lowercase();
         let sub = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
         match action.as_str() {
+            "describe" => {
+                // Return action->schema so clients can discover per-action arguments while
+                // keeping the exposed MCP tool list minimal.
+                let schemas = json!({
+                    "describe": ProofpatchTool.schema(),
+                    "triage_file": ProofpatchTriageFileTool.schema(),
+                    "tree_search_nearest": ProofpatchTreeSearchNearestTool.schema(),
+                    "context_pack": ProofpatchContextPackTool.schema(),
+                    "verify_summary": ProofpatchVerifySummaryTool.schema(),
+                    "locate_sorries": ProofpatchLocateSorriesTool.schema(),
+                    "patch_nearest": ProofpatchPatchNearestTool.schema(),
+                    "patch_region": ProofpatchPatchRegionTool.schema(),
+                });
+                Ok(json!({
+                    "ok": true,
+                    "kind": "proofpatch_describe",
+                    "actions": [
+                        "describe",
+                        "triage_file",
+                        "tree_search_nearest",
+                        "context_pack",
+                        "verify_summary",
+                        "locate_sorries",
+                        "patch_nearest",
+                        "patch_region"
+                    ],
+                    "schemas": schemas
+                }))
+            }
             "triage_file" => ProofpatchTriageFileTool.call(&sub).await,
             "tree_search_nearest" => ProofpatchTreeSearchNearestTool.call(&sub).await,
             "context_pack" => ProofpatchContextPackTool.call(&sub).await,
@@ -767,7 +821,12 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                 "smt_precheck": {
                     "type": "boolean",
                     "default": false,
-                    "description": "If true, run a best-effort SMT (QF_LIA) entailment check on hyps ⇒ target and prioritize arithmetic tactics when it succeeds."
+                    "description": "Deprecated. Use smt_mode=on|auto|off. If true, forces smt_mode=on; if false, forces smt_mode=off."
+                },
+                "smt_mode": {
+                    "type": "string",
+                    "default": "auto",
+                    "description": "SMT mode: off (never), auto (try only when LIA parsing succeeds), on (always attempt)."
                 },
                 "smt_timeout_ms": {
                     "type": "integer",
@@ -802,6 +861,15 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                 "research_notes": {
                     "type": "string",
                     "description": "Optional external notes (e.g., ArXiv summary) to condition LLM candidate generation. Only used when candidates_mode=llm."
+                },
+                "research_preset": {
+                    "type": "string",
+                    "description": "Optional repo-owned preset name (from <repo_root>/proofpatch.toml). If set, we run the preset and inject its bounded summary into LLM prompts."
+                },
+                "research_top_k": {
+                    "type": "integer",
+                    "default": 3,
+                    "description": "When research_preset is set, include at most this many sources in injected context."
                 },
                 "write": { "type": "boolean", "default": false, "description": "If true, write best text back to the file." },
                 "include_raw_verify": { "type": "boolean", "default": false, "description": "If true, include full verify raw output (can be large)." }
@@ -847,10 +915,24 @@ impl Tool for ProofpatchTreeSearchNearestTool {
             .get("include_goal_dump")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let smt_precheck = args
-            .get("smt_precheck")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let smt_mode = args
+            .get("smt_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto")
+            .trim()
+            .to_lowercase();
+        let smt_mode = match smt_mode.as_str() {
+            "off" | "0" | "false" | "no" => "off",
+            "on" | "1" | "true" | "yes" => "on",
+            _ => "auto",
+        };
+        // Back-compat: smt_precheck overrides smt_mode when present.
+        let smt_precheck = args.get("smt_precheck").and_then(|v| v.as_bool());
+        let smt_mode = match smt_precheck {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => smt_mode,
+        };
         let smt_timeout_ms = extract_u64_opt(args, "smt_timeout_ms")?.unwrap_or(1500);
         let smt_seed = extract_u64_opt(args, "smt_seed")?.unwrap_or(0);
         let llm_timeout_s = extract_u64_opt(args, "llm_timeout_s")?.unwrap_or(60);
@@ -866,6 +948,11 @@ impl Tool for ProofpatchTreeSearchNearestTool {
             .get("research_notes")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let research_preset = args
+            .get("research_preset")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let research_top_k = extract_u64_opt(args, "research_top_k")?.unwrap_or(3) as usize;
         let write = args.get("write").and_then(|v| v.as_bool()).unwrap_or(false);
         let include_raw_verify = args
             .get("include_raw_verify")
@@ -895,6 +982,71 @@ impl Tool for ProofpatchTreeSearchNearestTool {
         let repo_root = resolve_lean_repo_root(repo_root, Some(&file))?;
         plc::load_dotenv_smart(&repo_root);
 
+        // If a repo-owned research preset is provided, run it and inject a bounded summary as
+        // `research_notes` for LLM candidate generation. This makes the MCP flow “ideate-able”
+        // without requiring the caller to precompute and pass a notes blob.
+        let mut research_notes = research_notes;
+        if let Some(preset_name) = research_preset.as_deref() {
+            if let Ok(Some(cfg)) = plc::config::load_from_repo_root(&repo_root) {
+                if let Some(preset) = cfg.research.resolve_preset(preset_name) {
+                    if let Ok(mut papers) = plc::arxiv::arxiv_search(
+                        &preset.query,
+                        preset.max_results,
+                        StdDuration::from_millis(preset.timeout_ms),
+                    )
+                    .await
+                    {
+                        // Apply preset filters (any/all), consistent with `research-auto`.
+                        let must_any_l: Vec<String> = preset
+                            .must_include_any
+                            .iter()
+                            .map(|s| s.to_lowercase())
+                            .collect();
+                        let must_all_l: Vec<String> = preset
+                            .must_include_all
+                            .iter()
+                            .map(|s| s.to_lowercase())
+                            .collect();
+                        if !must_any_l.is_empty() || !must_all_l.is_empty() {
+                            papers = papers
+                                .into_iter()
+                                .filter(|p| {
+                                    let hay =
+                                        format!("{}\n{}", p.title, p.abstract_text).to_lowercase();
+                                    let ok_any = must_any_l.is_empty()
+                                        || must_any_l.iter().any(|tok| hay.contains(tok));
+                                    let ok_all = must_all_l.is_empty()
+                                        || must_all_l.iter().all(|tok| hay.contains(tok));
+                                    ok_any && ok_all
+                                })
+                                .collect();
+                        }
+                        let ctx = json!({
+                            "preset": preset_name,
+                            "query": preset.query,
+                            "papers": papers,
+                        });
+                        let notes = plc::ingest_research_json(&ctx);
+                        let mut s = String::new();
+                        s.push_str("Research context (repo-owned preset):\n");
+                        s.push_str(&format!("- preset: {preset_name}\n"));
+                        s.push_str(&format!("- query: {}\n", preset.query));
+                        s.push_str(&format!("- papers: {}\n", papers.len()));
+                        s.push_str("\nTop sources:\n");
+                        for src in notes.sources.iter().take(research_top_k) {
+                            let title = src.title.as_deref().unwrap_or("");
+                            let url = src
+                                .canonical_url
+                                .as_deref()
+                                .unwrap_or_else(|| src.url.as_str());
+                            s.push_str(&format!("- {title} {url}\n"));
+                        }
+                        research_notes = Some(s);
+                    }
+                }
+            }
+        }
+
         let p = repo_root.join(&file);
         if !p.exists() {
             return Err(format!("File not found: {}", p.display()));
@@ -915,11 +1067,13 @@ impl Tool for ProofpatchTreeSearchNearestTool {
             }
         }
 
-        let smt_entails: Option<bool> = if smt_precheck {
+        let smt_entails: Option<bool> = if smt_mode != "off" {
             goal_dump_v
                 .as_ref()
                 .and_then(|gd| gd.get("pp_dump"))
-                .and_then(|pp| plc::smt_lia::entails_from_pp_dump(pp, smt_timeout_ms, smt_seed).ok())
+                .and_then(|pp| {
+                    plc::smt_lia::entails_from_pp_dump(pp, smt_timeout_ms, smt_seed).ok()
+                })
                 .flatten()
         } else {
             None
@@ -1296,6 +1450,7 @@ impl Tool for ProofpatchTreeSearchNearestTool {
                 "candidates_count": candidates.len(),
                 "allow_sorry_candidates": allow_sorry_candidates,
                 "include_trace": include_trace,
+                "smt_mode": smt_mode,
                 "smt_precheck": smt_precheck,
                 "smt_timeout_ms": smt_timeout_ms,
                 "smt_seed": smt_seed
@@ -2448,7 +2603,9 @@ impl ProofpatchStdioMcpMinimal {
             .call(&v)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-        Ok(CallToolResult::success(vec![Content::text(out.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            out.to_string(),
+        )]))
     }
 }
 
