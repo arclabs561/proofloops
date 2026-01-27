@@ -16,10 +16,22 @@
 proofpatch triage-file --repo /abs/path/to/lean-repo --file Some/File.lean
 ```
 
+### Verify a file (summary)
+
+```bash
+proofpatch verify-summary --repo /abs/path/to/lean-repo --file Some/File.lean
+```
+
 ### Extract a bounded context pack
 
 ```bash
 proofpatch context-pack --repo /abs/path/to/lean-repo --file Some/File.lean --decl some_theorem
+```
+
+### Create a scratch lemma file
+
+```bash
+proofpatch scratch-lemma --repo /abs/path/to/lean-repo --file Some/File.lean --name my_lemma
 ```
 
 ### Patch a lemma (in-memory) and verify
@@ -44,4 +56,11 @@ More strict variants:
 ## Output stability
 
 Many commands include a stable `result_kind` string (e.g. `early_no_sorries`, `search`, `solved`) so downstream tooling can branch without brittle text matching.
+
+## Command grouping aliases
+
+These are equivalent:
+
+- `proofpatch smt probe` == `proofpatch smt-probe`
+- `proofpatch smt repro` == `proofpatch smt-repro`
 
