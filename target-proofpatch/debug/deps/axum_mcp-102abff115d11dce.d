@@ -1,0 +1,19 @@
+/Users/arc/Documents/dev/proofpatch/target-proofpatch/debug/deps/axum_mcp-102abff115d11dce.d: /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/lib.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/config.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/error.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/prompt.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/resource.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/schema.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/server.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/tool.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/tool_error.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/utils.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/validation.rs
+
+/Users/arc/Documents/dev/proofpatch/target-proofpatch/debug/deps/libaxum_mcp-102abff115d11dce.rlib: /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/lib.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/config.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/error.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/prompt.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/resource.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/schema.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/server.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/tool.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/tool_error.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/utils.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/validation.rs
+
+/Users/arc/Documents/dev/proofpatch/target-proofpatch/debug/deps/libaxum_mcp-102abff115d11dce.rmeta: /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/lib.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/config.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/error.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/prompt.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/resource.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/schema.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/server.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/tool.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/tool_error.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/utils.rs /Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/validation.rs
+
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/lib.rs:
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/config.rs:
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/error.rs:
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/prompt.rs:
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/resource.rs:
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/schema.rs:
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/server.rs:
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/tool.rs:
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/tool_error.rs:
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/utils.rs:
+/Users/arc/.cargo/git/checkouts/axum-mcp-4360a0fc3a94a7cb/b9a6481/src/validation.rs:
+
+# env-dep:CARGO_PKG_VERSION=0.2.0
